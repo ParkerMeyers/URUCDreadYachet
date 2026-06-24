@@ -282,35 +282,47 @@ class SSHManager:
         script_name = script_rel.split('/')[-1]   # e.g. "stabilization.py"
         log_file = f"/tmp/rov_{log_name}.log"
         rov_path_q = shlex.quote(rov_path)
-        script_q = shlex.quote(script)
         script_name_q = shlex.quote(script_name)
         log_file_q = shlex.quote(log_file)
         extra_args = (extra_args or "").strip()
-        extra_args_q = ""
+        extra_tokens: list[str] = []
         if extra_args:
-            # Keep free-form flags supported, but shell-quote each token safely.
+            # Keep free-form flags supported, but tokenize safely.
             try:
-                extra_args_q = " " + " ".join(shlex.quote(a) for a in shlex.split(extra_args))
+                extra_tokens = shlex.split(extra_args)
             except ValueError:
-                extra_args_q = " " + shlex.quote(extra_args)
+                extra_tokens = [extra_args]
+        launcher_argv = ["python3", script] + extra_tokens
+        launcher_code = (
+            "import json, subprocess, sys; "
+            "cmd=json.loads(sys.argv[1]); cwd=sys.argv[2]; log=sys.argv[3]; "
+            "f=open(log,'ab', buffering=0); "
+            "p=subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, "
+            "stdout=f, stderr=subprocess.STDOUT, start_new_session=True); "
+            "print(p.pid)"
+        )
         # Kill any existing instance first so it cannot hold the UDP port
         # that the new process needs to bind (same behaviour as start_mavproxy).
-        # </dev/null disconnects stdin so the process never hangs waiting for
-        # input when launched over an SSH exec channel.
+        # Launch via a remote python helper so PID reporting is deterministic
+        # (shell $! can be unreliable through some SSH/shell combinations).
         cmd = (
             f"pkill -f {script_name_q} 2>/dev/null || true; sleep 0.5; "
-            f"cd {rov_path_q} && "
-            f"nohup python3 {script_q}{extra_args_q} "
-            f"< /dev/null > {log_file_q} 2>&1 & "
-            f"echo $!"
+            f"python3 -c {shlex.quote(launcher_code)} "
+            f"{shlex.quote(json.dumps(launcher_argv))} "
+            f"{rov_path_q} {log_file_q}"
         )
         out, err, error = self.exec(cmd)
         if error:
             return False, error
-        pid = out.strip().splitlines()[-1] if out.strip() else ""
-        if not pid.isdigit():
+        pid = ""
+        for line in (out or "").splitlines():
+            token = line.strip()
+            if token.isdigit():
+                pid = token
+                break
+        if not pid:
             detail = err.strip() or out.strip() or f"launch returned no PID for {script_name}"
-            return False, detail[:220]
+            return False, detail[:240]
         return True, f"PID {pid}"
 
     def stop_onboard_process(self, script_name):
