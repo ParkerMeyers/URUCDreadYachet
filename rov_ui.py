@@ -169,6 +169,7 @@ STATE = {
         "arm":          [],
         "onboard_stab": [],
         "onboard_arm":  [],
+        "onboard_cam":  [],
     },
 }
 
