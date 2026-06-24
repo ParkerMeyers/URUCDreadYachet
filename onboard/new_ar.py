@@ -264,7 +264,7 @@ def main():
     global _joint_us, _j6_target_deg, _last_pkt_time, _rx_count
 
     print(f"[arm] Connecting to MAVProxy at {MAVLINK_URL} ...")
-    master = _connect_mavlink(MAVLINK_URL)
+    master = connect_mavlink(MAVLINK_URL)
 
     print("[arm] Waiting for heartbeat from Pix6 ...")
     hb = master.wait_heartbeat(timeout=20)
