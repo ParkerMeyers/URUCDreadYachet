@@ -35,6 +35,7 @@ Usage:
 import os
 import sys
 import re
+import shlex
 import json
 import time
 import socket
@@ -276,25 +277,40 @@ class SSHManager:
             return "", "", str(e)
 
     def start_onboard_process(self, script_rel, log_name, extra_args=""):
-        rov_path    = config["pi_rov_path"]
-        script      = f"{rov_path}/{script_rel}"
+        rov_path = config["pi_rov_path"]
+        script = f"{rov_path}/{script_rel}"
         script_name = script_rel.split('/')[-1]   # e.g. "stabilization.py"
-        log_file    = f"/tmp/rov_{log_name}.log"
+        log_file = f"/tmp/rov_{log_name}.log"
+        rov_path_q = shlex.quote(rov_path)
+        script_q = shlex.quote(script)
+        script_name_q = shlex.quote(script_name)
+        log_file_q = shlex.quote(log_file)
+        extra_args = (extra_args or "").strip()
+        extra_args_q = ""
+        if extra_args:
+            # Keep free-form flags supported, but shell-quote each token safely.
+            try:
+                extra_args_q = " " + " ".join(shlex.quote(a) for a in shlex.split(extra_args))
+            except ValueError:
+                extra_args_q = " " + shlex.quote(extra_args)
         # Kill any existing instance first so it cannot hold the UDP port
         # that the new process needs to bind (same behaviour as start_mavproxy).
         # </dev/null disconnects stdin so the process never hangs waiting for
         # input when launched over an SSH exec channel.
         cmd = (
-            f"pkill -f '{script_name}' 2>/dev/null; sleep 0.5; "
-            f"cd {rov_path} && "
-            f"nohup python3 {script} {extra_args} "
-            f"< /dev/null > {log_file} 2>&1 & "
+            f"pkill -f {script_name_q} 2>/dev/null || true; sleep 0.5; "
+            f"cd {rov_path_q} && "
+            f"nohup python3 {script_q}{extra_args_q} "
+            f"< /dev/null > {log_file_q} 2>&1 & "
             f"echo $!"
         )
         out, err, error = self.exec(cmd)
         if error:
             return False, error
-        pid = out.strip()
+        pid = out.strip().splitlines()[-1] if out.strip() else ""
+        if not pid.isdigit():
+            detail = err.strip() or out.strip() or f"launch returned no PID for {script_name}"
+            return False, detail[:220]
         return True, f"PID {pid}"
 
     def stop_onboard_process(self, script_name):
