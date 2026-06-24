@@ -1,476 +1,361 @@
 #!/usr/bin/env python3
+"""
+Arm controller — ONBOARD  (runs on the Raspberry Pi)
+=====================================================
+Receives joint PWM commands from arm_sender.py over UDP and forwards
+them to the Pixhawk 6 AUX outputs via MAVLink RC_CHANNELS_OVERRIDE
+through MAVProxy.
 
-import socket, time, sys, select, termios, tty, math
-import threading, json as _json
-import board, busio, adafruit_bno055
-from adafruit_servokit import ServoKit
-import lgpio
+Confirmed AUX wiring:
+    AUX1 (RC ch 9)  → J4
+    AUX2 (RC ch 10) → J1
+    AUX3 (RC ch 11) → J3
+    AUX4 (RC ch 12) → J6  (continuous rotation)
+    AUX5 (RC ch 13) → J5
+    AUX6 (RC ch 14) → J2
+    AUX7 (RC ch 15) → Claw
+    AUX8 (RC ch 16) → spare (always 1500)
 
-UDP_IP = "0.0.0.0"
-UDP_PORT = 5006
-BNO055_ADDR = 0x29
+Incoming UDP packet (from arm_sender.py), comma-separated:
+    J1, J2, J3, J4, J5, J6_PWM, Claw, J6_TARGET_ANGLE
+    index: 0    1    2    3    4     5      6         7
+    PWM range 500-2500 µs.  J6_TARGET_ANGLE in degrees (BNO055 auto-level).
 
-MOSFET_GPIO = 17          # BCM GPIO17, HIGH = servo power ON
-MOSFET_CONTROL_PORT = 5007  # UDP port for web-UI MOSFET commands
+Optional hardware (degrades gracefully if absent):
+    BNO055 IMU  — J6 auto-level stabilization when stick is centered
+    lgpio/GPIO17 MOSFET — servo power rail switch controlled from web UI
+"""
 
-MIN_US, MAX_US, CENTER_US = 500, 2500, 1500
+import json
+import math
+import socket
+import threading
+import time
 
-UPDATE_HZ = 200
-PRINT_HZ = 10
-TIMEOUT_SEC = 0.75
+from pymavlink import mavutil
 
-MAX_STEP_US = 100
-DEADBAND_US = 3
+# ── Optional: BNO055 IMU ──────────────────────────────────────────────────────
+try:
+    import board
+    import busio
+    import adafruit_bno055
+    _i2c = busio.I2C(board.SCL, board.SDA)
+    _bno = adafruit_bno055.BNO055_I2C(_i2c, address=0x29)
+    HAVE_BNO = True
+    print("[arm] BNO055 IMU ready — J6 auto-level enabled")
+except Exception as _e:
+    HAVE_BNO = False
+    _bno     = None
+    print(f"[arm] BNO055 not available ({_e}) — J6 manual-only")
 
-J4_CH = 10
-J4_DEADBAND_US = 25
-J4_MAX_STEP_US = 100
+# ── Optional: MOSFET via lgpio ────────────────────────────────────────────────
+MOSFET_GPIO = 17
+MOSFET_PORT = 5007
 
-J6_IN_LOW = 1490
-J6_IN_HIGH = 1510
+try:
+    import lgpio as _lgpio
+    _gpio_h = _lgpio.gpiochip_open(0)
+    _lgpio.gpio_claim_output(_gpio_h, MOSFET_GPIO, 0)
+    HAVE_GPIO = True
+    print(f"[arm] lgpio ready — MOSFET on GPIO{MOSFET_GPIO}")
+except Exception as _e:
+    HAVE_GPIO = False
+    _lgpio   = None
+    _gpio_h  = None
+    print(f"[arm] lgpio not available ({_e}) — MOSFET control disabled")
 
-J6_OUT_MIN = 1350
-J6_OUT_CENTER = 1500
-J6_OUT_MAX = 1650
+# ── Config ────────────────────────────────────────────────────────────────────
+UDP_PORT    = 5006
+MAVLINK_URL = "udp:127.0.0.1:14551"
+CENTER_US   = 1500
+MIN_US      = 500
+MAX_US      = 2500
+IGNORE      = 65535
+OVERRIDE_HZ = 20
+PRINT_HZ    = 2
+TIMEOUT_SEC = 0.75    # center all joints if no UDP packet received for this long
 
-J6_KP = -2.0
+# Maps incoming CSV joint index → RC channel number (AUX1=ch9, AUX2=ch10 …)
+# Incoming order: J1(0), J2(1), J3(2), J4(3), J5(4), J6_PWM(5), Claw(6)
+JOINT_TO_RC_CH = {
+    0: 10,   # J1   → AUX2
+    1: 14,   # J2   → AUX6
+    2: 11,   # J3   → AUX3
+    3:  9,   # J4   → AUX1
+    4: 13,   # J5   → AUX5
+    5: 12,   # J6   → AUX4  (continuous rotation — computed separately)
+    6: 15,   # Claw → AUX7
+}
+J6_RC_CH    = 12   # AUX4
+SPARE_RC_CH = 16   # AUX8 — always CENTER_US
+
+# J6 BNO055 stabilization (same constants as original new_ar.py)
+J6_IN_DEADBAND  = 10      # ±µs from 1500 that counts as "centered"
+J6_OUT_MIN      = 1350
+J6_OUT_CENTER   = 1500
+J6_OUT_MAX      = 1650
+J6_KP           = -2.0
 J6_DEADBAND_DEG = 3.0
-
-LEVEL_NORMAL = [0.0180, -0.9993, 0.0337]
-
-CLAW_CH = 8
-CLAW_DEFAULT_US = 1460
-
-# Incoming order:
-# J1,J2,J3,J4,J5,J6_PWM,Claw,J6_TARGET_ANGLE
-JOINT_TO_CHANNEL = {
-    1: 10,  # J1
-    2: 14,  # J2 shoulder
-    3: 11,  # J3
-    4: 9,  # J4
-    5: 15,  # J5
-    6: 12,  # J6 stabilization/manual
-    7: 8,   # Claw
-}
-
-CHANNEL_TO_JOINT_INDEX = {
-    10: 0,  # J1
-    13: 1,  # J2
-    11: 2,  # J3
-    9: 3,  # J4
-    15: 4,  # J5
-    8: 6,   # Claw
-}
-
-J6_CH = 12
-J5_CH = 15
+_LEVEL_NORMAL_RAW = [0.0180, -0.9993, 0.0337]
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-
-gpio_handle = lgpio.gpiochip_open(0)
-lgpio.gpio_claim_output(gpio_handle, MOSFET_GPIO, 0)
-
-kit = ServoKit(channels=16)
-i2c = busio.I2C(board.SCL, board.SDA)
-bno = adafruit_bno055.BNO055_I2C(i2c, address=BNO055_ADDR)
-
-servo_power_enabled = False
-controller_enabled = False
-j6_enabled = False
-
-target_us = {
-    ch: CLAW_DEFAULT_US if ch == CLAW_CH else CENTER_US
-    for ch in CHANNEL_TO_JOINT_INDEX
-}
-
-current_us = {
-    ch: CLAW_DEFAULT_US if ch == CLAW_CH else CENTER_US
-    for ch in CHANNEL_TO_JOINT_INDEX
-}
-
-j6_input_pwm = CENTER_US
-j6_target_angle_deg = 0.0
-
-last_packet_time = 0.0
-rx_count = 0
-last_raw = ""
-
-last_pwm_sent = {}
-j6_update_count = 0
-last_j6_rate_time = time.time()
-j6_actual_hz = 0.0
-
-def servo_power(on):
-    lgpio.gpio_write(gpio_handle, MOSFET_GPIO, 1 if on else 0)
-
-def clamp(x, lo, hi):
+def _clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
-def clamp_us(x):
-    return int(clamp(float(x), MIN_US, MAX_US))
 
-def normalize(v):
+def _clamp_us(x):
+    return int(_clamp(float(x), MIN_US, MAX_US))
+
+
+def _normalize(v):
     m = math.sqrt(sum(x * x for x in v))
-    if m < 0.001:
+    return [x / m for x in v] if m > 0.001 else None
+
+
+_LEVEL_NORMAL = _normalize(_LEVEL_NORMAL_RAW)
+
+
+def _read_j6_angle_deg():
+    """Read BNO055 gravity vector and return tilt angle (degrees). None on error."""
+    if not HAVE_BNO:
         return None
-    return [x / m for x in v]
-
-LEVEL_NORMAL = normalize(LEVEL_NORMAL)
-
-def us_to_angle(us):
-    us = clamp_us(us)
-    return (us - MIN_US) * 180.0 / (MAX_US - MIN_US)
-
-def set_pwm(ch, us):
-    us = clamp_us(us)
-
-    if last_pwm_sent.get(ch) == us:
-        return
-
     try:
-        kit.servo[ch].angle = us_to_angle(us)
-        last_pwm_sent[ch] = us
-    except OSError as e:
-        print(f"I2C write failed PCA{ch}: {e}")
-
-def set_off(ch):
-    try:
-        kit.servo[ch].angle = None
-        last_pwm_sent[ch] = None
-    except OSError as e:
-        print(f"I2C off failed PCA{ch}: {e}")
-
-def map_forward_pwm(input_pwm):
-    return J6_OUT_CENTER + (input_pwm - J6_IN_HIGH) * (J6_OUT_MAX - J6_OUT_CENTER) / (MAX_US - J6_IN_HIGH)
-
-def map_reverse_pwm(input_pwm):
-    return J6_OUT_CENTER - (J6_IN_LOW - input_pwm) * (J6_OUT_CENTER - J6_OUT_MIN) / (J6_IN_LOW - MIN_US)
-
-def default_for_channel(ch):
-    if ch == CLAW_CH:
-        return CLAW_DEFAULT_US
-    if ch == J6_CH:
-        return J6_OUT_CENTER
-    return CENTER_US
-
-def enable_power():
-    global servo_power_enabled
-    servo_power_enabled = True
-
-    servo_power(True)
-    time.sleep(0.15)
-
-    for ch in list(CHANNEL_TO_JOINT_INDEX.keys()) + [J6_CH]:
-        default_us = default_for_channel(ch)
-        current_us[ch] = default_us
-        target_us[ch] = default_us
-        set_pwm(ch, default_us)
-
-def disable_power():
-    global servo_power_enabled, controller_enabled, j6_enabled
-    servo_power_enabled = False
-    controller_enabled = False
-    j6_enabled = False
-
-    for ch in list(CHANNEL_TO_JOINT_INDEX.keys()) + [J6_CH]:
-        set_off(ch)
-
-    time.sleep(0.05)
-    servo_power(False)
-
-def smooth_regular_servos():
-    if not servo_power_enabled:
-        return
-
-    for ch in CHANNEL_TO_JOINT_INDEX:
-        deadband = J4_DEADBAND_US if ch == J4_CH else DEADBAND_US
-        max_step = J4_MAX_STEP_US if ch == J4_CH else MAX_STEP_US
-
-        err = target_us[ch] - current_us[ch]
-
-        if abs(err) <= deadband:
-            new_us = current_us[ch]
-        elif err > 0:
-            new_us = current_us[ch] + min(max_step, err)
-        else:
-            new_us = current_us[ch] - min(max_step, -err)
-
-        if new_us != current_us[ch]:
-            current_us[ch] = new_us
-            set_pwm(ch, new_us)
-
-def read_j6_angle_deg():
-    try:
-        g = bno.gravity
+        g = _bno.gravity
         if g is None or any(v is None for v in g):
             return None
-
-        gravity = normalize(g)
+        gravity = _normalize(g)
         if gravity is None:
             return None
-
-        dot = (
-            gravity[0] * LEVEL_NORMAL[0] +
-            gravity[1] * LEVEL_NORMAL[1] +
-            gravity[2] * LEVEL_NORMAL[2]
-        )
-
-        dot = clamp(dot, -1.0, 1.0)
+        dot = _clamp(sum(gravity[i] * _LEVEL_NORMAL[i] for i in range(3)), -1.0, 1.0)
         return math.degrees(math.asin(dot))
-
     except Exception:
         return None
 
-def update_j6():
-    if not servo_power_enabled or not j6_enabled:
-        return None, "off", J6_OUT_CENTER
 
-    # Manual override still has priority.
-    if j6_input_pwm > J6_IN_HIGH:
-        pwm = int(round(clamp(map_forward_pwm(j6_input_pwm), J6_OUT_CENTER, J6_OUT_MAX)))
-        set_pwm(J6_CH, pwm)
-        return None, "manual+", pwm
+def _compute_j6_pwm(j6_input_us, j6_target_angle_deg):
+    """
+    Compute J6 continuous-rotation servo PWM.
+    Stick outside deadband → direct manual mapping.
+    Stick centered + BNO055 available → auto-level to target angle.
+    Stick centered + no BNO055 → hold 1500 (stopped).
+    """
+    if j6_input_us > CENTER_US + J6_IN_DEADBAND:
+        scale = (j6_input_us - (CENTER_US + J6_IN_DEADBAND)) / \
+                (MAX_US - (CENTER_US + J6_IN_DEADBAND))
+        return int(round(_clamp(
+            J6_OUT_CENTER + scale * (J6_OUT_MAX - J6_OUT_CENTER),
+            J6_OUT_CENTER, J6_OUT_MAX
+        )))
 
-    if j6_input_pwm < J6_IN_LOW:
-        pwm = int(round(clamp(map_reverse_pwm(j6_input_pwm), J6_OUT_MIN, J6_OUT_CENTER)))
-        set_pwm(J6_CH, pwm)
-        return None, "manual-", pwm
+    if j6_input_us < CENTER_US - J6_IN_DEADBAND:
+        scale = ((CENTER_US - J6_IN_DEADBAND) - j6_input_us) / \
+                ((CENTER_US - J6_IN_DEADBAND) - MIN_US)
+        return int(round(_clamp(
+            J6_OUT_CENTER - scale * (J6_OUT_CENTER - J6_OUT_MIN),
+            J6_OUT_MIN, J6_OUT_CENTER
+        )))
 
-    # Centered J6 input means stabilization resumes.
-    measured_angle = read_j6_angle_deg()
-    if measured_angle is None:
-        set_pwm(J6_CH, J6_OUT_CENTER)
-        return None, "bad_imu", J6_OUT_CENTER
+    # Stick centered — auto-level if BNO055 is available
+    if HAVE_BNO:
+        angle = _read_j6_angle_deg()
+        if angle is not None:
+            err = angle + j6_target_angle_deg
+            if abs(err) < J6_DEADBAND_DEG:
+                return J6_OUT_CENTER
+            return int(round(_clamp(J6_OUT_CENTER + J6_KP * err, J6_OUT_MIN, J6_OUT_MAX)))
 
-    err = measured_angle + j6_target_angle_deg
+    return J6_OUT_CENTER
 
-    if abs(err) < J6_DEADBAND_DEG:
-        pwm = J6_OUT_CENTER
-    else:
-        pwm = J6_OUT_CENTER + J6_KP * err
 
-    pwm = int(round(clamp(pwm, J6_OUT_MIN, J6_OUT_MAX)))
-    set_pwm(J6_CH, pwm)
-    return err, "hold", pwm
+# ── Shared state (protected by _lock) ────────────────────────────────────────
+_lock = threading.Lock()
+_joint_us      = [CENTER_US] * 7   # [J1, J2, J3, J4, J5, J6_manual, Claw]
+_j6_target_deg = 0.0
+_last_pkt_time = 0.0
+_rx_count      = 0
+_mosfet_on     = False
 
-def handle_keyboard():
-    global controller_enabled, j6_enabled, j6_input_pwm
 
-    readable, _, _ = select.select([sys.stdin], [], [], 0)
-    if not readable:
-        return None
+# ── MOSFET control ────────────────────────────────────────────────────────────
+def _set_mosfet(on: bool):
+    global _mosfet_on
+    _mosfet_on = on
+    if HAVE_GPIO:
+        _lgpio.gpio_write(_gpio_h, MOSFET_GPIO, 1 if on else 0)
 
-    c = sys.stdin.read(1)
 
-    if c == " ":
-        if servo_power_enabled:
-            disable_power()
-            print("\nSERVO POWER OFF / CONTROLLER OFF / J6 OFF")
-        else:
-            enable_power()
-            print("\nSERVO POWER ON / ALL CHANNELS DEFAULTED")
-        return None
-
-    if c == "j":
-        if not servo_power_enabled:
-            print("\nJ6 cannot enable: servo power is OFF. Press SPACE first.")
-            return None
-
-        j6_enabled = not j6_enabled
-
-        if j6_enabled:
-            set_pwm(J6_CH, J6_OUT_CENTER)
-            print("\nJ6 STABILIZATION ON")
-        else:
-            set_pwm(J6_CH, J6_OUT_CENTER)
-            print("\nJ6 STABILIZATION OFF / J6 1460")
-        return None
-
-    if c == "g":
-        if not servo_power_enabled:
-            print("\nCannot listen to controller: servo power is OFF. Press SPACE first.")
-            return None
-
-        controller_enabled = True
-        print("\nCONTROLLER INPUT ENABLED")
-        return None
-
-    if c in ("\n", "\r"):
-        return None
-
-    line = c + sys.stdin.readline()
-    cmd = line.strip().lower()
-
-    if cmd in ("stop", "hold", "safe"):
-        controller_enabled = False
-
-        for ch in CHANNEL_TO_JOINT_INDEX:
-            target_us[ch] = default_for_channel(ch)
-
-        j6_input_pwm = CENTER_US
-        print("\nCONTROLLER INPUT OFF - TARGETS DEFAULTED")
-
-    elif cmd in ("q", "quit", "exit"):
-        return "quit"
-
-    return None
-
-for ch in list(CHANNEL_TO_JOINT_INDEX.keys()) + [J6_CH]:
-    kit.servo[ch].set_pulse_width_range(MIN_US, MAX_US)
-    set_off(ch)
-
-servo_power(False)
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((UDP_IP, UDP_PORT))
-sock.settimeout(0.001)
-
-print(f"Listening on UDP {UDP_PORT}")
-print(f"MOSFET GPIO {MOSFET_GPIO}: LOW at startup")
-print("space = servo power on/off")
-print("g = start listening to controller")
-print("j = toggle J6 stabilization")
-print("Expected: J1,J2,J3,J4,J5,J6_PWM,Claw,J6_TARGET_ANGLE")
-print("All joint PWM values expected from 500 to 2500.")
-print("Startup defaults: claw=700, regular servos=1500, J6 continuous rotation neutral=1460.")
-print("Also accepts PWM: prefix.")
-print(f"MOSFET control port: UDP {MOSFET_CONTROL_PORT} (web UI)")
-print()
-
-# ── Web-UI MOSFET control listener ──────────────────────────────────────────
-_mosfet_lock = threading.Lock()
-
-def _mosfet_udp_listener():
-    """Background thread: accept MOSFET on/off commands from the web UI."""
+def _mosfet_listener():
+    """Background thread: accept MOSFET on/off JSON commands from the web UI."""
     try:
-        ctl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        ctl_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        ctl_sock.bind(("0.0.0.0", MOSFET_CONTROL_PORT))
-        ctl_sock.settimeout(1.0)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", MOSFET_PORT))
+        s.settimeout(1.0)
     except Exception as e:
-        print(f"MOSFET control listener bind failed: {e}")
+        print(f"[arm] MOSFET listener bind failed: {e}")
         return
-
     while True:
         try:
-            data, _ = ctl_sock.recvfrom(256)
-            cmd = _json.loads(data.decode("utf-8"))
+            data, _ = s.recvfrom(256)
+            cmd = json.loads(data.decode())
             if cmd.get("cmd") == "mosfet":
-                want_on = bool(cmd.get("state", False))
-                with _mosfet_lock:
-                    if want_on and not servo_power_enabled:
-                        enable_power()
-                        print("\nMOSFET: ON  (web UI command)")
-                    elif not want_on and servo_power_enabled:
-                        disable_power()
-                        print("\nMOSFET: OFF (web UI command)")
+                _set_mosfet(bool(cmd.get("state", False)))
+                print(f"[arm] MOSFET {'ON' if _mosfet_on else 'OFF'} (web UI)")
         except socket.timeout:
             pass
         except Exception:
             pass
 
-threading.Thread(target=_mosfet_udp_listener, daemon=True).start()
-# ────────────────────────────────────────────────────────────────────────────
 
-# Launched via SSH/nohup (web UI) has no TTY — keyboard control is optional.
-have_tty = False
-old_terminal = None
-try:
-    old_terminal = termios.tcgetattr(sys.stdin)
-    tty.setcbreak(sys.stdin.fileno())
-    have_tty = True
-except (termios.error, OSError, AttributeError):
-    print("No TTY — running headless (UDP arm control only).")
+# ── MAVLink helpers ───────────────────────────────────────────────────────────
+def _build_rc_array():
+    """Build the 18-element RC array to send, computing J6 fresh each call."""
+    rc = [IGNORE] * 18
+    with _lock:
+        joint_us_snap  = list(_joint_us)
+        j6_target_snap = _j6_target_deg
+        last_pkt_snap  = _last_pkt_time
 
-last_update = time.time()
-last_print = time.time()
-j6_err = None
-j6_pwm = CENTER_US
-j6_status = "off"
+    timed_out = (time.time() - last_pkt_snap > TIMEOUT_SEC) and (last_pkt_snap > 0)
 
-try:
-    while True:
-        now = time.time()
+    if timed_out:
+        # Safety: stop all joints
+        for ch in list(JOINT_TO_RC_CH.values()) + [SPARE_RC_CH]:
+            rc[ch - 1] = CENTER_US
+        return rc
 
-        if have_tty and handle_keyboard() == "quit":
-            break
+    for joint_idx, rc_ch in JOINT_TO_RC_CH.items():
+        if rc_ch == J6_RC_CH:
+            # J6 computed separately below
+            continue
+        rc[rc_ch - 1] = _clamp_us(joint_us_snap[joint_idx])
 
-        try:
-            data, addr = sock.recvfrom(1024)
-            line = data.decode(errors="ignore").strip()
-            last_raw = line
+    # J6 continuous rotation (index 5 = J6_manual input)
+    rc[J6_RC_CH - 1] = _compute_j6_pwm(
+        _clamp_us(joint_us_snap[5]), j6_target_snap
+    )
 
-            if line.startswith("PWM:"):
-                line = line[4:]
+    rc[SPARE_RC_CH - 1] = CENTER_US
 
-            parts = line.split(",")
+    return rc
 
-            if len(parts) >= 8:
-                vals = [float(x) for x in parts]
 
-                incoming = vals[:7]
+def _send_override(master):
+    rc = _build_rc_array()
+    ts = master.target_system or 1
+    tc = master.target_component or 1
+    master.mav.rc_channels_override_send(ts, tc, *rc)
 
-                rx_count += 1
-                last_packet_time = now
 
-                # 6th value is still J6 manual override PWM.
-                j6_input_pwm = clamp_us(incoming[5])
+def _send_heartbeat(master):
+    master.mav.heartbeat_send(
+        mavutil.mavlink.MAV_TYPE_GCS,
+        mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+        0, 0, 0,
+    )
 
-                # 8th value is the live J6 stabilization target angle.
-                # No angle limits are applied.
-                j6_target_angle_deg = round(float(vals[7]), 2)
 
-                if controller_enabled:
-                    for ch, joint_idx in CHANNEL_TO_JOINT_INDEX.items():
-                        target_us[ch] = clamp_us(incoming[joint_idx])
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    global _joint_us, _j6_target_deg, _last_pkt_time, _rx_count
 
-        except socket.timeout:
-            pass
-        except ValueError:
-            pass
+    print(f"[arm] Connecting to MAVProxy at {MAVLINK_URL} ...")
+    master = mavutil.mavlink_connection(MAVLINK_URL)
 
-        if j6_enabled and now - last_packet_time > TIMEOUT_SEC:
-            j6_input_pwm = CENTER_US
-            set_pwm(J6_CH, J6_OUT_CENTER)
-            j6_status = "timeout"
+    print("[arm] Waiting for heartbeat from Pix6 ...")
+    hb = master.wait_heartbeat(timeout=20)
+    if hb:
+        print(f"[arm] Heartbeat OK "
+              f"(system={master.target_system} component={master.target_component})")
+    else:
+        print("[arm] *** No heartbeat in 20 s — continuing anyway ***")
 
-        if now - last_update >= 1.0 / UPDATE_HZ:
-            last_update = now
-            smooth_regular_servos()
-            j6_err, j6_status, j6_pwm = update_j6()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", UDP_PORT))
+    sock.settimeout(0.001)
 
-            j6_update_count += 1
-            if now - last_j6_rate_time >= 1.0:
-                j6_actual_hz = j6_update_count / (now - last_j6_rate_time)
-                j6_update_count = 0
-                last_j6_rate_time = now
+    threading.Thread(target=_mosfet_listener, daemon=True).start()
 
-        if now - last_print >= 1.0 / PRINT_HZ:
-            last_print = now
-            print(
-                f"rx={rx_count} j6_hz={j6_actual_hz:6.1f} "
-                f"power={servo_power_enabled} controller={controller_enabled} "
-                f"j6={j6_enabled} | "
-                f"j6_in={j6_input_pwm} mode={j6_status} "
-                f"target={j6_target_angle_deg:+7.2f} "
-                f"err={(j6_err if j6_err is not None else 0):+7.2f} pwm={j6_pwm} "
-                f"raw='{last_raw[:80]}'"
-            )
+    print(f"[arm] Listening on UDP {UDP_PORT}")
+    print(f"[arm] AUX1=J4  AUX2=J1  AUX3=J3  AUX4=J6  AUX5=J5  AUX6=J2  AUX7=Claw")
+    print(f"[arm] BNO055={'yes' if HAVE_BNO else 'no'}  MOSFET={'yes' if HAVE_GPIO else 'no'}")
 
-except KeyboardInterrupt:
-    pass
+    last_send      = 0.0
+    last_heartbeat = 0.0
+    last_print     = 0.0
 
-finally:
-    if have_tty and old_terminal is not None:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_terminal)
-    print("\nStopping.")
+    try:
+        while True:
+            now = time.time()
 
-    set_pwm(J6_CH, J6_OUT_CENTER)
-    time.sleep(0.05)
+            # ── Receive UDP arm commands ──────────────────────────────────────
+            try:
+                data, _ = sock.recvfrom(1024)
+                line = data.decode(errors="ignore").strip()
+                if line.startswith("PWM:"):
+                    line = line[4:]
+                parts = line.split(",")
+                if len(parts) >= 7:
+                    vals = [float(x) for x in parts]
+                    with _lock:
+                        _joint_us      = [_clamp_us(vals[i]) for i in range(7)]
+                        _j6_target_deg = float(vals[7]) if len(vals) >= 8 else 0.0
+                        _last_pkt_time = now
+                        _rx_count     += 1
+            except socket.timeout:
+                pass
+            except (ValueError, IndexError):
+                pass
 
-    for ch in list(CHANNEL_TO_JOINT_INDEX.keys()) + [J6_CH]:
-        set_off(ch)
+            # ── Send RC_CHANNELS_OVERRIDE at OVERRIDE_HZ ─────────────────────
+            if now - last_send >= 1.0 / OVERRIDE_HZ:
+                last_send = now
+                _send_override(master)
 
-    servo_power(False)
-    lgpio.gpiochip_close(gpio_handle)
-    print("Servo power OFF.")
+            # ── GCS heartbeat every second ────────────────────────────────────
+            if now - last_heartbeat >= 1.0:
+                last_heartbeat = now
+                _send_heartbeat(master)
+
+            # ── Status print at PRINT_HZ ──────────────────────────────────────
+            if now - last_print >= 1.0 / PRINT_HZ:
+                last_print = now
+                with _lock:
+                    rx   = _rx_count
+                    j6t  = _j6_target_deg
+                    lpt  = _last_pkt_time
+                    jus  = list(_joint_us)
+                timed_out = (now - lpt > TIMEOUT_SEC) and (lpt > 0)
+                j6_pwm = _compute_j6_pwm(_clamp_us(jus[5]), j6t) if not timed_out else CENTER_US
+                print(
+                    f"[arm] rx={rx} timeout={timed_out} mosfet={_mosfet_on} | "
+                    f"J1={jus[0]} J2={jus[1]} J3={jus[2]} J4={jus[3]} "
+                    f"J5={jus[4]} J6={j6_pwm}(in={jus[5]},tgt={j6t:.1f}) "
+                    f"Claw={jus[6]}"
+                )
+
+            time.sleep(0.002)
+
+    except KeyboardInterrupt:
+        print("\n[arm] Stopping — centering all AUX channels.")
+
+    finally:
+        # Send CENTER on all AUX channels before exiting
+        rc = [IGNORE] * 18
+        for ch in list(JOINT_TO_RC_CH.values()) + [SPARE_RC_CH]:
+            rc[ch - 1] = CENTER_US
+        ts = master.target_system or 1
+        tc = master.target_component or 1
+        master.mav.rc_channels_override_send(ts, tc, *rc)
+        time.sleep(0.2)
+
+        if HAVE_GPIO and _gpio_h is not None:
+            _lgpio.gpio_write(_gpio_h, MOSFET_GPIO, 0)
+            _lgpio.gpiochip_close(_gpio_h)
+
+        print("[arm] Done.")
+
+
+if __name__ == "__main__":
+    main()
