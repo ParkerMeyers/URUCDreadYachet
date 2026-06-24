@@ -276,40 +276,41 @@ class SSHManager:
                 self._invalidate_client()
             return "", "", str(e)
 
+    def _onboard_pgrep_pattern(self, script_rel_or_name: str) -> str:
+        """pgrep/pkill pattern that matches the running python3 script only."""
+        name = script_rel_or_name.split("/")[-1]
+        if "/" in script_rel_or_name:
+            rel = script_rel_or_name
+        else:
+            rel = f"onboard/{name}"
+        return shlex.quote(f"python3.*/{rel}")
+
     def start_onboard_process(self, script_rel, log_name, extra_args=""):
         rov_path = config["pi_rov_path"]
         script = f"{rov_path}/{script_rel}"
         script_name = script_rel.split('/')[-1]   # e.g. "stabilization.py"
         log_file = f"/tmp/rov_{log_name}.log"
         rov_path_q = shlex.quote(rov_path)
-        script_name_q = shlex.quote(script_name)
+        script_q = shlex.quote(script)
+        pgrep_pat = self._onboard_pgrep_pattern(script_rel)
         log_file_q = shlex.quote(log_file)
         extra_args = (extra_args or "").strip()
-        extra_tokens: list[str] = []
+        extra_args_q = ""
         if extra_args:
-            # Keep free-form flags supported, but tokenize safely.
             try:
-                extra_tokens = shlex.split(extra_args)
+                extra_args_q = " " + " ".join(
+                    shlex.quote(a) for a in shlex.split(extra_args)
+                )
             except ValueError:
-                extra_tokens = [extra_args]
-        launcher_argv = ["python3", script] + extra_tokens
-        launcher_code = (
-            "import json, subprocess, sys; "
-            "cmd=json.loads(sys.argv[1]); cwd=sys.argv[2]; log=sys.argv[3]; "
-            "f=open(log,'ab', buffering=0); "
-            "p=subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, "
-            "stdout=f, stderr=subprocess.STDOUT, start_new_session=True); "
-            "print(p.pid)"
-        )
-        # Kill any existing instance first so it cannot hold the UDP port
-        # that the new process needs to bind (same behaviour as start_mavproxy).
-        # Launch via a remote python helper so PID reporting is deterministic
-        # (shell $! can be unreliable through some SSH/shell combinations).
+                extra_args_q = " " + shlex.quote(extra_args)
+        # Same nohup pattern that works when launched manually on the Pi.
+        # Truncate log each start so error tails reflect the current attempt.
         cmd = (
-            f"pkill -f {script_name_q} 2>/dev/null || true; sleep 0.5; "
-            f"python3 -c {shlex.quote(launcher_code)} "
-            f"{shlex.quote(json.dumps(launcher_argv))} "
-            f"{rov_path_q} {log_file_q}"
+            f"pkill -f {pgrep_pat} 2>/dev/null || true; sleep 0.5; "
+            f"cd {rov_path_q} && "
+            f"nohup python3 {script_q}{extra_args_q} </dev/null > {log_file_q} 2>&1 & "
+            f"sleep 1; "
+            f"pgrep -f {pgrep_pat} | awk 'NR==1{{print; exit}}'"
         )
         out, err, error = self.exec(cmd)
         if error:
@@ -320,16 +321,18 @@ class SSHManager:
             if token.isdigit():
                 pid = token
                 break
-        if not pid:
-            detail = err.strip() or out.strip() or f"launch returned no PID for {script_name}"
-            return False, detail[:240]
-        return True, f"PID {pid}"
+        if pid:
+            return True, f"PID {pid}"
+        # SSH launch succeeded — caller verifies with _wait_onboard_running().
+        return True, f"Launch issued for {script_name}"
 
     def stop_onboard_process(self, script_name):
-        self.exec(f"pkill -f '{script_name}' 2>/dev/null || true")
+        pat = self._onboard_pgrep_pattern(script_name)
+        self.exec(f"pkill -f {pat} 2>/dev/null || true")
 
     def is_onboard_running(self, script_name):
-        out, _, error = self.exec(f"pgrep -f '{script_name}'")
+        pat = self._onboard_pgrep_pattern(script_name)
+        out, _, error = self.exec(f"pgrep -f {pat}")
         if error:
             return False
         return bool(out.strip())
