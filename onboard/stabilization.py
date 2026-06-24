@@ -22,6 +22,8 @@ from dataclasses import dataclass
 
 from pymavlink import mavutil
 
+from mavlink_rc import send_rc_channels_override
+
 
 # ============================================================
 # USER CONFIG
@@ -739,9 +741,8 @@ class PixhawkOutput:
             idx = MOTORS[motor_name]          # 0-based → rc[0..7] = RC ch 1..8
             rc[idx] = int(clamp(pwm, MIN_US, MAX_US))
 
-        ts, tc = self._target()
         try:
-            self.master.mav.rc_channels_override_send(ts, tc, *rc)
+            send_rc_channels_override(self.master, rc, ignore=self.IGNORE)
         except Exception as e:
             print(f"[WARN] RC_CHANNELS_OVERRIDE send failed: {e}")
 

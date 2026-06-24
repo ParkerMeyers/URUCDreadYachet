@@ -28,19 +28,13 @@ Optional hardware (degrades gracefully if absent):
 
 import json
 import math
-import os
 import socket
 import threading
 import time
 
-# AUX outputs use RC channels 9-16 — RC_CHANNELS_OVERRIDE needs MAVLink 2 (8-ch limit in v1).
-os.environ.setdefault("MAVLINK20", "1")
-
 from pymavlink import mavutil
-from pymavlink.dialects.v20 import ardupilotmega as mav_v20
 
-# Encoder for 18-channel RC override when the connection's mav binding is MAVLink 1.
-_MAV_V20 = mav_v20.MAVLink(None, srcSystem=255, srcComponent=190)
+from mavlink_rc import connect_mavlink, send_rc_channels_override
 
 # ── Optional: BNO055 IMU ──────────────────────────────────────────────────────
 try:
@@ -217,30 +211,8 @@ def _mosfet_listener():
 
 
 # ── MAVLink helpers ───────────────────────────────────────────────────────────
-def _connect_mavlink(url: str):
-    """Connect to MAVProxy; force MAVLink 2 so 18-channel RC override is valid."""
-    master = mavutil.mavlink_connection(url, source_system=255)
-    try:
-        master.mav.set_protocol(mavutil.mavlink.MAVLINK_V2)
-    except Exception:
-        pass
-    return master
-
-
 def _send_rc_override(master, rc):
-    ts = master.target_system or 1
-    tc = master.target_component or 1
-    channels = list(rc)
-    while len(channels) < 18:
-        channels.append(IGNORE)
-    try:
-        master.mav.rc_channels_override_send(ts, tc, *channels)
-        return
-    except TypeError:
-        # Pi pymavlink often loads the 8-channel (MAVLink 1) binding even with
-        # MAVLINK20=1 — pack and send via the v20 dialect encoder instead.
-        msg = _MAV_V20.rc_channels_override_encode(ts, tc, *channels[:18])
-        master.write(msg.pack(_MAV_V20))
+    send_rc_channels_override(master, rc, ignore=IGNORE)
 
 
 def _build_rc_array():

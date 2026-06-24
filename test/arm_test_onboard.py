@@ -26,7 +26,12 @@ Start MAVProxy first, then run this script:
 
 import json
 import socket
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "onboard"))
+from mavlink_rc import connect_mavlink, send_rc_channels_override
 
 from pymavlink import mavutil
 
@@ -64,7 +69,7 @@ def clamp(x, lo, hi):
 
 def main():
     print(f"[arm-onboard] Connecting to MAVProxy at {MAVLINK_URL} ...")
-    master = mavutil.mavlink_connection(MAVLINK_URL)
+    master = connect_mavlink(MAVLINK_URL)
 
     print("[arm-onboard] Waiting for heartbeat from Pix6 ...")
     hb = master.wait_heartbeat(timeout=15)
@@ -122,9 +127,7 @@ def main():
         for aux, us in pwm.items():
             rc_ch = aux + AUX_RC_OFFSET - 1          # AUX1→index 8, AUX2→index 9 …
             rc[rc_ch] = int(clamp(us, MIN_US, MAX_US))
-        ts = master.target_system or 1
-        tc = master.target_component or 1
-        master.mav.rc_channels_override_send(ts, tc, *rc)
+        send_rc_channels_override(master, rc, ignore=IGNORE)
 
     def send_heartbeat():
         master.mav.heartbeat_send(
