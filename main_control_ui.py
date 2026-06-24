@@ -3,7 +3,7 @@
 
 Ties together topside senders and onboard control programs:
 - Launch screen: SSH onboard (stabilization.py, new_ar.py) + local topside (arm_sender, thrust_sender)
-- Control screen: dual cameras, heading compass, telemetry, MOSFET, mode, Colmap/Crabs, system bar
+- Control screen: dual ROV RTP cameras (UDP 5600/5601), heading compass, telemetry, MOSFET, mode, Colmap/Crabs, system bar
 
 Run: python main_control_ui.py
 """
@@ -42,16 +42,38 @@ else:
     ImageTk = None
     HAVE_PIL = False
 
+try:
+    from topside.camera_feed import (
+        RovCameraStream,
+        default_camera_sources,
+        camera_display_label,
+        _parse_rov_udp_port as _parse_rov_udp,
+    )
+    HAVE_CAMERA_FEED = True
+except Exception:
+    RovCameraStream = None
+    default_camera_sources = None
+    camera_display_label = lambda s: str(s)
 
-# Optional: prefer a pure-Python SSH path (paramiko) when available. This avoids
-# relying on sshpass or platform ssh that may prompt on a TTY and cause the
-# GUI-launcher subprocess to hang/timeout even though SSH works from an
-# interactive terminal.
+    def _parse_rov_udp(source):
+        if isinstance(source, str) and source.startswith("rov-udp:"):
+            try:
+                return int(source.split(":", 1)[1])
+            except ValueError:
+                return None
+        return None
+
+    HAVE_CAMERA_FEED = False
+
+
+# Password SSH uses Paramiko so the UI never blocks on a console password prompt.
 HAVE_PARAMIKO = importlib.util.find_spec("paramiko") is not None
 if HAVE_PARAMIKO:
     paramiko = importlib.import_module("paramiko")
 else:
     paramiko = None
+
+PARAMIKO_INSTALL_HINT = "pip install paramiko"
 
 
 TELEMETRY_PORT = 5007
@@ -130,6 +152,7 @@ class ProcessController:
         self.local_processes = {}
         self.local_log_handles = {}
         self.remote_ready = False
+        self.onboard_launched = False
         self.ssh_executable = None
         self.sshpass_executable = None
 
@@ -170,6 +193,24 @@ class ProcessController:
 
         return self._resolve_executable(["ssh", "ssh.exe"])
 
+    def _onboard_password(self):
+        password = getattr(self.args, "onboard_password", None)
+        return password if isinstance(password, str) and password else None
+
+    def _uses_password_ssh(self):
+        return self._onboard_password() is not None
+
+    def _ensure_remote_access(self):
+        if self._uses_password_ssh():
+            if paramiko is None:
+                raise RuntimeError(
+                    "Password SSH from the UI requires Paramiko (no console prompts). "
+                    f"Install it with: {PARAMIKO_INSTALL_HINT}"
+                )
+            return "paramiko"
+        self._ensure_ssh_available()
+        return "ssh"
+
     def _ensure_ssh_available(self):
         self.ssh_executable = self._resolve_ssh_executable()
         if not self.ssh_executable:
@@ -192,54 +233,65 @@ class ProcessController:
             "-o",
             f"ConnectTimeout={REMOTE_CONNECT_TIMEOUT_SEC}",
             "-o",
-            "BatchMode=no",
+            "BatchMode=yes",
             "-o",
-            "PreferredAuthentications=password",
-            "-o",
-            "PubkeyAuthentication=no",
-            "-o",
-            "NumberOfPasswordPrompts=1",
+            "NumberOfPasswordPrompts=0",
         ]
         target = str(self.args.onboard_host)
         user = getattr(self.args, "onboard_user", None)
         if user:
             target = f"{str(user)}@{target}"
 
-        password = getattr(self.args, "onboard_password", None)
-        if isinstance(password, str) and password:
+        password = self._onboard_password()
+        if password:
             sshpass_path = self._resolve_sshpass()
             if sshpass_path is not None:
-                return [str(sshpass_path), "-p", password, ssh_executable, *ssh_args, target, str(remote_command)]
+                return [
+                    str(sshpass_path),
+                    "-p",
+                    password,
+                    ssh_executable,
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    f"ConnectTimeout={REMOTE_CONNECT_TIMEOUT_SEC}",
+                    "-o",
+                    "BatchMode=no",
+                    "-o",
+                    "PreferredAuthentications=password",
+                    "-o",
+                    "PubkeyAuthentication=no",
+                    "-o",
+                    "NumberOfPasswordPrompts=1",
+                    target,
+                    str(remote_command),
+                ]
+            raise RuntimeError(
+                "Password SSH requires Paramiko on this system. "
+                f"Install it with: {PARAMIKO_INSTALL_HINT}"
+            )
 
         return [ssh_executable, *ssh_args, target, str(remote_command)]
 
     def _run_remote_command(self, remote_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC):
-        # Prefer a paramiko-based SSH execution when we have a password but no
-        # sshpass available. Many SSH clients prompt on a TTY for passwords and
-        # will not read a password from stdin; that causes the subprocess to
-        # block until the timeout even though interactive SSH works.
-        password = getattr(self.args, "onboard_password", None)
-        sshpass_present = self._resolve_sshpass() is not None
-        if isinstance(password, str) and password and not sshpass_present and paramiko is not None:
-            try:
+        password = self._onboard_password()
+        if password:
+            if paramiko is None:
+                sshpass_present = self._resolve_sshpass() is not None
+                if not sshpass_present:
+                    raise RuntimeError(
+                        "Password SSH from the UI requires Paramiko. "
+                        f"Install it with: {PARAMIKO_INSTALL_HINT}"
+                    )
+            else:
                 return self._run_remote_command_paramiko(remote_command, timeout_sec=timeout_sec)
-            except Exception:
-                pass
 
         command = self._build_ssh_command(remote_command)
-        ssh_input = None
-        if isinstance(password, str) and password and not sshpass_present:
-            # As a fallback we attempt to write the password to stdin. This
-            # will not work with all ssh builds (some read from /dev/tty), but
-            # it's retained for environments where it is supported.
-            ssh_input = f"{password}\n"
-
         try:
             return subprocess.run(
                 command,
                 capture_output=True,
                 text=True,
-                input=ssh_input,
                 timeout=timeout_sec,
                 env=os.environ.copy(),
             )
@@ -256,27 +308,31 @@ class ProcessController:
             raise RuntimeError(f"SSH error while talking to the onboard computer: {exc}") from exc
 
     def _run_remote_command_paramiko(self, remote_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC):
-        """Execute a remote command using Paramiko (pure-Python SSH client).
-
-        Returns an object with attributes: returncode, stdout, stderr (to match
-        subprocess.CompletedProcess-like usage in the rest of the code).
-        """
+        """Execute a remote command using Paramiko (password auth, no TTY prompts)."""
         if paramiko is None:
-            raise RuntimeError("Paramiko is not installed")
+            raise RuntimeError(f"Paramiko is not installed. Run: {PARAMIKO_INSTALL_HINT}")
 
         host = str(self.args.onboard_host)
         user = getattr(self.args, "onboard_user", None)
-        password = getattr(self.args, "onboard_password", None)
+        password = self._onboard_password()
 
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         try:
-            client.connect(hostname=host, username=user or None, password=password or None, timeout=REMOTE_CONNECT_TIMEOUT_SEC)
-            stdin, stdout_fh, stderr_fh = client.exec_command(remote_command, timeout=timeout_sec)
+            client.connect(
+                hostname=host,
+                username=user or None,
+                password=password,
+                timeout=REMOTE_CONNECT_TIMEOUT_SEC,
+                auth_timeout=REMOTE_CONNECT_TIMEOUT_SEC,
+                banner_timeout=REMOTE_CONNECT_TIMEOUT_SEC,
+                allow_agent=False,
+                look_for_keys=False,
+            )
+            _stdin, stdout_fh, stderr_fh = client.exec_command(remote_command, timeout=timeout_sec)
             stdout = stdout_fh.read().decode("utf-8", errors="replace")
             stderr = stderr_fh.read().decode("utf-8", errors="replace")
-            # Paramiko provides an exit status on the channel
             try:
                 returncode = stdout_fh.channel.recv_exit_status()
             except Exception:
@@ -288,7 +344,7 @@ class ProcessController:
             result.stderr = stderr
             return result
         except paramiko.ssh_exception.AuthenticationException as exc:
-            raise RuntimeError("SSH authentication failed: check username/password") from exc
+            raise RuntimeError("SSH authentication failed: check username/password in the UI") from exc
         except (paramiko.SSHException, OSError, socket.timeout) as exc:
             raise RuntimeError(f"SSH (paramiko) error connecting to {host}: {exc}") from exc
         finally:
@@ -296,6 +352,19 @@ class ProcessController:
                 client.close()
             except Exception:
                 pass
+
+    def _onboard_processes_running(self):
+        check_command = (
+            'pgrep -f "onboard/stabilization.py" >/dev/null 2>&1 && '
+            'pgrep -f "onboard/new_ar.py" >/dev/null 2>&1 && '
+            'echo onboard-running'
+        )
+        try:
+            result = self._run_remote_command(check_command, timeout_sec=15)
+            output = (result.stdout or "") + (result.stderr or "")
+            return result.returncode == 0 and "onboard-running" in output
+        except Exception:
+            return False
 
     def _check_remote_setup(self):
         remote_root = str(self.args.onboard_root)
@@ -329,11 +398,12 @@ class ProcessController:
 
     def _build_onboard_hardware_stop_command(self):
         return (
-            'pkill -f "onboard/stabilization.py" || true; '
-            'pkill -f "onboard/new_ar.py" || true; '
-            "sleep 0.25; "
+            'pkill -TERM -f "onboard/stabilization.py" 2>/dev/null || true; '
+            'pkill -TERM -f "onboard/new_ar.py" 2>/dev/null || true; '
+            "sleep 0.75; "
             "python3 - <<'PY'\n"
             "import time\n"
+            "time.sleep(0.1)\n"
             "try:\n"
             "    from smbus2 import SMBus\n"
             "    bus = SMBus(1)\n"
@@ -342,9 +412,20 @@ class ProcessController:
             "        reg = 0x06 + 4 * ch\n"
             "        bus.write_i2c_block_data(addr, reg, [0, 0, 0, 0])\n"
             "    bus.close()\n"
-            "    print('PCA9685 outputs cleared')\n"
+            "    print('PCA9685: all PWM outputs off')\n"
             "except Exception as exc:\n"
             "    print(f'PCA9685 stop warning: {exc}')\n"
+            "try:\n"
+            "    from adafruit_servokit import ServoKit\n"
+            "    kit = ServoKit(channels=16)\n"
+            "    for ch in (8, 9, 10, 11, 12, 14, 15):\n"
+            "        try:\n"
+            "            kit.servo[ch].angle = None\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "    print('ServoKit: PWM outputs released')\n"
+            "except Exception as exc:\n"
+            "    print(f'ServoKit stop warning: {exc}')\n"
             "try:\n"
             "    import lgpio\n"
             "    handle = lgpio.gpiochip_open(0)\n"
@@ -357,15 +438,58 @@ class ProcessController:
             "except Exception as exc:\n"
             "    print(f'MOSFET stop warning: {exc}')\n"
             "open('/tmp/uru_mosfet_state', 'w', encoding='utf-8').write('0')\n"
-            "PY"
+            "PY\n"
+            "sleep 0.2; "
+            'pkill -9 -f "onboard/stabilization.py" 2>/dev/null || true; '
+            'pkill -9 -f "onboard/new_ar.py" 2>/dev/null || true; '
+            'echo onboard-hw-stop-complete'
         )
 
     def _stop_onboard_hardware(self):
-        self._ensure_ssh_available()
-        self._run_remote_command(
+        self._ensure_remote_access()
+        result = self._run_remote_command(
             self._build_onboard_hardware_stop_command(),
-            timeout_sec=20,
+            timeout_sec=30,
         )
+        self.onboard_launched = False
+        self.remote_ready = False
+        return result
+
+    def _read_log_tail(self, name, max_lines=12):
+        log_path = self.log_dir / f"{name}.log"
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            return "\n".join(lines[-max_lines:]) if lines else "(empty log)"
+        except Exception as exc:
+            return f"(could not read log: {exc})"
+
+    def _stop_local_topside(self):
+        for name, process in list(self.local_processes.items()):
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+            handle = self.local_log_handles.pop(name, None)
+            if handle is not None:
+                handle.close()
+            self.local_processes.pop(name, None)
+
+    def _verify_topside_processes(self, timeout_sec=2.0):
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            states = {name: self.get_process_state(name) for name in self.local_processes}
+            if all(state == "running" for state in states.values()):
+                return []
+            time.sleep(0.15)
+
+        failed = []
+        for name, process in self.local_processes.items():
+            if process.poll() is not None:
+                failed.append((name, process.returncode, self._read_log_tail(name)))
+        return failed
 
     def set_mosfet_state(self, enabled):
         state_value = 1 if enabled else 0
@@ -405,7 +529,9 @@ class ProcessController:
         return self._run_remote_command(stop_command, timeout_sec=20)
 
     def _launch_topside_programs_visible(self):
+        self._stop_local_topside()
         results = {}
+        mode_file = str(self.log_dir / UI_MODE_FILENAME)
         for name, rel_path in [
             ("arm_sender", Path("topside") / "arm_sender.py"),
             ("thrust_sender", Path("topside") / "thrust_sender.py"),
@@ -418,9 +544,12 @@ class ProcessController:
             log_handle = open(log_path, "a", encoding="utf-8")
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
+            env["ROV_UI_MANAGED"] = "1"
             if name == "thrust_sender":
                 env["ROV_TELEMETRY_UI_PORT"] = str(TELEMETRY_PORT)
-                env["ROV_UI_MODE_FILE"] = str(self.log_dir / UI_MODE_FILENAME)
+                env["ROV_UI_MODE_FILE"] = mode_file
+            if name == "arm_sender":
+                env["ROV_ARM_SERIAL"] = os.getenv("ROV_ARM_SERIAL", "COM3" if os.name == "nt" else "/dev/ttyACM0")
 
             launch_args = [sys.executable, str(script_path)]
             if name in {"arm_sender", "thrust_sender"}:
@@ -433,7 +562,9 @@ class ProcessController:
                 "env": env,
             }
             if os.name == "nt":
-                subprocess_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                if creationflags:
+                    subprocess_kwargs["creationflags"] = creationflags
             else:
                 subprocess_kwargs["start_new_session"] = True
 
@@ -445,11 +576,31 @@ class ProcessController:
         return results
 
     def launch_topside_programs(self):
-        return self._launch_topside_programs_visible()
+        results = self._launch_topside_programs_visible()
+        failed = self._verify_topside_processes()
+        if failed:
+            self._stop_local_topside()
+            details = []
+            for name, code, tail in failed:
+                details.append(f"{name} exited with code {code}.\nLast log lines:\n{tail}")
+            raise RuntimeError(
+                "Topside program(s) failed to stay running.\n\n"
+                + "\n\n".join(details)
+                + "\n\nInstall missing packages (pip install pygame pyserial) and check logs/."
+            )
+        return results
 
     def _launch_onboard_programs_remote(self):
-        self._ensure_ssh_available()
+        self._ensure_remote_access()
         self._check_remote_setup()
+
+        # Always safe-stop existing onboard processes and hardware before a fresh launch.
+        try:
+            self._stop_onboard_hardware()
+        except Exception:
+            pass
+
+        time.sleep(0.5)
 
         remote_root = str(self.args.onboard_root)
         remote_logs = {
@@ -465,12 +616,20 @@ class ProcessController:
         for program_name, remote_script_path, remote_log_path in launch_plan:
             self._launch_remote_program(program_name, remote_script_path, remote_log_path)
 
+        time.sleep(0.3)
+        if not self._onboard_processes_running():
+            raise RuntimeError(
+                "SSH commands completed but onboard processes were not detected on the Pi. "
+                "Check /tmp/uru_stabilization.log and /tmp/uru_new_ar.log on the robot."
+            )
+
         try:
             self.set_mosfet_state(False)
         except Exception:
             pass
 
         self.remote_ready = True
+        self.onboard_launched = True
         return {
             "status": "started",
             "host": self.args.onboard_host,
@@ -480,30 +639,41 @@ class ProcessController:
         }
 
     def launch_onboard_programs(self):
+        self._ensure_remote_access()
+        if self._onboard_processes_running():
+            remote_root = str(self.args.onboard_root)
+            self.remote_ready = True
+            self.onboard_launched = True
+            try:
+                self.set_mosfet_state(False)
+            except Exception:
+                pass
+            return {
+                "status": "already_running",
+                "host": self.args.onboard_host,
+                "user": self.args.onboard_user,
+                "remote_root": remote_root,
+                "logs": {
+                    "stabilization": "/tmp/uru_stabilization.log",
+                    "new_ar": "/tmp/uru_new_ar.log",
+                },
+            }
         return self._launch_onboard_programs_remote()
 
     def stop_all(self):
-        for name, process in list(self.local_processes.items()):
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-            handle = self.local_log_handles.pop(name, None)
-            if handle is not None:
-                handle.close()
-            self.local_processes.pop(name, None)
+        # 1) Stop topside command senders first so the Pi stops receiving new packets.
+        self._stop_local_topside()
+        time.sleep(0.4)
 
-        if self.remote_ready:
-            try:
-                self._stop_onboard_hardware()
-            except Exception:
-                try:
-                    self.set_mosfet_state(False)
-                except Exception:
-                    pass
+        # 2) Gracefully shut down onboard PWM/servos, then kill stale processes.
+        if self.onboard_launched:
+            self._stop_onboard_hardware()
+        else:
             self.remote_ready = False
+
+    def stop_onboard_hardware(self):
+        """Public wrapper used by the UI stop button for onboard-only shutdown."""
+        return self._stop_onboard_hardware()
 
     def get_process_state(self, name):
         process = self.local_processes.get(name)
@@ -532,7 +702,7 @@ class ROVMainApp(tk.Tk):
         self.onboard_started = False
         self._onboard_launch_in_progress = False
         self.mosfet_enabled = False
-        self.control_mode = "Stabilization"
+        self.control_mode = "Disarmed"
         self.colmap_running = False
         self.crabs_running = False
         self.colmap_button = None
@@ -553,12 +723,16 @@ class ROVMainApp(tk.Tk):
         self.telemetry_payload = {}
         self.telemetry_online = False
         self.last_telemetry_time = 0.0
-        self.camera_sources = [
-            os.getenv("ROV_CAMERA_1_URL", "0"),
-            os.getenv("ROV_CAMERA_2_URL", "1"),
-        ]
+        if HAVE_CAMERA_FEED and default_camera_sources is not None:
+            self.camera_sources = default_camera_sources()
+        else:
+            self.camera_sources = [
+                os.getenv("ROV_CAMERA_1_URL", "rov-udp:5600"),
+                os.getenv("ROV_CAMERA_2_URL", "rov-udp:5601"),
+            ]
         self.camera_streams = [None, None]
         self.camera_images = {}
+        self.camera_status = ["waiting", "waiting"]
         self.onboard_host_var = tk.StringVar(value=self.args.onboard_host)
         self.onboard_user_var = tk.StringVar(value=self.args.onboard_user)
         self.onboard_password_var = tk.StringVar(value=self.args.onboard_password)
@@ -568,7 +742,7 @@ class ROVMainApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         try:
-            self.mode_bridge.write("Stabilization")
+            self.mode_bridge.write("Disarmed")
         except Exception:
             pass
 
@@ -590,6 +764,7 @@ class ROVMainApp(tk.Tk):
                 release = getattr(stream, "release", None)
                 if callable(release):
                     release()
+        self.camera_streams = [None, None]
         self.destroy()
 
     def _apply_dark_theme(self):
@@ -779,14 +954,14 @@ class ROVMainApp(tk.Tk):
         cameras.columnconfigure(1, weight=1)
         cameras.rowconfigure(0, weight=1)
 
-        self.camera_left = ttk.LabelFrame(cameras, text="Camera 1", style="Card.TLabelframe")
+        self.camera_left = ttk.LabelFrame(cameras, text="Camera 1 · RTP/UDP 5600", style="Card.TLabelframe")
         self.camera_left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         self.camera_left.rowconfigure(0, weight=1)
         self.camera_left.columnconfigure(0, weight=1)
         self.camera_left_canvas = tk.Canvas(self.camera_left, bg="#101820", highlightthickness=0)
         self.camera_left_canvas.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 
-        self.camera_right = ttk.LabelFrame(cameras, text="Camera 2", style="Card.TLabelframe")
+        self.camera_right = ttk.LabelFrame(cameras, text="Camera 2 · RTP/UDP 5601", style="Card.TLabelframe")
         self.camera_right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         self.camera_right.rowconfigure(0, weight=1)
         self.camera_right.columnconfigure(0, weight=1)
@@ -873,19 +1048,35 @@ class ROVMainApp(tk.Tk):
 
     def _start_onboard_programs(self):
         if getattr(self, "_onboard_launch_in_progress", False):
-            return
+            started_at = getattr(self, "_onboard_launch_started_at", 0.0)
+            if time.time() - started_at < 90:
+                return
+            self._onboard_launch_in_progress = False
 
         host = self.onboard_host_var.get().strip()
         user = self.onboard_user_var.get().strip()
-        password = self.onboard_password_var.get().strip()
+        password = self.onboard_password_var.get()
         self.args.onboard_host = host or self.args.onboard_host
         self.args.onboard_user = user or self.args.onboard_user
-        self.args.onboard_password = password or self.args.onboard_password
+        self.args.onboard_password = password if password else self.args.onboard_password
         self.controller.args.onboard_host = self.args.onboard_host
         self.controller.args.onboard_user = self.args.onboard_user
         self.controller.args.onboard_password = self.args.onboard_password
 
+        if self.controller._uses_password_ssh() and not HAVE_PARAMIKO:
+            messagebox.showerror(
+                "Paramiko required",
+                f"Password SSH from the UI needs Paramiko installed.\n\nRun: {PARAMIKO_INSTALL_HINT}",
+            )
+            return
+
+        if self.topside_started:
+            self.controller._stop_local_topside()
+            self.topside_started = False
+            self.topside_status_var.set("Topside: paused while onboard restarts")
+
         self._onboard_launch_in_progress = True
+        self._onboard_launch_started_at = time.time()
         self.onboard_button.config(state="disabled")
         self.onboard_status_var.set("Onboard: launching over SSH...")
         self.launch_progress_var.set("Connecting to Pi and starting stabilization.py + new_ar.py")
@@ -893,18 +1084,50 @@ class ROVMainApp(tk.Tk):
         def worker():
             try:
                 result = self.controller.launch_onboard_programs()
-                self.after(0, lambda: self._on_onboard_launch_success(result))
+                self.after(0, lambda r=result: self._on_onboard_launch_success(r))
             except Exception as exc:
-                self.after(0, lambda: self._on_onboard_launch_failure(exc))
+                if self.controller._onboard_processes_running():
+                    fallback = {
+                        "status": "recovered",
+                        "host": self.args.onboard_host,
+                        "user": self.args.onboard_user,
+                        "remote_root": str(self.args.onboard_root),
+                        "logs": {
+                            "stabilization": "/tmp/uru_stabilization.log",
+                            "new_ar": "/tmp/uru_new_ar.log",
+                        },
+                    }
+                    self.after(0, lambda r=fallback: self._on_onboard_launch_success(r))
+                else:
+                    self.after(0, lambda e=exc: self._on_onboard_launch_failure(e))
+            finally:
+                self.after(0, self._clear_onboard_launch_in_progress_if_stale)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _clear_onboard_launch_in_progress_if_stale(self):
+        if self.onboard_started:
+            self._onboard_launch_in_progress = False
+            self.onboard_button.config(state="normal")
 
     def _on_onboard_launch_success(self, result):
         self._onboard_launch_in_progress = False
         self.onboard_button.config(state="normal")
         self.onboard_started = True
+        try:
+            self.mode_bridge.write("Disarmed")
+            self.control_mode = "Disarmed"
+            if hasattr(self, "mode_var"):
+                self.mode_var.set("Disarmed")
+        except Exception:
+            pass
+        status_note = ""
+        if result.get("status") == "already_running":
+            status_note = " (already running on Pi)"
+        elif result.get("status") == "recovered":
+            status_note = " (detected running after SSH)"
         self.onboard_status_var.set(
-            f"Onboard: running on {result['host']} ({result['user']})"
+            f"Onboard: running on {result['host']} ({result['user']}){status_note}"
         )
         self.remote_status_var.set(
             f"Remote root: {result['remote_root']}"
@@ -925,8 +1148,8 @@ class ROVMainApp(tk.Tk):
 
     def _start_topside_programs(self):
         try:
-            self.mode_bridge.write(self.control_mode)
-            result = self.controller.launch_topside_programs()
+            self.mode_bridge.write("Disarmed")
+            self.controller.launch_topside_programs()
             self.topside_started = True
             self.topside_status_var.set("Topside: arm_sender.py + thrust_sender.py running")
             self.launch_progress_var.set(
@@ -947,17 +1170,32 @@ class ROVMainApp(tk.Tk):
 
     def _stop_all(self):
         try:
+            self.mode_bridge.write("Disarmed")
+        except Exception:
+            pass
+
+        try:
             self.controller.stop_all()
         except Exception as exc:
-            messagebox.showwarning("Stop all warning", f"Some stop steps failed: {exc}")
+            messagebox.showwarning(
+                "Stop all warning",
+                f"Some stop steps failed: {exc}\n"
+                "If motors are still active, power-cycle the ROV or run stop again.",
+            )
 
         self.onboard_started = False
         self.topside_started = False
         self.mosfet_enabled = False
+        self.colmap_running = False
+        self.crabs_running = False
+        if self.colmap_button is not None:
+            self.colmap_button.config(state="normal", text="Start Colmap")
+        if self.crabs_button is not None:
+            self.crabs_button.config(state="normal", text="Start Crabs")
         self.onboard_status_var.set("Onboard: not started")
         self.topside_status_var.set("Topside: not started")
         self.remote_status_var.set("Remote: idle")
-        self.launch_progress_var.set("")
+        self.launch_progress_var.set("All programs stopped. Hardware outputs cleared.")
         self._update_mosfet_button()
         self._refresh_next_state()
         self._show_launch_screen()
@@ -1134,57 +1372,98 @@ class ROVMainApp(tk.Tk):
         canvas.create_rectangle(0, 0, width, height, fill="#101820", outline="#334155")
 
         source = self.camera_sources[index] if index < len(self.camera_sources) else ""
-        status_text = f"Source: {source or 'disabled'}"
-        canvas.create_text(
-            width / 2,
-            height / 2 - 20,
-            text=title,
-            fill="#f8fafc",
-            font=("Segoe UI", 18, "bold"),
-        )
-        canvas.create_text(
-            width / 2,
-            height / 2 + 12,
-            text="Live camera feed placeholder",
-            fill="#94a3b8",
-            font=("Segoe UI", 12),
-        )
-        canvas.create_text(
-            width / 2,
-            height / 2 + 38,
-            text=status_text,
-            fill="#cbd5e1",
-            font=("Segoe UI", 10),
-        )
+        feed_label = camera_display_label(source) if source else "disabled"
+        status = self.camera_status[index] if index < len(self.camera_status) else "waiting"
 
-        if HAVE_CV2 and HAVE_PIL and source:
-            cap = self.camera_streams[index]
-            if cap is None:
+        if HAVE_CV2 and HAVE_PIL and source and HAVE_CAMERA_FEED and RovCameraStream is not None:
+            stream = self.camera_streams[index]
+            if stream is None:
                 try:
-                    cap = cv2.VideoCapture(source)
-                    self.camera_streams[index] = cap
+                    stream = RovCameraStream(source, cv2=cv2)
+                    self.camera_streams[index] = stream
+                except Exception as exc:
+                    self.camera_status[index] = f"open failed: {exc}"
+                    stream = None
+
+            if stream is not None:
+                label_frame = self.camera_left if index == 0 else self.camera_right
+                try:
+                    label_frame.configure(text=f"{title} · {stream.label}")
                 except Exception:
-                    cap = None
+                    pass
 
-            if cap is not None:
                 try:
-                    ok, frame = cap.read()
+                    ok, frame = stream.read()
                     if ok and frame is not None:
                         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         resized = cv2.resize(frame, (width, height))
                         photo = ImageTk.PhotoImage(Image.fromarray(resized))
                         self.camera_images[canvas] = photo
                         canvas.create_image(0, 0, anchor="nw", image=photo)
+                        self.camera_status[index] = "live"
                         canvas.create_text(
                             width / 2,
                             height - 28,
-                            text="Live feed active",
+                            text=f"Live · {stream.label}",
                             fill="#34d399",
                             font=("Segoe UI", 10, "bold"),
                         )
                         return
-                except Exception:
-                    pass
+                    self.camera_status[index] = "waiting for stream"
+                except Exception as exc:
+                    self.camera_status[index] = f"read error: {exc}"
+                    try:
+                        stream.release()
+                    except Exception:
+                        pass
+                    self.camera_streams[index] = None
+
+        status = self.camera_status[index] if index < len(self.camera_status) else status
+        canvas.create_text(
+            width / 2,
+            height / 2 - 28,
+            text=title,
+            fill="#f8fafc",
+            font=("Segoe UI", 18, "bold"),
+        )
+        canvas.create_text(
+            width / 2,
+            height / 2 + 4,
+            text="ROV H.264 RTP feed",
+            fill="#94a3b8",
+            font=("Segoe UI", 12),
+        )
+        canvas.create_text(
+            width / 2,
+            height / 2 + 30,
+            text=feed_label,
+            fill="#cbd5e1",
+            font=("Segoe UI", 10),
+        )
+        canvas.create_text(
+            width / 2,
+            height / 2 + 54,
+            text=status,
+            fill="#64748b",
+            font=("Segoe UI", 9),
+        )
+        if not HAVE_CV2 or not HAVE_PIL:
+            canvas.create_text(
+                width / 2,
+                height / 2 + 78,
+                text="Install opencv-python and Pillow for in-UI video",
+                fill="#fbbf24",
+                font=("Segoe UI", 9),
+            )
+        elif not shutil.which("gst-launch-1.0") and _parse_rov_udp(source) is not None:
+            canvas.create_text(
+                width / 2,
+                height / 2 + 78,
+                text="Install GStreamer for RTP decode (or OpenCV+GStreamer build)",
+                fill="#fbbf24",
+                font=("Segoe UI", 9),
+                width=width - 40,
+            )
 
         canvas.create_line(40, 40, width - 40, height - 40, fill="#1d4ed8", width=2)
         canvas.create_line(40, height - 40, width - 40, 40, fill="#1d4ed8", width=2)

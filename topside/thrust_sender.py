@@ -503,74 +503,78 @@ def main():
                 print(f"Gain: {gain_percent}%")
 
             # ----------------------------------------------------
-            # Controller buttons.
+            # Controller buttons / axes (optional when UI-managed).
             # ----------------------------------------------------
-            num_buttons = joy.get_numbuttons()
+            if joy is None and pygame.joystick.get_count() > 0:
+                joy = pygame.joystick.Joystick(0)
+                joy.init()
+                button_previous = [False] * joy.get_numbuttons()
+                hat_previous = [(0, 0)] * joy.get_numhats()
+                print(f"Joystick connected: {joy.get_name()}")
 
-            if len(button_previous) != num_buttons:
-                button_previous = [False] * num_buttons
+            if joy is not None:
+                num_buttons = joy.get_numbuttons()
 
-            for b in range(num_buttons):
-                pressed = bool(joy.get_button(b))
+                if len(button_previous) != num_buttons:
+                    button_previous = [False] * num_buttons
 
-                if pressed and not button_previous[b]:
-                    if PRINT_BUTTON_DEBUG:
-                        print(f"Button pressed: {b}")
+                for b in range(num_buttons):
+                    pressed = bool(joy.get_button(b))
 
-                    if b == BUTTON_STABILIZE:
-                        stabilize = not stabilize
-                        print(f"Stabilization toggled by controller button {b}: {stabilize}")
+                    if pressed and not button_previous[b]:
+                        if PRINT_BUTTON_DEBUG:
+                            print(f"Button pressed: {b}")
 
-                    if BUTTON_DEPTH_HOLD is not None and b == BUTTON_DEPTH_HOLD:
-                        depth_hold = not depth_hold
-                        print(f"Depth hold toggled by controller button {b}: {depth_hold}")
+                        if b == BUTTON_STABILIZE:
+                            stabilize = not stabilize
+                            print(f"Stabilization toggled by controller button {b}: {stabilize}")
 
-                    if BUTTON_YAW_HOLD is not None and b == BUTTON_YAW_HOLD:
-                        yaw_hold = not yaw_hold
-                        print(f"Yaw hold toggled by controller button {b}: {yaw_hold}")
+                        if BUTTON_DEPTH_HOLD is not None and b == BUTTON_DEPTH_HOLD:
+                            depth_hold = not depth_hold
+                            print(f"Depth hold toggled by controller button {b}: {depth_hold}")
 
-                    if BUTTON_GAIN_UP is not None and b == BUTTON_GAIN_UP:
+                        if BUTTON_YAW_HOLD is not None and b == BUTTON_YAW_HOLD:
+                            yaw_hold = not yaw_hold
+                            print(f"Yaw hold toggled by controller button {b}: {yaw_hold}")
+
+                        if BUTTON_GAIN_UP is not None and b == BUTTON_GAIN_UP:
+                            gain_percent = adjust_gain(gain_percent, GAIN_STEP_PERCENT)
+                            print(f"Gain: {gain_percent}%")
+
+                        if BUTTON_GAIN_DOWN is not None and b == BUTTON_GAIN_DOWN:
+                            gain_percent = adjust_gain(gain_percent, -GAIN_STEP_PERCENT)
+                            print(f"Gain: {gain_percent}%")
+
+                        if BUTTON_QUIT is not None and b == BUTTON_QUIT:
+                            running = False
+
+                    button_previous[b] = pressed
+
+                num_hats = joy.get_numhats()
+
+                if len(hat_previous) != num_hats:
+                    hat_previous = [(0, 0)] * num_hats
+
+                for h in range(num_hats):
+                    hat_x, hat_y = joy.get_hat(h)
+                    prev_x, prev_y = hat_previous[h]
+
+                    if hat_y == 1 and prev_y != 1:
                         gain_percent = adjust_gain(gain_percent, GAIN_STEP_PERCENT)
                         print(f"Gain: {gain_percent}%")
 
-                    if BUTTON_GAIN_DOWN is not None and b == BUTTON_GAIN_DOWN:
+                    elif hat_y == -1 and prev_y != -1:
                         gain_percent = adjust_gain(gain_percent, -GAIN_STEP_PERCENT)
                         print(f"Gain: {gain_percent}%")
 
-                    if BUTTON_QUIT is not None and b == BUTTON_QUIT:
-                        running = False
+                    hat_previous[h] = (hat_x, hat_y)
 
-                button_previous[b] = pressed
-
-            # ----------------------------------------------------
-            # D-pad / hat gain control.
-            # ----------------------------------------------------
-            num_hats = joy.get_numhats()
-
-            if len(hat_previous) != num_hats:
-                hat_previous = [(0, 0)] * num_hats
-
-            for h in range(num_hats):
-                hat_x, hat_y = joy.get_hat(h)
-                prev_x, prev_y = hat_previous[h]
-
-                if hat_y == 1 and prev_y != 1:
-                    gain_percent = adjust_gain(gain_percent, GAIN_STEP_PERCENT)
-                    print(f"Gain: {gain_percent}%")
-
-                elif hat_y == -1 and prev_y != -1:
-                    gain_percent = adjust_gain(gain_percent, -GAIN_STEP_PERCENT)
-                    print(f"Gain: {gain_percent}%")
-
-                hat_previous[h] = (hat_x, hat_y)
-
-            # ----------------------------------------------------
-            # Raw axes.
-            # ----------------------------------------------------
-            left_x = get_axis_safe(joy, AXIS_LEFT_X)
-            left_y = get_axis_safe(joy, AXIS_LEFT_Y)
-            right_x = get_axis_safe(joy, AXIS_RIGHT_X)
-            right_y = get_axis_safe(joy, AXIS_RIGHT_Y)
+                left_x = get_axis_safe(joy, AXIS_LEFT_X)
+                left_y = get_axis_safe(joy, AXIS_LEFT_Y)
+                right_x = get_axis_safe(joy, AXIS_RIGHT_X)
+                right_y = get_axis_safe(joy, AXIS_RIGHT_Y)
+            else:
+                left_x = left_y = right_x = right_y = 0.0
 
             # ----------------------------------------------------
             # Mapped controls.

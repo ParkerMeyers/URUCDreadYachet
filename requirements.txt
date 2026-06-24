@@ -1,0 +1,20 @@
+# Topside control laptop + main_control_ui.py
+#   pip install -r requirements.txt
+#
+# Onboard Raspberry Pi dependencies are in requirements-onboard.txt
+#   pip install -r requirements-onboard.txt
+
+# SSH launch from UI (password auth, no console prompts)
+paramiko>=3.4
+
+# thrust_sender.py
+pygame>=2.5
+pynput>=1.7.6
+
+# arm_sender.py
+pyserial>=3.5
+
+# Camera panels in main_control_ui.py (RTP/UDP H.264 via OpenCV)
+opencv-python>=4.8
+Pillow>=10.0
+numpy>=1.24

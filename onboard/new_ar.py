@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import socket, time, sys, select, termios, tty, math
+import socket, time, sys, select, termios, tty, math, signal
 import board, busio, adafruit_bno055
 from adafruit_servokit import ServoKit
 import lgpio
@@ -341,6 +341,13 @@ last_print = time.time()
 j6_err = None
 j6_pwm = CENTER_US
 j6_status = "off"
+
+
+def _handle_shutdown_signal(signum, frame):
+    raise KeyboardInterrupt()
+
+
+signal.signal(signal.SIGTERM, _handle_shutdown_signal)
 
 try:
     tty.setcbreak(sys.stdin.fileno())
