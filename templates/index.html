@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>DreadYachet ROV</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/rov_ui.css') }}">
+
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════
+     LAUNCH SCREEN
+     ══════════════════════════════════════════════════ -->
+<div id="launch" class="view active">
+
+  <div class="launch-header">
+    <h1>DreadYachet ROV</h1>
+    <p>Mission Control &amp; Launch System</p>
+  </div>
+
+  <div class="config-grid">
+
+    <div class="config-group">
+      <h3>Pi Connection</h3>
+      <div class="field"><label>Pi IP Address</label>
+        <input id="cfg-pi_ip" type="text" value="192.168.2.249"/></div>
+      <div class="field"><label>SSH User</label>
+        <input id="cfg-pi_user" type="text" value="uruc"/></div>
+      <div class="field"><label>SSH Password</label>
+        <input id="cfg-pi_password" type="password" value="yahboom"/></div>
+      <div class="field"><label>SSH Port</label>
+        <input id="cfg-pi_ssh_port" type="text" value="22"/></div>
+      <div class="field"><label>ROV Project Path on Pi</label>
+        <input id="cfg-pi_rov_path" type="text" value="/home/uruc/URUCDreadYachet"/></div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="sshConnect()">Connect SSH</button>
+        <span id="ssh-status" class="ssh-badge">Disconnected</span>
+      </div>
+    </div>
+
+    <div class="config-group">
+      <h3>Topside Hardware</h3>
+      <div class="field"><label>Serial Port (Arm Controller)</label>
+        <input id="cfg-serial_port" type="text" value="COM3"/></div>
+      <div class="field"><label>Camera 1 URL (MJPEG)</label>
+        <input id="cfg-camera1_url" type="text" value="http://192.168.2.249:8160"/></div>
+      <div class="field"><label>Camera 2 URL (MJPEG)</label>
+        <input id="cfg-camera2_url" type="text" value="http://192.168.2.249:8161"/></div>
+    </div>
+
+    <div class="config-group">
+      <h3>Network Ports</h3>
+      <div class="field"><label>Thrust UDP Port (→ Pi, 5005)</label>
+        <input id="cfg-thrust_udp_port" type="text" value="5005"/></div>
+      <div class="field"><label>Telemetry Port (← Pi, 5006)</label>
+        <input id="cfg-telemetry_port" type="text" value="5006"/></div>
+      <div class="field"><label>Arm UDP Port (→ Pi)</label>
+        <input id="cfg-arm_udp_port" type="text" value="5006"/></div>
+      <div class="field"><label>MOSFET Control Port</label>
+        <input id="cfg-mosfet_control_port" type="text" value="5007"/></div>
+    </div>
+
+    <div class="config-group">
+      <h3>MAVProxy (on Pi)</h3>
+      <div class="field"><label>MAVProxy Binary Path</label>
+        <input id="cfg-mavproxy_bin" type="text" value="/home/uruc/mav_env/bin/mavproxy.py"/></div>
+      <div class="field"><label>Pixhawk Serial Port</label>
+        <input id="cfg-mavproxy_serial" type="text" value="/dev/ttyACM1"/></div>
+      <div class="field"><label>Baud Rate</label>
+        <input id="cfg-mavproxy_baud" type="text" value="115200"/></div>
+      <div class="field"><label>UDP Out 1 (topside)</label>
+        <input id="cfg-mavproxy_out1" type="text" value="udp:10.42.0.1:14550"/></div>
+      <div class="field"><label>UDP Out 2 (local Pi)</label>
+        <input id="cfg-mavproxy_out2" type="text" value="udp:127.0.0.1:14551"/></div>
+    </div>
+
+    <div class="config-group">
+      <h3>Onboard Commands</h3>
+      <div class="field"><label>COLMAP Command (on Pi)</label>
+        <input id="cfg-colmap_command" type="text" value="python3 colmap_run.py"/></div>
+      <div class="field"><label>Crabs Command (on Pi)</label>
+        <input id="cfg-crabs_command" type="text" value="python3 crabs.py"/></div>
+    </div>
+
+  </div>
+
+  <div class="launch-panels">
+
+    <!-- Onboard panel -->
+    <div class="panel">
+      <h2>🔵 Onboard Programs <small style="font-size:.7rem;color:var(--dim)">(Pi)</small></h2>
+      <p class="panel-desc">Launches MAVProxy, <code>stabilization.py</code> (thruster control) and
+        <code>new_ar.py</code> (arm + MOSFET) on the ROV Pi via SSH.</p>
+      <div class="program-status">
+        <div class="prog-row"><div class="dot" id="dot-mavproxy"></div><span>mavproxy (UDP bridge)</span></div>
+        <div class="prog-row"><div class="dot" id="dot-stab"></div><span>stabilization.py</span></div>
+        <div class="prog-row"><div class="dot" id="dot-arm"></div><span>new_ar.py</span></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btn-start-onboard" onclick="startOnboard()">Start Onboard</button>
+        <button class="btn btn-danger" onclick="stopOnboard()">Stop</button>
+      </div>
+      <div id="onboard-summary" style="font-size:.8rem;font-weight:600;min-height:20px;font-family:var(--mono)"></div>
+      <div class="progress-log" id="onboard-progress-log" style="display:none"></div>
+    </div>
+
+    <!-- Topside panel -->
+    <div class="panel">
+      <h2>🟡 Topside Programs <small style="font-size:.7rem;color:var(--dim)">(this PC)</small></h2>
+      <p class="panel-desc">Launches <code>arm_sender.py</code> (serial → arm control) on this PC.
+        Gamepad thruster control is built into this web UI — no separate script needed.</p>
+      <div class="program-status">
+        <div class="prog-row">
+          <div class="dot" id="dot-gamepad-launch"></div>
+          <span id="gamepad-launch-label">Gamepad — press any button to connect</span>
+        </div>
+        <div class="prog-row"><div class="dot" id="dot-armlocal"></div><span>arm_sender.py</span></div>
+        <div class="prog-row">
+          <div class="dot" id="dot-telem-launch"></div>
+          <span id="telem-launch-label">Telemetry listener (UDP 5006)</span>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" id="btn-activate-gp" onclick="activateGamepad()">Activate Gamepad</button>
+        <button class="btn btn-primary" id="btn-start-topside" onclick="startTopside()">Start Arm Sender</button>
+        <button class="btn btn-danger" onclick="stopTopside()">Stop</button>
+      </div>
+      <div id="topside-msg" style="font-size:.75rem;color:var(--dim);min-height:18px;font-family:var(--mono)"></div>
+    </div>
+
+  </div>
+
+  <div class="proceed-row">
+    <button class="btn btn-success" onclick="openControl()">Open Control Screen →</button>
+  </div>
+
+</div><!-- /launch -->
+
+<!-- ══════════════════════════════════════════════════
+     CONTROL SCREEN
+     ══════════════════════════════════════════════════ -->
+<div id="control" class="view">
+
+  <!-- Top bar -->
+  <div class="topbar">
+    <span class="topbar-title">⚓ DreadYachet ROV</span>
+
+    <span id="pill-connection" class="status-pill">
+      <span class="status-dot"></span> SSH: --
+    </span>
+    <span id="pill-telemetry" class="status-pill">
+      <span class="status-dot"></span> Telem: --
+    </span>
+    <span id="pill-mode" class="status-pill">
+      <span class="status-dot"></span> Mode: --
+    </span>
+    <span id="pill-gamepad" class="status-pill err">
+      <span class="status-dot"></span> GP: NONE
+    </span>
+
+    <span class="topbar-spacer"></span>
+
+    <span style="font-family:var(--mono);font-size:.75rem;color:var(--dim);white-space:nowrap;flex-shrink:0">
+      GAIN: <span id="tb-gain" style="color:var(--accent)">100</span>%
+    </span>
+    <button class="btn btn-secondary" style="padding:4px 12px;font-size:.75rem;flex-shrink:0"
+            onclick="activateGamepad()">🎮 GP</button>
+    <button class="btn btn-secondary" style="padding:4px 12px;font-size:.75rem;flex-shrink:0"
+            onclick="showKeybinds()">⌨ Keybinds</button>
+    <button class="btn btn-secondary" style="padding:4px 12px;font-size:.75rem;flex-shrink:0"
+            onclick="toggleLog()">Logs</button>
+    <button class="btn btn-secondary" style="padding:4px 12px;font-size:.75rem;flex-shrink:0"
+            onclick="showLaunch()">← Launch</button>
+  </div>
+
+  <!-- Camera feeds -->
+  <div class="cameras">
+
+    <div class="cam-wrap">
+      <div class="cam-no-signal" id="no-sig-1">
+        <div class="ns-icon">📡</div>
+        <div class="ns-text">No Signal — Camera 1</div>
+      </div>
+      <img id="cam1" class="cam-img" style="display:none" alt="Camera 1"/>
+      <canvas id="hud1" class="cam-hud"></canvas>
+      <div id="disarmed-banner" class="disarmed-banner hidden">⚠ DISARMED — select DRIVE/ARMED to move thrusters</div>
+      <div class="cam-label">CAM 1 / FORWARD</div>
+      <div class="cam-telemetry" id="cam1-tel">
+        <div>DEPTH <span class="val-hi" id="c1-depth">--</span>m</div>
+        <div>HOLD  <span id="c1-hold-d">--</span>m</div>
+        <div>YAW   <span class="val-hi" id="c1-yaw">--</span>°</div>
+      </div>
+    </div>
+
+    <div class="cam-wrap">
+      <div class="cam-no-signal" id="no-sig-2">
+        <div class="ns-icon">📡</div>
+        <div class="ns-text">No Signal — Camera 2</div>
+      </div>
+      <img id="cam2" class="cam-img" style="display:none" alt="Camera 2"/>
+      <canvas id="hud2" class="cam-hud"></canvas>
+      <div class="cam-label">CAM 2 / SIDE</div>
+      <div class="cam-telemetry" id="cam2-tel">
+        <div>ROLL  <span class="val-hi" id="c2-roll">--</span>°</div>
+        <div>PITCH <span class="val-hi" id="c2-pitch">--</span>°</div>
+        <div>STAB  <span id="c2-stab">--</span></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Control bar -->
+  <div class="controlbar">
+
+    <span class="control-label">Power</span>
+    <div class="mosfet-toggle" id="mosfet-toggle" onclick="toggleMosfet()">
+      <div class="mosfet-indicator"></div>
+      <span id="mosfet-label">MOSFET OFF</span>
+    </div>
+
+    <div class="ctrl-sep"></div>
+
+    <span class="control-label">Mode</span>
+    <button class="mode-btn active-disarmed" id="mode-disarmed"
+            onclick="setMode('disarmed')">DISARMED</button>
+    <button class="mode-btn" id="mode-armed"
+            onclick="setMode('armed')">DRIVE / ARMED</button>
+    <button class="mode-btn" id="mode-stabilize"
+            onclick="setMode('stabilize')">STABILIZE</button>
+
+    <div class="ctrl-sep"></div>
+
+    <span class="control-label">Hold</span>
+    <button class="ctrl-flag" id="flag-stab"    onclick="toggleStabilize()">STAB: OFF</button>
+    <button class="ctrl-flag" id="flag-depth"   onclick="toggleDepthHold()">DEPTH: OFF</button>
+    <button class="ctrl-flag" id="flag-yaw"     onclick="toggleYawHold()">YAW: OFF</button>
+
+    <div class="ctrl-sep"></div>
+
+    <span class="control-label">Actions</span>
+    <button class="action-btn" onclick="startColmap()">▶ COLMAP</button>
+    <button class="action-btn" onclick="startCrabs()">🦀 CRABS</button>
+
+  </div>
+
+  <!-- Telemetry bar -->
+  <div class="telembar">
+    <div class="telem-cell">
+      <span class="tc-label">State</span>
+      <span class="tc-val" id="tel-state">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Depth</span>
+      <span class="tc-val" id="tel-depth">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Hold D</span>
+      <span class="tc-val" id="tel-hold-d">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Yaw</span>
+      <span class="tc-val" id="tel-yaw">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Hold Y</span>
+      <span class="tc-val" id="tel-hold-y">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Roll</span>
+      <span class="tc-val" id="tel-roll">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Pitch</span>
+      <span class="tc-val" id="tel-pitch">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">H Grp</span>
+      <span class="tc-val" id="tel-hgrp">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">V Grp</span>
+      <span class="tc-val" id="tel-vgrp">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Pressure</span>
+      <span class="tc-val" id="tel-press">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Temp</span>
+      <span class="tc-val" id="tel-temp">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Depth Hold</span>
+      <span class="tc-val" id="tel-dh">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Yaw Hold</span>
+      <span class="tc-val" id="tel-yh">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">CMD F</span>
+      <span class="tc-val" id="tel-cmd-f">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">CMD L</span>
+      <span class="tc-val" id="tel-cmd-l">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">CMD Y</span>
+      <span class="tc-val" id="tel-cmd-y">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">CMD V</span>
+      <span class="tc-val" id="tel-cmd-v">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Arm →Pi</span>
+      <span class="tc-val" id="tel-arm-proc">--</span>
+    </div>
+  </div>
+
+</div><!-- /control -->
+
+<!-- Log drawer -->
+<div id="log-drawer" class="log-drawer">
+  <div class="log-header">
+    PROCESS LOGS
+    <div class="log-tabs">
+      <div class="log-tab active" onclick="switchLog('arm')" id="lt-arm">Arm Sender</div>
+      <div class="log-tab" onclick="switchLog('onboard_stab')" id="lt-stab">Onboard Stab</div>
+      <div class="log-tab" onclick="switchLog('onboard_arm')" id="lt-arm2">Onboard Arm</div>
+    </div>
+    <span class="log-close" onclick="toggleLog()">✕</span>
+  </div>
+  <div class="log-content" id="log-content"></div>
+</div>
+
+<!-- ══════════════════════════════════════════════════
+     KEYBINDS MODAL
+     ══════════════════════════════════════════════════ -->
+<div id="keybinds-modal" class="modal-overlay" style="display:none" onclick="hideKeybindsOutside(event)">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>⌨ Controls &amp; Keybinds</h2>
+      <button class="btn btn-secondary" style="padding:4px 12px;font-size:.8rem"
+              onclick="hideKeybinds()">Close ✕</button>
+    </div>
+    <div class="modal-body">
+
+      <div class="kb-section">
+        <h3>Drive Modes (click buttons in control bar)</h3>
+        <table class="kb-table">
+          <tr><td>DISARMED</td><td>All thruster commands zeroed — ROV won't move. Safe state.</td></tr>
+          <tr><td>DRIVE / ARMED</td><td>Full manual control via gamepad. Stabilization flags controlled independently.</td></tr>
+          <tr><td>STABILIZE</td><td>Manual control + auto pitch/roll correction from IMU. Enables STAB flag automatically.</td></tr>
+        </table>
+      </div>
+
+      <div class="kb-section">
+        <h3>Keyboard Shortcuts (work on Control screen)</h3>
+        <table class="kb-table">
+          <tr><td>S</td><td>Toggle pitch/roll stabilization ON/OFF</td></tr>
+          <tr><td>D</td><td>Toggle depth hold ON/OFF</td></tr>
+          <tr><td>Y</td><td>Toggle yaw hold ON/OFF</td></tr>
+          <tr><td>↑ Arrow</td><td>Increase gain by 10%</td></tr>
+          <tr><td>↓ Arrow</td><td>Decrease gain by 10%</td></tr>
+          <tr><td>ESC</td><td>Emergency stop — sets DISARMED mode and clears all flags</td></tr>
+        </table>
+      </div>
+
+      <div class="kb-section">
+        <h3>Gamepad Axes (Axis Layout: <span id="kb-layout-display" style="color:var(--accent)">ORIGINAL</span>)</h3>
+        <table class="kb-table">
+          <tr><td>Left Stick Y</td><td>Vertical / Heave — up = ascend, down = descend</td></tr>
+          <tr><td>Right Stick Y</td><td>Forward / Backward</td></tr>
+          <tr><td id="kb-axis-left-x-label">Left Stick X</td><td id="kb-axis-left-x-desc">Yaw (rotate) — left = turn left, right = turn right</td></tr>
+          <tr><td id="kb-axis-right-x-label">Right Stick X</td><td id="kb-axis-right-x-desc">Lateral strafe — left = strafe left, right = strafe right</td></tr>
+        </table>
+        <p class="kb-note">Axis layout matches thrust_sender.py CONTROL_LAYOUT setting.</p>
+        <div class="layout-select" style="margin-top:12px">
+          <span style="font-size:.8rem;color:var(--dim);line-height:2">Layout:</span>
+          <button class="layout-btn active" id="layout-btn-original" onclick="setLayout('original')">
+            Original (Left X = Yaw)
+          </button>
+          <button class="layout-btn" id="layout-btn-swapped" onclick="setLayout('swapped')">
+            Swapped (Left X = Strafe)
+          </button>
+        </div>
+      </div>
+
+      <div class="kb-section">
+        <h3>Gamepad Buttons</h3>
+        <table class="kb-table">
+          <tr><td>Button 9</td><td>Toggle stabilization (same as S key) — typically Start/Menu button</td></tr>
+          <tr><td>D-pad Up</td><td>Increase gain by 10%</td></tr>
+          <tr><td>D-pad Down</td><td>Decrease gain by 10%</td></tr>
+        </table>
+        <p class="kb-note">Button numbering is browser Gamepad API index — may vary by controller.
+          Check browser console for button debug output when pressing buttons.</p>
+      </div>
+
+      <div class="kb-section">
+        <h3>Control Parameters</h3>
+        <table class="kb-table">
+          <tr><td>Deadzone</td><td>5% (axes under 0.05 are treated as zero)</td></tr>
+          <tr><td>Gain Range</td><td>10% – 100%, step 10%, default 100%</td></tr>
+          <tr><td>Combined Thrust Limit</td><td>H-group + V-group ≤ 150% (same as thrust_sender.py)</td></tr>
+          <tr><td>Send Rate</td><td>50 Hz (matches thrust_sender.py SEND_HZ)</td></tr>
+          <tr><td>Control Timeout (Pi)</td><td>0.8 s — Pi zeros thrusters if no packet received</td></tr>
+        </table>
+      </div>
+
+      <div class="kb-section">
+        <h3>MOSFET Toggle</h3>
+        <table class="kb-table">
+          <tr><td>MOSFET OFF</td><td>Physical power cut to servos / accessories. Does NOT disarm thrusters.</td></tr>
+          <tr><td>MOSFET ON</td><td>Power enabled. Set mode to ARMED or STABILIZE to move thrusters.</td></tr>
+        </table>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div class="toast-container" id="toast-container"></div>
+
+<script src="{{ url_for('static', filename='js/rov_ui.js') }}"></script>
+</body>
+</html>
