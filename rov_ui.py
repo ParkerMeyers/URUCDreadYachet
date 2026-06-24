@@ -342,21 +342,23 @@ class SSHManager:
         return bool(out.strip())
 
     def get_onboard_status(self):
-        """Check all three onboard processes in one SSH exec to avoid hammering
+        """Check all four onboard processes in one SSH exec to avoid hammering
         the SSH channel with separate calls every monitoring cycle."""
         cmd = (
             "pgrep -f 'mavproxy'        > /dev/null 2>&1 && echo mavproxy_ok; "
             "pgrep -f 'stabilization.py'> /dev/null 2>&1 && echo stab_ok; "
             "pgrep -f 'new_ar.py'       > /dev/null 2>&1 && echo arm_ok; "
+            "pgrep -f 'camera_stream.py'> /dev/null 2>&1 && echo cam_ok; "
             "true"
         )
         out, _, error = self.exec(cmd, timeout=10)
         if error:
-            return {"mavproxy": False, "stab": False, "arm": False}
+            return {"mavproxy": False, "stab": False, "arm": False, "cam": False}
         return {
             "mavproxy": "mavproxy_ok" in out,
             "stab":     "stab_ok"     in out,
             "arm":      "arm_ok"      in out,
+            "cam":      "cam_ok"      in out,
         }
 
     def get_mavproxy_log(self, lines=10):
@@ -638,11 +640,13 @@ def _monitor_loop():
                 STATE["onboard_mavproxy"] = status["mavproxy"]
                 STATE["onboard_stab"]     = status["stab"]
                 STATE["onboard_arm"]      = status["arm"]
+                STATE["onboard_cam"]      = status["cam"]
             else:
                 STATE["ssh_connected"]    = False
                 STATE["onboard_mavproxy"] = False
                 STATE["onboard_stab"]     = False
                 STATE["onboard_arm"]      = False
+                STATE["onboard_cam"]      = False
 
         tel_age = time.time() - STATE["last_telemetry_time"]
         if tel_age > 2.0:
@@ -659,6 +663,7 @@ def emit_status():
         "arm_running":           STATE["arm_running"],
         "onboard_stab":          STATE["onboard_stab"],
         "onboard_arm":           STATE["onboard_arm"],
+        "onboard_cam":           STATE["onboard_cam"],
         "onboard_mavproxy":      STATE["onboard_mavproxy"],
         "ssh_connected":         STATE["ssh_connected"],
         "ssh_error":             STATE["ssh_error"],
@@ -874,12 +879,46 @@ def api_start_onboard():
             )
             emit_status()
 
+            # Step 4: camera_stream.py (optional — ROV works without cameras)
+            _emit_onboard_progress("camera", "starting", "Launching camera_stream.py (MJPEG feeds)...")
+            cam0_dev = config.get("camera0_device", "/dev/video0")
+            cam1_dev = config.get("camera1_device", "/dev/video2")
+            cam_args = f"--cam0 {cam0_dev} --cam1 {cam1_dev}"
+            ok_c, msg_c = ssh.start_onboard_process(
+                "onboard/camera_stream.py", "cam", extra_args=cam_args
+            )
+            if ok_c:
+                ok_c, msg_c = _wait_onboard_running(
+                    lambda: ssh.is_onboard_running("camera_stream.py"),
+                    "camera_stream.py",
+                    timeout_sec=12.0,
+                )
+            if not ok_c:
+                log_tail = ssh.get_onboard_log("cam", lines=8)
+                if log_tail:
+                    last_line = log_tail.strip().splitlines()[-1][:120]
+                    msg_c = f"{msg_c} | Log: {last_line}"
+            STATE["onboard_cam"] = ok_c
+            _emit_onboard_progress(
+                "camera", "done" if ok_c else "error", msg_c
+            )
+            emit_status()
+
             core_ok = ok_m and ok_s
-            all_ok = core_ok and ok_a
-            if all_ok:
-                summary = "✓ All onboard programs running (MAVProxy, stabilization, new_ar)"
+            if core_ok and ok_a and ok_c:
+                summary = "✓ All onboard programs running (MAVProxy, stabilization, new_ar, cameras)"
+            elif core_ok and ok_a:
+                summary = "✓ ROV ready — cameras unavailable (check device paths / opencv install)"
             elif core_ok:
-                summary = "✓ Thruster control ready (MAVProxy + stabilization). Arm controller failed — see log."
+                parts_warn = []
+                if not ok_a:
+                    parts_warn.append("arm controller")
+                if not ok_c:
+                    parts_warn.append("cameras")
+                summary = (
+                    "✓ Thruster control ready. Optional component(s) failed: "
+                    + ", ".join(parts_warn) + " — see Logs"
+                )
             else:
                 parts = []
                 if not ok_m:
@@ -888,6 +927,8 @@ def api_start_onboard():
                     parts.append("stabilization")
                 if not ok_a:
                     parts.append("new_ar")
+                if not ok_c:
+                    parts.append("cameras")
                 summary = "✕ Failed: " + ", ".join(parts) + " — open Logs for details"
 
             _emit_onboard_progress(
@@ -909,9 +950,11 @@ def api_start_onboard():
 def api_stop_onboard():
     ssh.stop_onboard_process("stabilization.py")
     ssh.stop_onboard_process("new_ar.py")
+    ssh.stop_onboard_process("camera_stream.py")
     ssh.stop_mavproxy()
     STATE["onboard_stab"]     = False
     STATE["onboard_arm"]      = False
+    STATE["onboard_cam"]      = False
     STATE["onboard_mavproxy"] = False
     emit_status()
     return jsonify({"ok": True})
@@ -1009,6 +1052,7 @@ def api_status():
         "arm_running":           STATE["arm_running"],
         "onboard_stab":          STATE["onboard_stab"],
         "onboard_arm":           STATE["onboard_arm"],
+        "onboard_cam":           STATE["onboard_cam"],
         "onboard_mavproxy":      STATE["onboard_mavproxy"],
         "ssh_connected":         STATE["ssh_connected"],
         "mode":                  STATE["mode"],
@@ -1044,12 +1088,13 @@ def api_onboard_progress():
             "onboard_mavproxy": STATE["onboard_mavproxy"],
             "onboard_stab": STATE["onboard_stab"],
             "onboard_arm": STATE["onboard_arm"],
+            "onboard_cam": STATE["onboard_cam"],
         })
 
 
 @app.route("/api/onboard_log/<name>")
 def api_onboard_log(name):
-    allowed = {"stab", "arm", "colmap", "crabs"}
+    allowed = {"stab", "arm", "cam", "colmap", "crabs"}
     if name not in allowed:
         return jsonify({"lines": []})
     out = ssh.get_onboard_log(name)
