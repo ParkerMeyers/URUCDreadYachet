@@ -32,12 +32,11 @@ if HAVE_CV2:
 else:
     cv2 = None
 
-HAVE_PIL = importlib.util.find_spec("PIL") is not None
-if HAVE_PIL:
-    PIL = importlib.import_module("PIL")
-    Image = PIL.Image
-    ImageTk = PIL.ImageTk
-else:
+try:
+    from PIL import Image, ImageTk
+
+    HAVE_PIL = True
+except ImportError:
     Image = None
     ImageTk = None
     HAVE_PIL = False
