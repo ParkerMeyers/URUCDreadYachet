@@ -201,7 +201,10 @@ class ProcessController:
         password = getattr(self.args, "onboard_password", None)
         sshpass_present = self._resolve_sshpass() is not None
         if isinstance(password, str) and password and not sshpass_present and paramiko is not None:
-            return self._run_remote_command_paramiko(remote_command, timeout_sec=timeout_sec)
+            try:
+                return self._run_remote_command_paramiko(remote_command, timeout_sec=timeout_sec)
+            except Exception:
+                pass
 
         command = self._build_ssh_command(remote_command)
         ssh_input = None
@@ -229,6 +232,8 @@ class ProcessController:
                 "Make sure the Pi is powered on, reachable on the network, and that SSH is enabled. "
                 f"Details: {details}"
             ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"SSH error while talking to the onboard computer: {exc}") from exc
 
     def _run_remote_command_paramiko(self, remote_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC):
         """Execute a remote command using Paramiko (pure-Python SSH client).
@@ -302,6 +307,27 @@ class ProcessController:
             )
         return result
 
+    def set_mosfet_state(self, enabled):
+        state_value = 1 if enabled else 0
+        remote_command = (
+            "python3 - <<'PY'\n"
+            "import lgpio\n"
+            "handle = lgpio.gpiochip_open(0)\n"
+            "try:\n"
+            "    lgpio.gpio_claim_output(handle, 17, 0)\n"
+            f"    lgpio.gpio_write(handle, 17, {state_value})\n"
+            "finally:\n"
+            "    lgpio.gpiochip_close(handle)\n"
+            f"open('/tmp/uru_mosfet_state', 'w', encoding='utf-8').write('{state_value}')\n"
+            "PY"
+        )
+        result = self._run_remote_command(remote_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Could not set MOSFET state over SSH: {result.stderr.strip() or result.stdout.strip()}"
+            )
+        return result
+
     def _launch_topside_programs_visible(self):
         results = {}
         for name, rel_path in [
@@ -360,6 +386,11 @@ class ProcessController:
         for program_name, remote_script_path, remote_log_path in launch_plan:
             self._launch_remote_program(program_name, remote_script_path, remote_log_path)
 
+        try:
+            self.set_mosfet_state(False)
+        except Exception:
+            pass
+
         self.remote_ready = True
         return {
             "status": "started",
@@ -393,6 +424,10 @@ class ProcessController:
             )
             try:
                 self._run_remote_command(stop_command, timeout_sec=15)
+            except Exception:
+                pass
+            try:
+                self.set_mosfet_state(False)
             except Exception:
                 pass
             self.remote_ready = False
@@ -451,6 +486,7 @@ class ROVMainApp(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self._apply_dark_theme()
         self._build_ui()
         self._refresh_ui_loop()
 
@@ -465,6 +501,33 @@ class ROVMainApp(tk.Tk):
                 if callable(release):
                     release()
         self.destroy()
+
+    def _apply_dark_theme(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        self.configure(bg="#020617")
+        self.option_add("*Font", "Segoe UI 10")
+        self.option_add("*Background", "#020617")
+        self.option_add("*Foreground", "#f8fafc")
+
+        style.configure(".", background="#020617", foreground="#f8fafc", fieldbackground="#0f172a")
+        style.configure("TFrame", background="#020617")
+        style.configure("TLabelframe", background="#020617")
+        style.configure("TLabelframe.Label", background="#020617", foreground="#f8fafc")
+        style.configure("TLabel", background="#020617", foreground="#f8fafc")
+        style.configure("TButton", background="#0f172a", foreground="#f8fafc", padding=(8, 6))
+        style.map(
+            "TButton",
+            background=[("active", "#334155"), ("pressed", "#0f766e"), ("!disabled", "#0f172a")],
+            foreground=[("disabled", "#64748b"), ("!disabled", "#f8fafc")],
+        )
+        style.configure("TEntry", fieldbackground="#0f172a", foreground="#f8fafc", background="#0f172a")
+        style.configure("TRadiobutton", background="#020617", foreground="#f8fafc")
+        style.configure("TCheckbutton", background="#020617", foreground="#f8fafc")
 
     def _build_ui(self):
         self.launch_frame = ttk.Frame(self)
@@ -535,7 +598,7 @@ class ROVMainApp(tk.Tk):
 
         self.topside_button = ttk.Button(
             button_frame,
-            text="Start art topside program",
+            text="Start topside programs",
             command=self._start_topside_programs,
             width=24,
         )
@@ -638,6 +701,7 @@ class ROVMainApp(tk.Tk):
             width=24,
         )
         self.mosfet_button.pack(side="left", padx=(0, 8))
+        self._update_mosfet_button()
 
         self.mode_var = tk.StringVar(value=self.control_mode)
         mode_frame = ttk.LabelFrame(controls, text="Mode")
@@ -687,6 +751,12 @@ class ROVMainApp(tk.Tk):
             self.remote_status_var.set(
                 f"Remote root: {result['remote_root']}"
             )
+            self.mosfet_enabled = False
+            try:
+                self.controller.set_mosfet_state(False)
+            except Exception as exc:
+                self.remote_status_var.set(f"Remote root: {result['remote_root']} (MOSFET init warning: {exc})")
+            self._update_mosfet_button()
             self._refresh_next_state()
         except Exception as exc:
             self.onboard_started = False
@@ -717,20 +787,53 @@ class ROVMainApp(tk.Tk):
             self.next_button.config(state="disabled")
 
     def _stop_all(self):
-        try:
-            self.controller.stop_all()
-        except Exception as exc:
-            messagebox.showerror("Stop failed", str(exc))
-        self.topside_started = False
-        self.onboard_started = False
-        self.onboard_status_var.set("Not started")
-        self.topside_status_var.set("Not started")
-        self.remote_status_var.set("No remote launch")
-        self._refresh_next_state()
+        for name, process in list(self.local_processes.items()):
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            handle = self.local_log_handles.pop(name, None)
+            if handle is not None:
+                handle.close()
+            self.local_processes.pop(name, None)
+
+        if self.remote_ready:
+            self._ensure_ssh_available()
+            stop_command = (
+                'pkill -f "onboard/stabilization.py" || true; '
+                'pkill -f "onboard/new_ar.py" || true'
+            )
+            try:
+                self._run_remote_command(stop_command, timeout_sec=15)
+            except Exception:
+                pass
+            try:
+                self.set_mosfet_state(False)
+            except Exception:
+                pass
+            self.remote_ready = False
+
+    def _update_mosfet_button(self):
+        if getattr(self, "mosfet_button", None) is None:
+            return
+        self.mosfet_button.config(text=f"Toggle MOSFET ({'ON' if self.mosfet_enabled else 'OFF'})")
 
     def _toggle_mosfet(self):
-        self.mosfet_enabled = not self.mosfet_enabled
-        self.mosfet_button.config(text=f"Toggle MOSFET ({'ON' if self.mosfet_enabled else 'OFF'})")
+        if not self.onboard_started:
+            messagebox.showwarning("Not ready", "Start the onboard programs first.")
+            return
+
+        target_enabled = not self.mosfet_enabled
+        try:
+            self.controller.set_mosfet_state(target_enabled)
+            self.mosfet_enabled = target_enabled
+        except Exception as exc:
+            messagebox.showwarning("MOSFET toggle failed", f"Unable to change MOSFET state: {exc}")
+            return
+
+        self._update_mosfet_button()
         self.telemetry["state"] = "MOSFET ON" if self.mosfet_enabled else "OK"
 
     def _set_mode(self, mode):
