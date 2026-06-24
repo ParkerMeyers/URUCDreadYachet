@@ -28,9 +28,13 @@ Optional hardware (degrades gracefully if absent):
 
 import json
 import math
+import os
 import socket
 import threading
 import time
+
+# AUX outputs use RC channels 9-16 — RC_CHANNELS_OVERRIDE needs MAVLink 2 (8-ch limit in v1).
+os.environ.setdefault("MAVLINK20", "1")
 
 from pymavlink import mavutil
 
@@ -209,6 +213,28 @@ def _mosfet_listener():
 
 
 # ── MAVLink helpers ───────────────────────────────────────────────────────────
+def _connect_mavlink(url: str):
+    """Connect to MAVProxy; force MAVLink 2 so 18-channel RC override is valid."""
+    master = mavutil.mavlink_connection(url, source_system=255)
+    try:
+        master.mav.set_protocol(mavutil.mavlink.MAVLINK_V2)
+    except Exception:
+        pass
+    return master
+
+
+def _send_rc_override(master, rc):
+    ts = master.target_system or 1
+    tc = master.target_component or 1
+    try:
+        master.mav.rc_channels_override_send(ts, tc, *rc)
+    except TypeError as e:
+        raise RuntimeError(
+            "RC_CHANNELS_OVERRIDE rejected — MAVLink 2 required for AUX ch 9-16. "
+            "Is MAVProxy running on udp:127.0.0.1:14551?"
+        ) from e
+
+
 def _build_rc_array():
     """Build the 18-element RC array to send, computing J6 fresh each call."""
     rc = [IGNORE] * 18
@@ -242,10 +268,7 @@ def _build_rc_array():
 
 
 def _send_override(master):
-    rc = _build_rc_array()
-    ts = master.target_system or 1
-    tc = master.target_component or 1
-    master.mav.rc_channels_override_send(ts, tc, *rc)
+    _send_rc_override(master, _build_rc_array())
 
 
 def _send_heartbeat(master):
@@ -261,7 +284,7 @@ def main():
     global _joint_us, _j6_target_deg, _last_pkt_time, _rx_count
 
     print(f"[arm] Connecting to MAVProxy at {MAVLINK_URL} ...")
-    master = mavutil.mavlink_connection(MAVLINK_URL)
+    master = _connect_mavlink(MAVLINK_URL)
 
     print("[arm] Waiting for heartbeat from Pix6 ...")
     hb = master.wait_heartbeat(timeout=20)
@@ -345,9 +368,7 @@ def main():
         rc = [IGNORE] * 18
         for ch in list(JOINT_TO_RC_CH.values()) + [SPARE_RC_CH]:
             rc[ch - 1] = CENTER_US
-        ts = master.target_system or 1
-        tc = master.target_component or 1
-        master.mav.rc_channels_override_send(ts, tc, *rc)
+        _send_rc_override(master, rc)
         time.sleep(0.2)
 
         if HAVE_GPIO and _gpio_h is not None:
