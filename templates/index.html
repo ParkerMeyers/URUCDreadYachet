@@ -44,10 +44,14 @@
       <h3>Topside Hardware</h3>
       <div class="field"><label>Serial Port (Arm Controller)</label>
         <input id="cfg-serial_port" type="text" value="COM3"/></div>
-      <div class="field"><label>Camera 1 URL (MJPEG)</label>
+      <div class="field"><label>Camera 1 URL (MJPEG proxy target)</label>
         <input id="cfg-camera1_url" type="text" value="http://192.168.2.249:8160"/></div>
-      <div class="field"><label>Camera 2 URL (MJPEG)</label>
+      <div class="field"><label>Camera 2 URL (MJPEG proxy target)</label>
         <input id="cfg-camera2_url" type="text" value="http://192.168.2.249:8161"/></div>
+      <div class="field"><label>Camera 0 Device on Pi (V4L2)</label>
+        <input id="cfg-camera0_device" type="text" value="/dev/video0"/></div>
+      <div class="field"><label>Camera 1 Device on Pi (V4L2)</label>
+        <input id="cfg-camera1_device" type="text" value="/dev/video2"/></div>
     </div>
 
     <div class="config-group">
@@ -97,6 +101,7 @@
         <div class="prog-row"><div class="dot" id="dot-mavproxy"></div><span>mavproxy (UDP bridge)</span></div>
         <div class="prog-row"><div class="dot" id="dot-stab"></div><span>stabilization.py</span></div>
         <div class="prog-row"><div class="dot" id="dot-arm"></div><span>new_ar.py</span></div>
+        <div class="prog-row"><div class="dot" id="dot-cam"></div><span>camera_stream.py</span></div>
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" id="btn-start-onboard" onclick="startOnboard()">Start Onboard</button>
@@ -327,10 +332,11 @@
 <div id="log-drawer" class="log-drawer">
   <div class="log-header">
     PROCESS LOGS
-    <div class="log-tabs">
+      <div class="log-tabs">
       <div class="log-tab active" onclick="switchLog('arm')" id="lt-arm">Arm Sender</div>
       <div class="log-tab" onclick="switchLog('onboard_stab')" id="lt-stab">Onboard Stab</div>
       <div class="log-tab" onclick="switchLog('onboard_arm')" id="lt-arm2">Onboard Arm</div>
+      <div class="log-tab" onclick="switchLog('onboard_cam')" id="lt-cam">Cameras</div>
     </div>
     <span class="log-close" onclick="toggleLog()">✕</span>
   </div>

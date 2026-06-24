@@ -4,7 +4,7 @@
 let _tel    = {};
 let _status = {};
 let _currentLog  = 'arm';
-const _logs = { thrust: [], arm: [], onboard_stab: [], onboard_arm: [] };
+const _logs = { thrust: [], arm: [], onboard_stab: [], onboard_arm: [], onboard_cam: [] };
 let _onboardPollTimer = null;
 const _onboardProgressSeen = new Set();
 let socket = null;
@@ -78,6 +78,10 @@ function handleOnboardProgress({ step, status, msg, time }) {
     if (status === 'done') setDot('dot-arm', true);
     if (status === 'error') setDotError('dot-arm');
   }
+  if (step === 'camera') {
+    if (status === 'done') setDot('dot-cam', true);
+    if (status === 'error') setDotError('dot-cam');
+  }
 
   const summary = document.getElementById('onboard-summary');
   if (summary && msg) {
@@ -118,6 +122,7 @@ function startOnboardPoll() {
       if (d.onboard_mavproxy) setDot('dot-mavproxy', true);
       if (d.onboard_stab)     setDot('dot-stab', true);
       if (d.onboard_arm)      setDot('dot-arm', true);
+      if (d.onboard_cam)      setDot('dot-cam', true);
       if (!d.starting) stopOnboardPoll();
     } catch (_) {}
   }
@@ -140,6 +145,7 @@ function stopOnboardPoll() {
 function getCfg() {
   const keys = ['pi_ip','pi_user','pi_password','pi_ssh_port','pi_rov_path',
                  'serial_port','camera1_url','camera2_url',
+                 'camera0_device','camera1_device',
                  'thrust_udp_port','telemetry_port','arm_udp_port',
                  'mosfet_control_port','colmap_command','crabs_command',
                  'mavproxy_bin','mavproxy_serial','mavproxy_baud',
@@ -376,6 +382,7 @@ function updateStatus() {
   setDot('dot-mavproxy', s.onboard_mavproxy);
   setDot('dot-stab',     s.onboard_stab);
   setDot('dot-arm',      s.onboard_arm);
+  setDot('dot-cam',      s.onboard_cam);
   setDot('dot-armlocal', s.arm_running);
 
   // Telemetry listener status on launch screen
@@ -1091,7 +1098,7 @@ let _logOpen       = false;
 let _logRefreshTimer = null;
 
 // Map JS log name → API endpoint name for onboard (Pi-side) logs
-const _onboardLogNames = { onboard_stab: 'stab', onboard_arm: 'arm' };
+const _onboardLogNames = { onboard_stab: 'stab', onboard_arm: 'arm', onboard_cam: 'cam' };
 
 function toggleLog() {
   _logOpen = !_logOpen;
@@ -1106,8 +1113,8 @@ function toggleLog() {
 
 function switchLog(name) {
   _currentLog = name;
-  ['arm','onboard_stab','onboard_arm'].forEach(n => {
-    const id = n === 'onboard_stab' ? 'lt-stab' : n === 'onboard_arm' ? 'lt-arm2' : 'lt-arm';
+  const tabMap = { arm: 'lt-arm', onboard_stab: 'lt-stab', onboard_arm: 'lt-arm2', onboard_cam: 'lt-cam' };
+  Object.entries(tabMap).forEach(([n, id]) => {
     const el = document.getElementById(id);
     if (el) el.classList.toggle('active', n === name);
   });

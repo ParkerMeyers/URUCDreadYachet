@@ -18,5 +18,6 @@ pyserial>=3.5
 
 # ── Onboard (Raspberry Pi) ───────────────────────────────────
 # Install separately on the Pi:
-#   pip3 install pymavlink
+#   pip3 install pymavlink opencv-python-headless
+#   opencv-python-headless is required by onboard/camera_stream.py
 # smbus2 / adafruit-circuitpython-* are no longer required (PCA9685 replaced by Pix6 RC output).
