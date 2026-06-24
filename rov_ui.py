@@ -928,6 +928,36 @@ def api_start_onboard():
             emit_status()
 
             # Step 4: camera_stream.py (optional — ROV works without cameras)
+            # SSH can drop during the arm _wait_onboard_running poll; try to
+            # reconnect once before attempting the camera launch.
+            if not ssh.is_connected():
+                _emit_onboard_progress("camera", "wait",
+                                       "SSH dropped — reconnecting for camera start...")
+                ok_r, _ = ssh.connect(
+                    config["pi_ip"], config["pi_user"], config["pi_password"],
+                    port=int(config["pi_ssh_port"])
+                )
+                STATE["ssh_connected"] = ok_r
+                if not ok_r:
+                    STATE["onboard_cam"] = False
+                    _emit_onboard_progress(
+                        "camera", "error",
+                        "SSH reconnect failed — cameras not started (ROV still operational)"
+                    )
+                    emit_status()
+                    ok_c = False
+                    # Jump straight to summary
+                    core_ok = ok_m and ok_s
+                    if core_ok and ok_a:
+                        summary = "✓ ROV ready — cameras not started (SSH dropped, reconnect and retry)"
+                    elif core_ok:
+                        summary = "✓ Thruster control ready — arm + cameras not started (SSH dropped)"
+                    else:
+                        summary = "✕ SSH dropped during startup — reconnect and retry"
+                    _emit_onboard_progress("complete", "done" if core_ok else "error", summary)
+                    emit_status()
+                    return
+
             _emit_onboard_progress("camera", "starting", "Launching camera_stream.py (MJPEG feeds)...")
             cam0_dev = config.get("camera0_device", "/dev/video0")
             cam1_dev = config.get("camera1_device", "/dev/video2")
