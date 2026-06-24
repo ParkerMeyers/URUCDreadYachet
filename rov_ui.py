@@ -109,7 +109,7 @@ DEFAULT_CONFIG = {
     "colmap_command":      "python3 colmap_run.py",
     "crabs_command":       "python3 crabs.py",
     "mavproxy_bin":        "/home/uruc/mav_env/bin/mavproxy.py",
-    "mavproxy_serial":     "/dev/ttyACM1",
+    "mavproxy_serial":     "/dev/ttyACM0",
     "mavproxy_baud":       "115200",
     "mavproxy_out1":       "udp:10.42.0.1:14550",
     "mavproxy_out2":       "udp:127.0.0.1:14551",
