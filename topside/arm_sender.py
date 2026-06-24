@@ -37,7 +37,13 @@ def clamp_angle(x):
     return clamp(float(x), J6_TARGET_MIN_DEG, J6_TARGET_MAX_DEG)
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-ser = serial.Serial(SERIAL_PORT, BAUD, timeout=0.1)
+
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD, timeout=0.1)
+except Exception as e:
+    print(f"ERROR: Could not open serial port {SERIAL_PORT}: {e}")
+    print("Check that the arm controller is connected and the port is correct.")
+    raise SystemExit(1)
 
 print(f"Reading serial: {SERIAL_PORT} @ {BAUD}")
 print(f"Sending UDP to: {PI_IP}:{UDP_PORT}")
