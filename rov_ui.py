@@ -395,6 +395,49 @@ class SSHManager:
         _, _, error = self.exec(full_cmd)
         return error is None, error or "started"
 
+    def sync_onboard_files(self):
+        """Upload all onboard/*.py files from the local project to the Pi via SFTP.
+
+        Opens a dedicated SFTP channel on the existing SSH transport without
+        holding the exec lock, so normal SSH commands can continue concurrently.
+        """
+        with self._lock:
+            if self._client is None:
+                return False, "Not connected"
+            try:
+                sftp = self._client.open_sftp()
+            except Exception as e:
+                return False, f"SFTP channel failed: {e}"
+
+        remote_onboard = f"{config['pi_rov_path']}/onboard"
+        local_onboard  = ROV_ROOT / "onboard"
+
+        uploaded, errors = [], []
+        try:
+            try:
+                sftp.stat(remote_onboard)
+            except FileNotFoundError:
+                sftp.mkdir(remote_onboard)
+
+            for local_file in sorted(local_onboard.glob("*.py")):
+                remote_path = f"{remote_onboard}/{local_file.name}"
+                try:
+                    sftp.put(str(local_file), remote_path)
+                    uploaded.append(local_file.name)
+                except Exception as e:
+                    errors.append(f"{local_file.name}: {e}")
+        except Exception as e:
+            errors.append(f"Sync error: {e}")
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+        if errors:
+            return False, "Upload errors — " + "; ".join(errors)
+        return True, f"Synced {len(uploaded)} file(s): {', '.join(uploaded)}"
+
 
 ssh = SSHManager()
 
@@ -836,6 +879,11 @@ def api_start_onboard():
 
     def _do_start():
         try:
+            # Step 0: push local onboard/*.py to the Pi so edits take effect immediately.
+            _emit_onboard_progress("sync", "starting", "Uploading onboard scripts to Pi...")
+            ok_sync, msg_sync = ssh.sync_onboard_files()
+            _emit_onboard_progress("sync", "done" if ok_sync else "error", msg_sync)
+
             # Step 1: MAVProxy
             _emit_onboard_progress("mavproxy", "starting", "Launching MAVProxy bridge...")
             ok_m, msg_m = ssh.start_mavproxy()
