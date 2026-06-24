@@ -34,7 +34,7 @@ import time
 
 from pymavlink import mavutil
 
-from mavlink_rc import connect_mavlink, send_rc_channels_override
+from mavlink_rc import connect_mavlink, send_rc_channels_override, wait_for_heartbeat
 
 # ── Optional: BNO055 IMU ──────────────────────────────────────────────────────
 try:
@@ -68,7 +68,7 @@ except Exception as _e:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 UDP_PORT    = 5006
-MAVLINK_URL = "udp:127.0.0.1:14551"
+MAVLINK_URL = "udp:127.0.0.1:14552"   # MAVProxy --out=udp:127.0.0.1:14552 (arm link)
 CENTER_US   = 1500
 MIN_US      = 500
 MAX_US      = 2500
@@ -267,7 +267,7 @@ def main():
     master = connect_mavlink(MAVLINK_URL)
 
     print("[arm] Waiting for heartbeat from Pix6 ...")
-    hb = master.wait_heartbeat(timeout=20)
+    hb = wait_for_heartbeat(master, timeout=20)
     if hb:
         print(f"[arm] Heartbeat OK "
               f"(system={master.target_system} component={master.target_component})")

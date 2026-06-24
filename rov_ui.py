@@ -115,7 +115,8 @@ DEFAULT_CONFIG = {
     "mavproxy_serial":     "/dev/ttyACM0",
     "mavproxy_baud":       "115200",
     "mavproxy_out1":       "udp:10.42.0.1:14550",
-    "mavproxy_out2":       "udp:127.0.0.1:14551",
+    "mavproxy_out2":       "udp:127.0.0.1:14551",   # stabilization.py
+    "mavproxy_out3":       "udp:127.0.0.1:14552",   # new_ar.py (arm)
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -360,6 +361,7 @@ class SSHManager:
         baud  = config["mavproxy_baud"]
         out1  = config["mavproxy_out1"]
         out2  = config["mavproxy_out2"]
+        out3  = config.get("mavproxy_out3", "udp:127.0.0.1:14552")
         # No --daemon: we background with nohup+& and redirect to our log file.
         # --daemon double-forks and makes pgrep unreliable.
         # </dev/null prevents MAVProxy hanging on stdin when launched over SSH.
@@ -369,6 +371,7 @@ class SSHManager:
             f"--baudrate {baud} "
             f"--out={out1} "
             f"--out={out2} "
+            f"--out={out3} "
             f"< /dev/null > /tmp/rov_mavproxy.log 2>&1 & echo $!"
         )
         out, _, error = self.exec(cmd, timeout=10)

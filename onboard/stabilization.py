@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 from pymavlink import mavutil
 
-from mavlink_rc import send_rc_channels_override
+from mavlink_rc import connect_mavlink, send_rc_channels_override, wait_for_heartbeat
 
 
 # ============================================================
@@ -442,7 +442,7 @@ class SmoothPID:
 class MavlinkReader:
     def __init__(self, mavlink_url):
         print(f"Connecting MAVLink: {mavlink_url}")
-        self.master = mavutil.mavlink_connection(mavlink_url)
+        self.master = connect_mavlink(mavlink_url)
 
         self.roll_deg = 0.0
         self.pitch_deg = 0.0
@@ -955,7 +955,7 @@ def main():
     mav = MavlinkReader(MAVLINK_UDP)
 
     print("Waiting for MAVLink heartbeat from Pix6 via MAVProxy...")
-    hb = mav.master.wait_heartbeat(timeout=2)
+    hb = wait_for_heartbeat(mav.master, timeout=20)
     if hb:
         print(f"Heartbeat received — system {mav.master.target_system}, "
               f"component {mav.master.target_component}.")
