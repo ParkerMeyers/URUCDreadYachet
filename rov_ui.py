@@ -276,66 +276,87 @@ class SSHManager:
                 self._invalidate_client()
             return "", "", str(e)
 
-    def _onboard_pgrep_pattern(self, script_rel_or_name: str) -> str:
-        """pgrep/pkill pattern that matches the running python3 script only."""
-        name = script_rel_or_name.split("/")[-1]
-        if "/" in script_rel_or_name:
-            rel = script_rel_or_name
-        else:
-            rel = f"onboard/{name}"
-        return shlex.quote(f"python3.*/{rel}")
-
-    def start_onboard_process(self, script_rel, log_name, extra_args=""):
-        rov_path = config["pi_rov_path"]
-        script = f"{rov_path}/{script_rel}"
-        script_name = script_rel.split('/')[-1]   # e.g. "stabilization.py"
-        log_file = f"/tmp/rov_{log_name}.log"
-        rov_path_q = shlex.quote(rov_path)
-        script_q = shlex.quote(script)
-        pgrep_pat = self._onboard_pgrep_pattern(script_rel)
-        log_file_q = shlex.quote(log_file)
-        extra_args = (extra_args or "").strip()
-        extra_args_q = ""
-        if extra_args:
-            try:
-                extra_args_q = " " + " ".join(
-                    shlex.quote(a) for a in shlex.split(extra_args)
-                )
-            except ValueError:
-                extra_args_q = " " + shlex.quote(extra_args)
-        # Same nohup pattern that works when launched manually on the Pi.
-        # Truncate log each start so error tails reflect the current attempt.
+    def _supervisor_cmd(self, *args, timeout=90):
+        """Run onboard/supervisor.py on the Pi; return (parsed_json, error_msg)."""
+        rov_path = shlex.quote(config["pi_rov_path"])
         cmd = (
-            f"pkill -f {pgrep_pat} 2>/dev/null || true; sleep 0.5; "
-            f"cd {rov_path_q} && "
-            f"nohup python3 {script_q}{extra_args_q} </dev/null > {log_file_q} 2>&1 & "
-            f"sleep 1; "
-            f"pgrep -f {pgrep_pat} | awk 'NR==1{{print; exit}}'"
+            f"cd {rov_path} && python3 onboard/supervisor.py "
+            + " ".join(shlex.quote(str(a)) for a in args)
         )
-        out, err, error = self.exec(cmd)
+        out, err, error = self.exec(cmd, timeout=timeout)
         if error:
-            return False, error
-        pid = ""
-        for line in (out or "").splitlines():
-            token = line.strip()
-            if token.isdigit():
-                pid = token
-                break
-        if pid:
-            return True, f"PID {pid}"
-        # SSH launch succeeded — caller verifies with _wait_onboard_running().
-        return True, f"Launch issued for {script_name}"
+            return None, error
+        blob = (out or "") + "\n" + (err or "")
+        for line in reversed(blob.splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return json.loads(line), None
+                except json.JSONDecodeError:
+                    continue
+        return None, (err or out or "supervisor returned no JSON").strip()[:240]
+
+    def supervisor_start_and_wait(
+        self, name: str, timeout_sec: float = 50.0, extra_args: str = ""
+    ) -> tuple[bool, str]:
+        """Start one onboard service and block until log-ready or timeout."""
+        start_args = ["start", name]
+        if extra_args.strip():
+            start_args.extend(["--extra-args", extra_args.strip()])
+        data, err = self._supervisor_cmd(*start_args, timeout=30)
+        if err:
+            return False, f"start failed: {err}"
+
+        pid = (data or {}).get("pid", "?")
+        data, err = self._supervisor_cmd(
+            "wait", name, "--timeout", str(int(timeout_sec)),
+            timeout=timeout_sec + 25,
+        )
+        if err:
+            return False, f"wait failed: {err}"
+        if data and data.get("ok"):
+            return True, f"PID {data.get('pid', pid)} ready"
+
+        tail = (data or {}).get("log_tail", "")
+        detail = (data or {}).get("error", "not ready")
+        if tail:
+            last = tail.strip().splitlines()[-1][:120]
+            return False, f"{detail} | Log: {last}"
+        return False, detail
+
+    def supervisor_stop_all(self):
+        self._supervisor_cmd("stop", "all", timeout=20)
+
+    def supervisor_status(self) -> dict:
+        data, err = self._supervisor_cmd("status", timeout=15)
+        if err or not data:
+            return {}
+        return data
+
+    def is_onboard_running(self, script_name: str) -> bool:
+        key = {
+            "stabilization.py": "stab",
+            "new_ar.py": "arm",
+            "camera_stream.py": "cam",
+        }.get(script_name, "")
+        if not key:
+            return False
+        st = self.supervisor_status().get(key, {})
+        return bool(st.get("alive"))
 
     def stop_onboard_process(self, script_name):
-        pat = self._onboard_pgrep_pattern(script_name)
-        self.exec(f"pkill -f {pat} 2>/dev/null || true")
+        key = {
+            "stabilization.py": "stab",
+            "new_ar.py": "arm",
+            "camera_stream.py": "cam",
+        }.get(script_name)
+        if key:
+            self._supervisor_cmd("stop", key, timeout=15)
 
-    def is_onboard_running(self, script_name):
-        pat = self._onboard_pgrep_pattern(script_name)
-        out, _, error = self.exec(f"pgrep -f {pat}")
-        if error:
-            return False
-        return bool(out.strip())
+    def start_onboard_process(self, script_rel, log_name, extra_args=""):
+        """Legacy wrapper — prefer supervisor_start_and_wait()."""
+        ok, msg = self.supervisor_start_and_wait(log_name, 50.0, extra_args)
+        return ok, msg
 
     def get_onboard_log(self, log_name, lines=20):
         log_file = f"/tmp/rov_{log_name}.log"
@@ -396,23 +417,15 @@ class SSHManager:
         return bool(out.strip())
 
     def get_onboard_status(self):
-        """Check all four onboard processes in one SSH exec to avoid hammering
-        the SSH channel with separate calls every monitoring cycle."""
-        cmd = (
-            "pgrep -f 'mavproxy'        > /dev/null 2>&1 && echo mavproxy_ok; "
-            "pgrep -f 'stabilization.py'> /dev/null 2>&1 && echo stab_ok; "
-            "pgrep -f 'new_ar.py'       > /dev/null 2>&1 && echo arm_ok; "
-            "pgrep -f 'camera_stream.py'> /dev/null 2>&1 && echo cam_ok; "
-            "true"
-        )
-        out, _, error = self.exec(cmd, timeout=10)
-        if error:
+        """Check onboard processes via the Pi-side supervisor."""
+        st = self.supervisor_status()
+        if not st:
             return {"mavproxy": False, "stab": False, "arm": False, "cam": False}
         return {
-            "mavproxy": "mavproxy_ok" in out,
-            "stab":     "stab_ok"     in out,
-            "arm":      "arm_ok"      in out,
-            "cam":      "cam_ok"      in out,
+            "mavproxy": self.is_mavproxy_running(),
+            "stab":     bool(st.get("stab", {}).get("alive")),
+            "arm":      bool(st.get("arm", {}).get("alive")),
+            "cam":      bool(st.get("cam", {}).get("alive")),
         }
 
     def get_mavproxy_log(self, lines=10):
@@ -976,158 +989,36 @@ def api_start_onboard():
                     emit_status()
                     return
 
-            # Step 2: stabilization.py — kill any stale instance first so the
-            # new process can bind its UDP ports (5005, 14551) without conflict.
-            ssh.stop_onboard_process("stabilization.py")
-            time.sleep(0.5)
-            _emit_onboard_progress("stabilization", "starting", "Launching stabilization.py...")
-            ok_s, msg_s = ssh.start_onboard_process("onboard/stabilization.py", "stab")
-            if ok_s:
-                # stabilization.py does a quick 2 s heartbeat probe then enters
-                # the main loop immediately — 15 s is plenty to confirm it started.
-                ok_s, msg_s = _wait_onboard_running(
-                    lambda: ssh.is_onboard_running("stabilization.py"),
-                    "stabilization.py",
-                    timeout_sec=15.0,
-                )
-
-            # If SSH dropped during the wait, try a single reconnect.
-            # stabilization.py may have started fine — the process is nohup'd
-            # and keeps running regardless of SSH state.
-            if not ssh.is_connected():
-                _emit_onboard_progress("stabilization", "wait",
-                                       "SSH dropped — attempting reconnect...")
-                ok_r, _ = ssh.connect(
-                    config["pi_ip"], config["pi_user"], config["pi_password"],
-                    port=int(config["pi_ssh_port"])
-                )
-                if ok_r:
-                    STATE["ssh_connected"] = True
-                    time.sleep(1.0)  # let the new connection settle before exec
-                    if ssh.is_onboard_running("stabilization.py"):
-                        ok_s   = True
-                        msg_s  = "stabilization.py running"
-                    else:
-                        msg_s = "stabilization.py not found after SSH reconnect"
-                else:
-                    STATE["ssh_connected"] = False
-                    msg_s = "stabilization.py timed out and SSH reconnect failed"
-
-            if not ok_s:
-                log_tail = ssh.get_onboard_log("stab", lines=8)
-                if log_tail:
-                    last_line = log_tail.strip().splitlines()[-1][:120]
-                    msg_s = f"{msg_s} | Log: {last_line}"
+            # Step 2–4: onboard scripts via Pi-side supervisor (setsid + pidfile + log-ready)
+            _emit_onboard_progress(
+                "stabilization", "starting", "Launching stabilization.py..."
+            )
+            ok_s, msg_s = ssh.supervisor_start_and_wait("stab", timeout_sec=55.0)
             STATE["onboard_stab"] = ok_s
             _emit_onboard_progress(
                 "stabilization", "done" if ok_s else "error", msg_s
             )
             emit_status()
 
-            if not ssh.is_connected():
-                _emit_onboard_progress(
-                    "arm_ctrl", "error", "SSH session not active — reconnect and retry"
-                )
-                STATE["onboard_arm"] = False
-                _emit_onboard_progress(
-                    "complete", "error",
-                    "✕ Failed: stabilization — SSH lost during start. Reconnect SSH and retry.",
-                )
-                emit_status()
-                return
-
-            # Step 3: new_ar.py (arm — optional; thrusters work without it)
-            _emit_onboard_progress("arm_ctrl", "starting", "Launching new_ar.py (arm controller)...")
-            ok_a, msg_a = ssh.start_onboard_process("onboard/new_ar.py", "arm")
-            if ok_a:
-                ok_a, msg_a = _wait_onboard_running(
-                    lambda: ssh.is_onboard_running("new_ar.py"),
-                    "new_ar.py",
-                    timeout_sec=20.0,
-                )
-
-            # If SSH dropped during the wait, try a single reconnect.
-            # new_ar.py may have started fine — it's nohup'd and keeps running
-            # regardless of SSH state.
-            if not ssh.is_connected():
-                _emit_onboard_progress("arm_ctrl", "wait",
-                                       "SSH dropped — attempting reconnect...")
-                ok_r, _ = ssh.connect(
-                    config["pi_ip"], config["pi_user"], config["pi_password"],
-                    port=int(config["pi_ssh_port"])
-                )
-                if ok_r:
-                    STATE["ssh_connected"] = True
-                    time.sleep(1.0)  # let the new connection settle before exec
-                    if ssh.is_onboard_running("new_ar.py"):
-                        ok_a  = True
-                        msg_a = "new_ar.py running"
-                    else:
-                        msg_a = "new_ar.py not found after SSH reconnect"
-                else:
-                    STATE["ssh_connected"] = False
-                    msg_a = "new_ar.py timed out and SSH reconnect failed"
-
-            if not ok_a:
-                log_tail = ssh.get_onboard_log("arm", lines=8)
-                if log_tail:
-                    last_line = log_tail.strip().splitlines()[-1][:120]
-                    msg_a = f"{msg_a} | Log: {last_line}"
+            _emit_onboard_progress(
+                "arm_ctrl", "starting", "Launching new_ar.py (arm controller)..."
+            )
+            ok_a, msg_a = ssh.supervisor_start_and_wait("arm", timeout_sec=55.0)
             STATE["onboard_arm"] = ok_a
             _emit_onboard_progress(
                 "arm_ctrl", "done" if ok_a else "error", msg_a
             )
             emit_status()
 
-            # Step 4: camera_stream.py (optional — ROV works without cameras)
-            # SSH can drop during the arm _wait_onboard_running poll; try to
-            # reconnect once before attempting the camera launch.
-            if not ssh.is_connected():
-                _emit_onboard_progress("camera", "wait",
-                                       "SSH dropped — reconnecting for camera start...")
-                ok_r, _ = ssh.connect(
-                    config["pi_ip"], config["pi_user"], config["pi_password"],
-                    port=int(config["pi_ssh_port"])
-                )
-                STATE["ssh_connected"] = ok_r
-                if not ok_r:
-                    STATE["onboard_cam"] = False
-                    _emit_onboard_progress(
-                        "camera", "error",
-                        "SSH reconnect failed — cameras not started (ROV still operational)"
-                    )
-                    emit_status()
-                    ok_c = False
-                    # Jump straight to summary
-                    core_ok = ok_m and ok_s
-                    if core_ok and ok_a:
-                        summary = "✓ ROV ready — cameras not started (SSH dropped, reconnect and retry)"
-                    elif core_ok:
-                        summary = "✓ Thruster control ready — arm + cameras not started (SSH dropped)"
-                    else:
-                        summary = "✕ SSH dropped during startup — reconnect and retry"
-                    _emit_onboard_progress("complete", "done" if core_ok else "error", summary)
-                    emit_status()
-                    return
-
-            _emit_onboard_progress("camera", "starting", "Launching camera_stream.py (MJPEG feeds)...")
+            _emit_onboard_progress(
+                "camera", "starting", "Launching camera_stream.py (MJPEG feeds)..."
+            )
             cam0_dev = config.get("camera0_device", "/dev/video0")
             cam1_dev = config.get("camera1_device", "/dev/video2")
             cam_args = f"--cam0 {cam0_dev} --cam1 {cam1_dev}"
-            ok_c, msg_c = ssh.start_onboard_process(
-                "onboard/camera_stream.py", "cam", extra_args=cam_args
+            ok_c, msg_c = ssh.supervisor_start_and_wait(
+                "cam", timeout_sec=25.0, extra_args=cam_args
             )
-            if ok_c:
-                ok_c, msg_c = _wait_onboard_running(
-                    lambda: ssh.is_onboard_running("camera_stream.py"),
-                    "camera_stream.py",
-                    timeout_sec=12.0,
-                )
-            if not ok_c:
-                log_tail = ssh.get_onboard_log("cam", lines=8)
-                if log_tail:
-                    last_line = log_tail.strip().splitlines()[-1][:120]
-                    msg_c = f"{msg_c} | Log: {last_line}"
             STATE["onboard_cam"] = ok_c
             _emit_onboard_progress(
                 "camera", "done" if ok_c else "error", msg_c
@@ -1178,9 +1069,7 @@ def api_start_onboard():
 
 @app.route("/api/onboard/stop", methods=["POST"])
 def api_stop_onboard():
-    ssh.stop_onboard_process("stabilization.py")
-    ssh.stop_onboard_process("new_ar.py")
-    ssh.stop_onboard_process("camera_stream.py")
+    ssh.supervisor_stop_all()
     ssh.stop_mavproxy()
     STATE["onboard_stab"]     = False
     STATE["onboard_arm"]      = False
