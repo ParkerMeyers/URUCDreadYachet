@@ -2764,13 +2764,37 @@ function setupCamera(imgId, noSigId, camNum) {
   const img   = document.getElementById(imgId);
   const noSig = document.getElementById(noSigId);
   let retryT  = null;
+  let failCount = 0;
 
-  function load() { img.src = `/camera/${camNum}?t=${Date.now()}`; }
+  function directUrl() {
+    const el = document.getElementById('cfg-camera' + camNum + '_url');
+    return el ? el.value.trim() : '';
+  }
 
-  img.onload = () => { noSig.style.display = 'none'; img.style.display = 'block'; };
+  function load() {
+    const direct = directUrl();
+    img.src = direct || `/camera/${camNum}?t=${Date.now()}`;
+  }
+
+  img.onload = () => {
+    failCount = 0;
+    noSig.style.display = 'none';
+    img.style.display   = 'block';
+  };
+
   img.onerror = () => {
+    failCount++;
     noSig.style.display = 'flex';
     img.style.display   = 'none';
+    const nsText = noSig.querySelector('.ns-text');
+    if (nsText) {
+      const url = directUrl() || `(proxy /camera/${camNum})`;
+      nsText.textContent = `No Signal — Cam ${camNum} (${url})`;
+    }
+    if (failCount === 1 && directUrl()) {
+      img.src = `/camera/${camNum}?t=${Date.now()}`;
+      return;
+    }
     if (!retryT) { retryT = setTimeout(() => { retryT = null; load(); }, 5000); }
   };
   load();
@@ -2780,6 +2804,7 @@ function setupCamera(imgId, noSigId, camNum) {
 // VIEW SWITCHING
 // ─────────────────────────────────────────────────────────────
 function openControl() {
+  saveConfig();
   activateGamepad();
   document.getElementById('launch').classList.remove('active');
   document.getElementById('control').classList.add('active');
