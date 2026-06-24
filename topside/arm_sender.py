@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 
+import os
 import socket
+import sys
 import serial
 import time
 
 SERIAL_PORT = "/dev/ttyACM0"
 BAUD = 115200
 
-PI_IP = "10.42.0.181"   # CHANGE THIS
+PI_IP = sys.argv[1] if len(sys.argv) >= 2 else os.getenv("ROV_HOST", "10.42.0.181")
 UDP_PORT = 5006
 
 PRINT_EVERY = 0.1

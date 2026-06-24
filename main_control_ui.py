@@ -45,8 +45,21 @@ else:
     HAVE_PIL = False
 
 
+# Optional: prefer a pure-Python SSH path (paramiko) when available. This avoids
+# relying on sshpass or platform ssh that may prompt on a TTY and cause the
+# GUI-launcher subprocess to hang/timeout even though SSH works from an
+# interactive terminal.
+HAVE_PARAMIKO = importlib.util.find_spec("paramiko") is not None
+if HAVE_PARAMIKO:
+    paramiko = importlib.import_module("paramiko")
+else:
+    paramiko = None
+
+
 TELEMETRY_PORT = 5006
 TELEMETRY_TIMEOUT_SEC = 1.0
+REMOTE_CONNECT_TIMEOUT_SEC = 10
+REMOTE_LAUNCH_TIMEOUT_SEC = 45
 
 
 class TelemetryReceiver:
@@ -103,12 +116,20 @@ class ProcessController:
     def _local_script(self, relative_path):
         return self.repo_root / relative_path
 
-    def _resolve_executable(self, candidates):
+    def _resolve_executable(self, candidates, extra_paths=None):
         for name in candidates:
             resolved = shutil.which(name)
             if resolved:
                 return resolved
 
+        if extra_paths:
+            for path in extra_paths:
+                if os.path.exists(path):
+                    return path
+
+        return None
+
+    def _resolve_ssh_executable(self):
         if os.name == "nt":
             system_root = os.environ.get("SystemRoot", r"C:\Windows")
             system32 = os.path.join(system_root, "System32")
@@ -125,14 +146,12 @@ class ProcessController:
                 r"C:\Program Files\Git\usr\bin\ssh.exe",
                 r"C:\Program Files\Git\bin\ssh.exe",
             ]
-            for path in extra_paths:
-                if os.path.exists(path):
-                    return path
+            return self._resolve_executable(["ssh", "ssh.exe"], extra_paths=extra_paths)
 
-        return None
+        return self._resolve_executable(["ssh", "ssh.exe"])
 
     def _ensure_ssh_available(self):
-        self.ssh_executable = self._resolve_executable(["ssh", "ssh.exe"])
+        self.ssh_executable = self._resolve_ssh_executable()
         if not self.ssh_executable:
             raise RuntimeError(
                 "SSH was not found on PATH or in the common Windows OpenSSH locations. "
@@ -151,7 +170,7 @@ class ProcessController:
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
-            "ConnectTimeout=5",
+            f"ConnectTimeout={REMOTE_CONNECT_TIMEOUT_SEC}",
             "-o",
             "BatchMode=no",
             "-o",
@@ -174,7 +193,116 @@ class ProcessController:
 
         return [ssh_executable, *ssh_args, target, str(remote_command)]
 
-    def launch_topside_programs(self):
+    def _run_remote_command(self, remote_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC):
+        # Prefer a paramiko-based SSH execution when we have a password but no
+        # sshpass available. Many SSH clients prompt on a TTY for passwords and
+        # will not read a password from stdin; that causes the subprocess to
+        # block until the timeout even though interactive SSH works.
+        password = getattr(self.args, "onboard_password", None)
+        sshpass_present = self._resolve_sshpass() is not None
+        if isinstance(password, str) and password and not sshpass_present and paramiko is not None:
+            return self._run_remote_command_paramiko(remote_command, timeout_sec=timeout_sec)
+
+        command = self._build_ssh_command(remote_command)
+        ssh_input = None
+        if isinstance(password, str) and password and not sshpass_present:
+            # As a fallback we attempt to write the password to stdin. This
+            # will not work with all ssh builds (some read from /dev/tty), but
+            # it's retained for environments where it is supported.
+            ssh_input = f"{password}\n"
+
+        try:
+            return subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                input=ssh_input,
+                timeout=timeout_sec,
+                env=os.environ.copy(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = (exc.stdout or "").strip()
+            stderr = (exc.stderr or "").strip()
+            details = stderr or stdout or "No output"
+            raise RuntimeError(
+                "SSH timed out while talking to the onboard computer. "
+                "Make sure the Pi is powered on, reachable on the network, and that SSH is enabled. "
+                f"Details: {details}"
+            ) from exc
+
+    def _run_remote_command_paramiko(self, remote_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC):
+        """Execute a remote command using Paramiko (pure-Python SSH client).
+
+        Returns an object with attributes: returncode, stdout, stderr (to match
+        subprocess.CompletedProcess-like usage in the rest of the code).
+        """
+        if paramiko is None:
+            raise RuntimeError("Paramiko is not installed")
+
+        host = str(self.args.onboard_host)
+        user = getattr(self.args, "onboard_user", None)
+        password = getattr(self.args, "onboard_password", None)
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        try:
+            client.connect(hostname=host, username=user or None, password=password or None, timeout=REMOTE_CONNECT_TIMEOUT_SEC)
+            stdin, stdout_fh, stderr_fh = client.exec_command(remote_command, timeout=timeout_sec)
+            stdout = stdout_fh.read().decode("utf-8", errors="replace")
+            stderr = stderr_fh.read().decode("utf-8", errors="replace")
+            # Paramiko provides an exit status on the channel
+            try:
+                returncode = stdout_fh.channel.recv_exit_status()
+            except Exception:
+                returncode = 0
+
+            result = type("R", (), {})()
+            result.returncode = returncode
+            result.stdout = stdout
+            result.stderr = stderr
+            return result
+        except paramiko.ssh_exception.AuthenticationException as exc:
+            raise RuntimeError("SSH authentication failed: check username/password") from exc
+        except (paramiko.SSHException, OSError, socket.timeout) as exc:
+            raise RuntimeError(f"SSH (paramiko) error connecting to {host}: {exc}") from exc
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _check_remote_setup(self):
+        remote_root = str(self.args.onboard_root)
+        check_command = (
+            f'test -d "{remote_root}" && '
+            f'test -f "{remote_root}/onboard/stabilization.py" && '
+            f'test -f "{remote_root}/onboard/new_ar.py" && '
+            'echo remote-ready'
+        )
+        result = self._run_remote_command(check_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "The onboard side is not set up yet or the remote root is wrong. "
+                f"Expected files at {remote_root}/onboard/stabilization.py and "
+                f"{remote_root}/onboard/new_ar.py. Copy the repo to the Pi and verify SSH access first."
+            )
+
+    def _launch_remote_program(self, program_name, remote_script_path, remote_log_path):
+        remote_command = (
+            f'cd "{self.args.onboard_root}" && '
+            f'nohup python3 -u "{remote_script_path}" > "{remote_log_path}" 2>&1 < /dev/null & '
+            f'echo "{program_name}:launched"'
+        )
+        result = self._run_remote_command(remote_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Could not launch {program_name} over SSH: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        return result
+
+    def _launch_topside_programs_visible(self):
         results = {}
         for name, rel_path in [
             ("arm_sender", Path("topside") / "arm_sender.py"),
@@ -189,54 +317,48 @@ class ProcessController:
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
 
-            process = subprocess.Popen(
-                [sys.executable, str(script_path)],
-                cwd=str(self.repo_root),
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                env=env,
-            )
+            launch_args = [sys.executable, str(script_path)]
+            if name in {"arm_sender", "thrust_sender"}:
+                launch_args.append(self.args.onboard_host)
+
+            subprocess_kwargs = {
+                "cwd": str(self.repo_root),
+                "stdout": log_handle,
+                "stderr": subprocess.STDOUT,
+                "env": env,
+            }
+            if os.name == "nt":
+                subprocess_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+            else:
+                subprocess_kwargs["start_new_session"] = True
+
+            process = subprocess.Popen(launch_args, **subprocess_kwargs)
             self.local_processes[name] = process
             self.local_log_handles[name] = log_handle
             results[name] = {"status": "started", "log": str(log_path)}
 
         return results
 
-    def launch_onboard_programs(self):
-        self._ensure_ssh_available()
+    def launch_topside_programs(self):
+        return self._launch_topside_programs_visible()
 
-        remote_root = self.args.onboard_root
+    def _launch_onboard_programs_remote(self):
+        self._ensure_ssh_available()
+        self._check_remote_setup()
+
+        remote_root = str(self.args.onboard_root)
         remote_logs = {
             "stabilization": "/tmp/uru_stabilization.log",
             "new_ar": "/tmp/uru_new_ar.log",
         }
 
-        remote_command = (
-            f'cd "{remote_root}" && '
-            f'nohup python3 "onboard/stabilization.py" > "{remote_logs["stabilization"]}" 2>&1 & '
-            f'nohup python3 "onboard/new_ar.py" > "{remote_logs["new_ar"]}" 2>&1 & '
-            'echo onboard-launched'
-        )
+        launch_plan = [
+            ("stabilization", "onboard/stabilization.py", remote_logs["stabilization"]),
+            ("new_ar", "onboard/new_ar.py", remote_logs["new_ar"]),
+        ]
 
-        command = self._build_ssh_command(remote_command)
-
-        password = getattr(self.args, "onboard_password", None)
-        ssh_input = None
-        if isinstance(password, str) and password and self._resolve_sshpass() is None:
-            ssh_input = f"{password}\n"
-
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            input=ssh_input,
-            timeout=20,
-            env=os.environ.copy(),
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Could not launch onboard scripts over SSH: {result.stderr.strip() or result.stdout.strip()}"
-            )
+        for program_name, remote_script_path, remote_log_path in launch_plan:
+            self._launch_remote_program(program_name, remote_script_path, remote_log_path)
 
         self.remote_ready = True
         return {
@@ -246,6 +368,9 @@ class ProcessController:
             "remote_root": remote_root,
             "logs": remote_logs,
         }
+
+    def launch_onboard_programs(self):
+        return self._launch_onboard_programs_remote()
 
     def stop_all(self):
         for name, process in list(self.local_processes.items()):
@@ -266,8 +391,10 @@ class ProcessController:
                 'pkill -f "onboard/stabilization.py" || true; '
                 'pkill -f "onboard/new_ar.py" || true'
             )
-            command = self._build_ssh_command(stop_command)
-            subprocess.run(command, capture_output=True, text=True, timeout=15)
+            try:
+                self._run_remote_command(stop_command, timeout_sec=15)
+            except Exception:
+                pass
             self.remote_ready = False
 
     def get_process_state(self, name):
@@ -360,6 +487,18 @@ class ROVMainApp(tk.Tk):
             justify="center",
         )
         intro.pack(pady=(0, 18))
+
+        prereq = ttk.Label(
+            self.launch_frame,
+            text=(
+                "Tip: the onboard Pi must already be reachable over SSH and have the repo at the remote root "
+                "before starting the onboard programs."
+            ),
+            wraplength=900,
+            justify="center",
+            foreground="#475569",
+        )
+        prereq.pack(pady=(0, 10))
 
         host_frame = ttk.LabelFrame(self.launch_frame, text="SSH target")
         host_frame.pack(fill="x", padx=18, pady=(0, 10))
@@ -782,10 +921,10 @@ class ROVMainApp(tk.Tk):
 def parse_args():
     parser = argparse.ArgumentParser(description="Launch the ROV UI and control stack")
     parser.add_argument("--repo-root", default=str(Path(__file__).resolve().parent))
-    parser.add_argument("--onboard-host", default=os.getenv("ROV_HOST", "10.42.0.181"))
+    parser.add_argument("--onboard-host", default=os.getenv("ROV_HOST", "192.168.2.249"))
     parser.add_argument("--onboard-user", default=os.getenv("ROV_USER", "uruc"))
     parser.add_argument("--onboard-password", default=os.getenv("ROV_PASSWORD", "yahboom"))
-    parser.add_argument("--onboard-root", default=os.getenv("ROV_ROOT", "/home/pi/URUCDreadYachet"))
+    parser.add_argument("--onboard-root", default=os.getenv("ROV_ROOT", "/home/uruc/URUCDreadYachet"))
     return parser.parse_args()
 
 
