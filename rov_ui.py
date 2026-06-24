@@ -217,17 +217,30 @@ class SSHManager:
             except:
                 return False
 
+    def _invalidate_client(self):
+        if self._client:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
+
     def exec(self, cmd, timeout=20):
         with self._lock:
             if self._client is None:
-                return "", "Not connected", "not_connected"
-        try:
-            _, stdout, stderr = self._client.exec_command(cmd, timeout=timeout)
-            out = stdout.read().decode("utf-8", errors="replace")
-            err = stderr.read().decode("utf-8", errors="replace")
-            return out.strip(), err.strip(), None
-        except Exception as e:
-            return "", "", str(e)
+                return "", "", "Not connected"
+            try:
+                transport = self._client.get_transport()
+                if transport is None or not transport.is_active():
+                    self._invalidate_client()
+                    return "", "", "SSH session not active"
+                _, stdout, stderr = self._client.exec_command(cmd, timeout=timeout)
+                out = stdout.read().decode("utf-8", errors="replace")
+                err = stderr.read().decode("utf-8", errors="replace")
+                return out.strip(), err.strip(), None
+            except Exception as e:
+                self._invalidate_client()
+                return "", "", str(e)
 
     def start_onboard_process(self, script_rel, log_name, extra_args=""):
         rov_path = config["pi_rov_path"]
@@ -633,6 +646,11 @@ def camera_stream(cam_num):
 # FLASK API ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
 
+@app.route("/favicon.ico")
+def favicon():
+    return Response(status=204)
+
+
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -720,11 +738,28 @@ def api_start_onboard():
                     "stabilization.py",
                     timeout_sec=10.0,
                 )
+            if not ok_s:
+                log_tail = ssh.get_onboard_log("stab", lines=8)
+                if log_tail:
+                    last_line = log_tail.strip().splitlines()[-1][:120]
+                    msg_s = f"{msg_s} | Log: {last_line}"
             STATE["onboard_stab"] = ok_s
             _emit_onboard_progress(
                 "stabilization", "done" if ok_s else "error", msg_s
             )
             emit_status()
+
+            if not ssh.is_connected():
+                _emit_onboard_progress(
+                    "arm_ctrl", "error", "SSH session not active — reconnect and retry"
+                )
+                STATE["onboard_arm"] = False
+                _emit_onboard_progress(
+                    "complete", "error",
+                    "✕ Failed: stabilization — SSH lost during start. Reconnect SSH and retry.",
+                )
+                emit_status()
+                return
 
             # Step 3: new_ar.py (arm — optional; thrusters work without it)
             _emit_onboard_progress("arm_ctrl", "starting", "Launching new_ar.py (arm controller)...")
@@ -932,7 +967,7 @@ def on_connect():
 
 
 @socketio.on("request_status")
-def on_request_status():
+def on_request_status(_data=None):
     emit_status()
 
 
@@ -2772,8 +2807,7 @@ function setupCamera(imgId, noSigId, camNum) {
   }
 
   function load() {
-    const direct = directUrl();
-    img.src = direct || `/camera/${camNum}?t=${Date.now()}`;
+    img.src = `/camera/${camNum}?t=${Date.now()}`;
   }
 
   img.onload = () => {
@@ -2788,12 +2822,8 @@ function setupCamera(imgId, noSigId, camNum) {
     img.style.display   = 'none';
     const nsText = noSig.querySelector('.ns-text');
     if (nsText) {
-      const url = directUrl() || `(proxy /camera/${camNum})`;
-      nsText.textContent = `No Signal — Cam ${camNum} (${url})`;
-    }
-    if (failCount === 1 && directUrl()) {
-      img.src = `/camera/${camNum}?t=${Date.now()}`;
-      return;
+      const upstream = directUrl() || 'not configured';
+      nsText.textContent = `No Signal — Cam ${camNum} (upstream ${upstream})`;
     }
     if (!retryT) { retryT = setTimeout(() => { retryT = null; load(); }, 5000); }
   };
