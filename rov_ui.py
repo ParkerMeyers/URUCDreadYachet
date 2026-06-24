@@ -246,9 +246,12 @@ class SSHManager:
         rov_path = config["pi_rov_path"]
         script   = f"{rov_path}/{script_rel}"
         log_file = f"/tmp/rov_{log_name}.log"
+        # </dev/null disconnects stdin so the process never hangs waiting for
+        # input when launched over an SSH exec channel.
         cmd = (
             f"cd {rov_path} && "
-            f"nohup python3 {script} {extra_args} > {log_file} 2>&1 & "
+            f"nohup python3 {script} {extra_args} "
+            f"< /dev/null > {log_file} 2>&1 & "
             f"echo $!"
         )
         out, err, error = self.exec(cmd)
@@ -289,28 +292,37 @@ class SSHManager:
         baud  = config["mavproxy_baud"]
         out1  = config["mavproxy_out1"]
         out2  = config["mavproxy_out2"]
+        # No --daemon: we background with nohup+& and redirect to our log file.
+        # --daemon double-forks and makes pgrep unreliable.
+        # </dev/null prevents MAVProxy hanging on stdin when launched over SSH.
         cmd = (
             f"nohup {bin_} "
             f"--master={ser} "
             f"--baudrate {baud} "
             f"--out={out1} "
             f"--out={out2} "
-            f"--daemon "
-            f"> /tmp/rov_mavproxy.log 2>&1 &"
+            f"< /dev/null > /tmp/rov_mavproxy.log 2>&1 & echo $!"
         )
-        _, _, error = self.exec(cmd, timeout=10)
+        out, _, error = self.exec(cmd, timeout=10)
         if error:
             return False, error
-        return True, "MAVProxy started"
+        pid = out.strip()
+        return True, f"MAVProxy started (PID {pid})"
 
     def stop_mavproxy(self):
         self.exec("pkill -f mavproxy 2>/dev/null; pkill -f MAVProxy 2>/dev/null || true")
 
     def is_mavproxy_running(self):
-        out, _, error = self.exec("pgrep -f mavproxy")
+        # pgrep -a shows full command line; -f matches against it.
+        # Returns True if any mavproxy process is alive.
+        out, _, error = self.exec("pgrep -f 'mavproxy'")
         if error:
             return False
         return bool(out.strip())
+
+    def get_mavproxy_log(self, lines=10):
+        out, _, _ = self.exec(f"tail -n {lines} /tmp/rov_mavproxy.log 2>/dev/null || echo ''")
+        return out
 
     def run_colmap(self):
         rov_path = config["pi_rov_path"]
@@ -713,8 +725,13 @@ def api_start_onboard():
             ok_m, msg_m = ssh.start_mavproxy()
             if ok_m:
                 ok_m, msg_m = _wait_onboard_running(
-                    ssh.is_mavproxy_running, "MAVProxy", timeout_sec=15.0
+                    ssh.is_mavproxy_running, "MAVProxy", timeout_sec=30.0
                 )
+            if not ok_m:
+                mav_log = ssh.get_mavproxy_log(lines=5)
+                if mav_log:
+                    last_line = mav_log.strip().splitlines()[-1][:150]
+                    msg_m = f"{msg_m} | Log: {last_line}"
             STATE["onboard_mavproxy"] = ok_m
             _emit_onboard_progress(
                 "mavproxy", "done" if ok_m else "error", msg_m
