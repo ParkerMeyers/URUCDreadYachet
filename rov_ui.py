@@ -189,14 +189,31 @@ class SSHManager:
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(
                 host, port=port, username=user, password=password,
-                timeout=10, banner_timeout=15, auth_timeout=15
+                timeout=20, banner_timeout=30, auth_timeout=30
             )
+            # Send SSH-level keepalives every 15 s so the connection survives
+            # idle periods on the drive page or between process-status polls.
+            t = client.get_transport()
+            if t:
+                t.set_keepalive(15)
             with self._lock:
                 if self._client:
                     try: self._client.close()
                     except: pass
                 self._client = client
             return True, "Connected"
+        except (TimeoutError, socket.timeout):
+            return False, (
+                f"Timed out connecting to {host}:{port} — "
+                "is the Pi on and reachable? Check the IP address."
+            )
+        except paramiko.AuthenticationException:
+            return False, f"Authentication failed for {user}@{host} — check username/password."
+        except paramiko.SSHException as e:
+            return False, f"SSH error: {e}"
+        except OSError as e:
+            # Covers ConnectionRefusedError, NetworkUnreachable, etc.
+            return False, f"Network error reaching {host}:{port} — {e}"
         except Exception as e:
             return False, str(e)
 
@@ -319,6 +336,24 @@ class SSHManager:
         if error:
             return False
         return bool(out.strip())
+
+    def get_onboard_status(self):
+        """Check all three onboard processes in one SSH exec to avoid hammering
+        the SSH channel with separate calls every monitoring cycle."""
+        cmd = (
+            "pgrep -f 'mavproxy'        > /dev/null 2>&1 && echo mavproxy_ok; "
+            "pgrep -f 'stabilization.py'> /dev/null 2>&1 && echo stab_ok; "
+            "pgrep -f 'new_ar.py'       > /dev/null 2>&1 && echo arm_ok; "
+            "true"
+        )
+        out, _, error = self.exec(cmd, timeout=10)
+        if error:
+            return {"mavproxy": False, "stab": False, "arm": False}
+        return {
+            "mavproxy": "mavproxy_ok" in out,
+            "stab":     "stab_ok"     in out,
+            "arm":      "arm_ok"      in out,
+        }
 
     def get_mavproxy_log(self, lines=10):
         out, _, _ = self.exec(f"tail -n {lines} /tmp/rov_mavproxy.log 2>/dev/null || echo ''")
@@ -499,12 +534,14 @@ def _emit_onboard_progress(step: str, status: str, msg: str = ""):
 
 
 def _wait_onboard_running(check_fn, label: str, timeout_sec: float = 12.0) -> tuple[bool, str]:
-    """Poll until an onboard process is running or timeout."""
+    """Poll until an onboard process is running or timeout.
+    Polls every 2 s (not 0.5 s) so we don't flood the SSH connection while
+    the monitor loop is also making SSH calls every second."""
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         if check_fn():
             return True, f"{label} running"
-        time.sleep(0.5)
+        time.sleep(2.0)
     return False, f"{label} did not start within {int(timeout_sec)}s — check onboard logs"
 
 
@@ -575,22 +612,33 @@ def _start_telemetry_listener():
 # BACKGROUND MONITOR
 # ─────────────────────────────────────────────────────────────────────────────
 
+_ssh_monitor_counter = 0   # only query SSH process status every 5 s
+
 def _monitor_loop():
+    global _ssh_monitor_counter
     while True:
         time.sleep(1.0)
         STATE["thrust_running"] = is_local_running("thrust")
         STATE["arm_running"]    = is_local_running("arm")
 
-        if ssh.is_connected():
-            STATE["ssh_connected"]    = True
-            STATE["onboard_mavproxy"] = ssh.is_mavproxy_running()
-            STATE["onboard_stab"]     = ssh.is_onboard_running("stabilization.py")
-            STATE["onboard_arm"]      = ssh.is_onboard_running("new_ar.py")
-        else:
-            STATE["ssh_connected"]    = False
-            STATE["onboard_mavproxy"] = False
-            STATE["onboard_stab"]     = False
-            STATE["onboard_arm"]      = False
+        _ssh_monitor_counter += 1
+        # Skip heavy SSH polling while the startup sequence is running —
+        # it and _wait_onboard_running are already making SSH calls and
+        # competing for the channel can drop the connection.
+        # Between startup sequences, check every 5 s via a single batched exec.
+        if not STATE["onboard_starting"] and _ssh_monitor_counter >= 5:
+            _ssh_monitor_counter = 0
+            if ssh.is_connected():
+                STATE["ssh_connected"] = True
+                status = ssh.get_onboard_status()
+                STATE["onboard_mavproxy"] = status["mavproxy"]
+                STATE["onboard_stab"]     = status["stab"]
+                STATE["onboard_arm"]      = status["arm"]
+            else:
+                STATE["ssh_connected"]    = False
+                STATE["onboard_mavproxy"] = False
+                STATE["onboard_stab"]     = False
+                STATE["onboard_arm"]      = False
 
         tel_age = time.time() - STATE["last_telemetry_time"]
         if tel_age > 2.0:
@@ -739,22 +787,46 @@ def api_start_onboard():
             emit_status()
 
             if ok_m:
-                for i in range(4):
-                    time.sleep(0.5)
+                for i in range(5):
+                    time.sleep(1.0)
                     _emit_onboard_progress(
                         "mavproxy", "wait",
-                        f"Waiting for MAVProxy to initialize... ({i + 1}/4)"
+                        f"Waiting for MAVProxy to initialize... ({i + 1}/5)"
                     )
 
             # Step 2: stabilization.py
             _emit_onboard_progress("stabilization", "starting", "Launching stabilization.py...")
             ok_s, msg_s = ssh.start_onboard_process("onboard/stabilization.py", "stab")
             if ok_s:
+                # stabilization.py blocks up to 15 s waiting for MAVLink heartbeat —
+                # give it 25 s before declaring failure.
                 ok_s, msg_s = _wait_onboard_running(
                     lambda: ssh.is_onboard_running("stabilization.py"),
                     "stabilization.py",
-                    timeout_sec=10.0,
+                    timeout_sec=25.0,
                 )
+
+            # If SSH dropped during the wait, try a single reconnect.
+            # stabilization.py may have started fine — the process is nohup'd
+            # and keeps running regardless of SSH state.
+            if not ssh.is_connected():
+                _emit_onboard_progress("stabilization", "wait",
+                                       "SSH dropped — attempting reconnect...")
+                ok_r, _ = ssh.connect(
+                    config["pi_ip"], config["pi_user"], config["pi_password"],
+                    port=int(config["pi_ssh_port"])
+                )
+                if ok_r:
+                    STATE["ssh_connected"] = True
+                    if ssh.is_onboard_running("stabilization.py"):
+                        ok_s   = True
+                        msg_s  = "stabilization.py running"
+                    else:
+                        msg_s = "stabilization.py not found after SSH reconnect"
+                else:
+                    STATE["ssh_connected"] = False
+                    msg_s = "stabilization.py timed out and SSH reconnect failed"
+
             if not ok_s:
                 log_tail = ssh.get_onboard_log("stab", lines=8)
                 if log_tail:
@@ -860,6 +932,16 @@ def api_start_topside():
         ok, msg = start_local_process("arm", cmd, cwd=ROV_ROOT)
         results["arm_sender"] = {"ok": ok, "msg": msg}
         STATE["arm_running"] = ok
+
+        if ok:
+            # Re-check after 1 s — if arm_sender crashed immediately (e.g. COM3
+            # denied) this will flip the dot to red before the user notices a
+            # false "running" state.
+            def _arm_confirm():
+                time.sleep(1.0)
+                STATE["arm_running"] = is_local_running("arm")
+                emit_status()
+            socketio.start_background_task(_arm_confirm)
     else:
         results["arm_sender"] = {"ok": True, "msg": "already running"}
 

@@ -1087,12 +1087,21 @@ function hideKeybindsOutside(e) {
 // ─────────────────────────────────────────────────────────────
 // LOGS
 // ─────────────────────────────────────────────────────────────
-let _logOpen = false;
+let _logOpen       = false;
+let _logRefreshTimer = null;
+
+// Map JS log name → API endpoint name for onboard (Pi-side) logs
+const _onboardLogNames = { onboard_stab: 'stab', onboard_arm: 'arm' };
 
 function toggleLog() {
   _logOpen = !_logOpen;
   document.getElementById('log-drawer').classList.toggle('open', _logOpen);
-  if (_logOpen) refreshLogView();
+  if (_logOpen) {
+    refreshLogView();
+    _startLogAutoRefresh();
+  } else {
+    _stopLogAutoRefresh();
+  }
 }
 
 function switchLog(name) {
@@ -1106,11 +1115,55 @@ function switchLog(name) {
 }
 
 function refreshLogView() {
+  const apiName = _onboardLogNames[_currentLog];
+  if (apiName) {
+    // Onboard (Pi-side) logs — fetch from server which SSHes to Pi
+    fetch(`/api/onboard_log/${apiName}`)
+      .then(r => r.json())
+      .then(d => {
+        if (d.lines) {
+          _logs[_currentLog] = d.lines;
+          _renderLogContent(d.lines);
+        }
+      })
+      .catch(() => {
+        _renderLogContent(['(Could not fetch log — SSH not connected?)']);
+      });
+  } else {
+    // Local logs (arm_sender) — already in memory from socket events
+    _renderLogContent(_logs[_currentLog] || []);
+  }
+}
+
+function _renderLogContent(lines) {
   const content = document.getElementById('log-content');
-  const lines   = _logs[_currentLog] || [];
+  if (!content) return;
   content.innerHTML = lines.map(l =>
     `<div class="log-line">${escapeHtml(l)}</div>`
   ).join('');
+  content.scrollTop = content.scrollHeight;
+}
+
+function _startLogAutoRefresh() {
+  _stopLogAutoRefresh();
+  // Refresh onboard logs every 3 s while the drawer is open
+  _logRefreshTimer = setInterval(() => {
+    if (_logOpen && _onboardLogNames[_currentLog]) refreshLogView();
+  }, 3000);
+}
+
+function _stopLogAutoRefresh() {
+  if (_logRefreshTimer) { clearInterval(_logRefreshTimer); _logRefreshTimer = null; }
+}
+
+function appendLogLine(line) {
+  if (!_logOpen) return;
+  const content = document.getElementById('log-content');
+  const div = document.createElement('div');
+  div.className   = 'log-line';
+  div.textContent = line;
+  content.appendChild(div);
+  if (content.children.length > 300) content.removeChild(content.firstChild);
   content.scrollTop = content.scrollHeight;
 }
 
