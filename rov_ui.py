@@ -132,6 +132,7 @@ STATE = {
     "mode":                "disarmed",
     "mosfet_on":           False,
     "last_telemetry_time": 0.0,
+    "telemetry_packets":   0,
     "telemetry_listener_ok": False,
     "onboard_starting":      False,
     "onboard_progress":      [],
@@ -415,9 +416,14 @@ def _forward_ctrl_to_pi(packet: dict):
         print(f"[WARN] Control UDP send failed: {e}")
 
 
-def _make_keepalive_packet() -> dict:
-    """Neutral packet so Pi learns our telemetry return address."""
+def _get_active_ctrl_packet() -> dict:
+    """Pick the best control packet to send: live browser input or neutral keepalive."""
     global _ctrl_keepalive_seq
+    with _ctrl_lock:
+        recent = (time.time() - _last_browser_ctrl_time) < 1.0
+        if recent and _last_browser_ctrl:
+            return dict(_last_browser_ctrl)
+
     with _ctrl_lock:
         _ctrl_keepalive_seq += 1
         seq = _ctrl_keepalive_seq
@@ -439,15 +445,17 @@ def _make_keepalive_packet() -> dict:
     }
 
 
+def _make_keepalive_packet() -> dict:
+    """Backward-compatible alias."""
+    return _get_active_ctrl_packet()
+
+
 def _start_control_keepalive():
     """Send control UDP at 20 Hz so Pi always has a telemetry return address."""
     def _loop():
         while True:
             time.sleep(0.05)
-            with _ctrl_lock:
-                recent = (time.time() - _last_browser_ctrl_time) < 0.2
-                pkt = _last_browser_ctrl if (recent and _last_browser_ctrl) else _make_keepalive_packet()
-            _forward_ctrl_to_pi(pkt)
+            _forward_ctrl_to_pi(_get_active_ctrl_packet())
 
     threading.Thread(target=_loop, daemon=True, name="ctrl-keepalive").start()
 
@@ -498,6 +506,7 @@ def _update_telemetry_from_json(pkt: dict):
     tel["depth_recapture_pending"] = bool(pkt.get("depth_recapture_pending", False))
     tel["yaw_recapture_pending"]   = bool(pkt.get("yaw_recapture_pending", False))
     STATE["last_telemetry_time"]   = time.time()
+    STATE["telemetry_packets"]     = STATE.get("telemetry_packets", 0) + 1
     socketio.emit("telemetry", dict(tel))
 
 
@@ -717,24 +726,32 @@ def api_start_onboard():
             )
             emit_status()
 
-            # Step 3: new_ar.py
+            # Step 3: new_ar.py (arm — optional; thrusters work without it)
             _emit_onboard_progress("arm_ctrl", "starting", "Launching new_ar.py (arm controller)...")
             ok_a, msg_a = ssh.start_onboard_process("onboard/new_ar.py", "arm")
             if ok_a:
                 ok_a, msg_a = _wait_onboard_running(
                     lambda: ssh.is_onboard_running("new_ar.py"),
                     "new_ar.py",
-                    timeout_sec=10.0,
+                    timeout_sec=20.0,
                 )
+            if not ok_a:
+                log_tail = ssh.get_onboard_log("arm", lines=8)
+                if log_tail:
+                    last_line = log_tail.strip().splitlines()[-1][:120]
+                    msg_a = f"{msg_a} | Log: {last_line}"
             STATE["onboard_arm"] = ok_a
             _emit_onboard_progress(
                 "arm_ctrl", "done" if ok_a else "error", msg_a
             )
             emit_status()
 
-            all_ok = ok_m and ok_s and ok_a
+            core_ok = ok_m and ok_s
+            all_ok = core_ok and ok_a
             if all_ok:
                 summary = "✓ All onboard programs running (MAVProxy, stabilization, new_ar)"
+            elif core_ok:
+                summary = "✓ Thruster control ready (MAVProxy + stabilization). Arm controller failed — see log."
             else:
                 parts = []
                 if not ok_m:
@@ -747,7 +764,7 @@ def api_start_onboard():
 
             _emit_onboard_progress(
                 "complete",
-                "done" if all_ok else "error",
+                "done" if core_ok else "error",
                 summary,
             )
             emit_status()

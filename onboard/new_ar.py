@@ -372,7 +372,15 @@ def _mosfet_udp_listener():
 threading.Thread(target=_mosfet_udp_listener, daemon=True).start()
 # ────────────────────────────────────────────────────────────────────────────
 
-old_terminal = termios.tcgetattr(sys.stdin)
+# Launched via SSH/nohup (web UI) has no TTY — keyboard control is optional.
+have_tty = False
+old_terminal = None
+try:
+    old_terminal = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin.fileno())
+    have_tty = True
+except (termios.error, OSError, AttributeError):
+    print("No TTY — running headless (UDP arm control only).")
 
 last_update = time.time()
 last_print = time.time()
@@ -381,12 +389,10 @@ j6_pwm = CENTER_US
 j6_status = "off"
 
 try:
-    tty.setcbreak(sys.stdin.fileno())
-
     while True:
         now = time.time()
 
-        if handle_keyboard() == "quit":
+        if have_tty and handle_keyboard() == "quit":
             break
 
         try:
@@ -455,7 +461,8 @@ except KeyboardInterrupt:
     pass
 
 finally:
-    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_terminal)
+    if have_tty and old_terminal is not None:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_terminal)
     print("\nStopping.")
 
     set_pwm(J6_CH, J6_OUT_CENTER)
