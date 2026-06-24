@@ -96,3 +96,7 @@ Traceback (most recent call last):
   File "C:\Users\parke\PycharmProjects\URUCDreadYachet - Copy\topside\thrust_sender.py", line 124, in get_axis_safe
     if axis_index < 0 or axis_index >= joy.get_numaxes():
 AttributeError: 'NoneType' object has no attribute 'get_numaxes'
+Traceback (most recent call last):
+  File "C:\Users\parke\PycharmProjects\URUCDreadYachet - Copy\topside\thrust_sender.py", line 44, in <module>
+    import pygame
+ModuleNotFoundError: No module named 'pygame'

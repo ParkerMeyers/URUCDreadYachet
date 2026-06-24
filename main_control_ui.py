@@ -67,13 +67,62 @@ except Exception:
 
 
 # Password SSH uses Paramiko so the UI never blocks on a console password prompt.
-HAVE_PARAMIKO = importlib.util.find_spec("paramiko") is not None
-if HAVE_PARAMIKO:
-    paramiko = importlib.import_module("paramiko")
-else:
-    paramiko = None
+paramiko = None
 
-PARAMIKO_INSTALL_HINT = "pip install paramiko"
+
+def _project_venv_python():
+    root = Path(__file__).resolve().parent
+    candidates = []
+    if os.name == "nt":
+        candidates.extend([root / ".venv" / "Scripts" / "python.exe", root / "venv" / "Scripts" / "python.exe"])
+    else:
+        candidates.extend([root / ".venv" / "bin" / "python3", root / "venv" / "bin" / "python3"])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _bootstrap_project_venv():
+    if os.environ.get("ROV_SKIP_VENV_BOOTSTRAP"):
+        return
+    venv_python = _project_venv_python()
+    if venv_python is None:
+        return
+    current = Path(sys.executable).resolve()
+    if current == venv_python:
+        return
+    os.environ["ROV_SKIP_VENV_BOOTSTRAP"] = "1"
+    os.execv(str(venv_python), [str(venv_python), *sys.argv])
+
+
+def _paramiko_install_hint():
+    venv_python = _project_venv_python()
+    lines = [f"{sys.executable} -m pip install paramiko"]
+    if venv_python is not None and Path(sys.executable).resolve() != venv_python:
+        lines.append(f"Or run the UI with the project venv: {venv_python} main_control_ui.py")
+    return "\n".join(lines)
+
+
+def _load_paramiko():
+    global paramiko
+    if paramiko is not None:
+        return paramiko
+    try:
+        paramiko = importlib.import_module("paramiko")
+        return paramiko
+    except ImportError as exc:
+        raise RuntimeError(
+            "Paramiko is not available in the Python interpreter running this UI.\n\n"
+            f"Interpreter: {sys.executable}\n\n"
+            f"{_paramiko_install_hint()}"
+        ) from exc
+
+
+def _paramiko_available():
+    if paramiko is not None:
+        return True
+    return importlib.util.find_spec("paramiko") is not None
 
 
 TELEMETRY_PORT = 5007
@@ -202,11 +251,7 @@ class ProcessController:
 
     def _ensure_remote_access(self):
         if self._uses_password_ssh():
-            if paramiko is None:
-                raise RuntimeError(
-                    "Password SSH from the UI requires Paramiko (no console prompts). "
-                    f"Install it with: {PARAMIKO_INSTALL_HINT}"
-                )
+            _load_paramiko()
             return "paramiko"
         self._ensure_ssh_available()
         return "ssh"
@@ -279,7 +324,7 @@ class ProcessController:
                 ]
             raise RuntimeError(
                 "Password SSH requires Paramiko on this system. "
-                f"Install it with: {PARAMIKO_INSTALL_HINT}"
+                f"{_paramiko_install_hint()}"
             )
 
         return [ssh_executable, *ssh_args, target, str(remote_command)]
@@ -287,15 +332,8 @@ class ProcessController:
     def _run_remote_command(self, remote_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC):
         password = self._onboard_password()
         if password:
-            if paramiko is None:
-                sshpass_present = self._resolve_sshpass() is not None
-                if not sshpass_present:
-                    raise RuntimeError(
-                        "Password SSH from the UI requires Paramiko. "
-                        f"Install it with: {PARAMIKO_INSTALL_HINT}"
-                    )
-            else:
-                return self._run_remote_command_paramiko(remote_command, timeout_sec=timeout_sec)
+            _load_paramiko()
+            return self._run_remote_command_paramiko(remote_command, timeout_sec=timeout_sec)
 
         command = self._build_ssh_command(remote_command)
         try:
@@ -320,15 +358,14 @@ class ProcessController:
 
     def _run_remote_command_paramiko(self, remote_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC):
         """Execute a remote command using Paramiko (password auth, no TTY prompts)."""
-        if paramiko is None:
-            raise RuntimeError(f"Paramiko is not installed. Run: {PARAMIKO_INSTALL_HINT}")
+        mod = _load_paramiko()
 
         host = str(self.args.onboard_host)
         user = getattr(self.args, "onboard_user", None)
         password = self._onboard_password()
 
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client = mod.SSHClient()
+        client.set_missing_host_key_policy(mod.AutoAddPolicy())
 
         try:
             client.connect(
@@ -354,9 +391,9 @@ class ProcessController:
             result.stdout = stdout
             result.stderr = stderr
             return result
-        except paramiko.ssh_exception.AuthenticationException as exc:
+        except mod.ssh_exception.AuthenticationException as exc:
             raise RuntimeError("SSH authentication failed: check username/password in the UI") from exc
-        except (paramiko.SSHException, OSError, socket.timeout) as exc:
+        except (mod.SSHException, OSError, socket.timeout) as exc:
             raise RuntimeError(f"SSH (paramiko) error connecting to {host}: {exc}") from exc
         finally:
             try:
@@ -1079,12 +1116,12 @@ class ROVMainApp(tk.Tk):
         self.controller.args.onboard_user = self.args.onboard_user
         self.controller.args.onboard_password = self.args.onboard_password
 
-        if self.controller._uses_password_ssh() and not HAVE_PARAMIKO:
-            messagebox.showerror(
-                "Paramiko required",
-                f"Password SSH from the UI needs Paramiko installed.\n\nRun: {PARAMIKO_INSTALL_HINT}",
-            )
-            return
+        if self.controller._uses_password_ssh():
+            try:
+                _load_paramiko()
+            except RuntimeError as exc:
+                messagebox.showerror("Paramiko required", str(exc))
+                return
 
         if self.topside_started:
             self.controller._stop_local_topside()
@@ -1589,11 +1626,23 @@ def parse_args():
         default=os.getenv("ROV_VENV", "venv"),
         help="Onboard venv directory on the Pi (relative to --onboard-root, or absolute path)",
     )
+    parser.add_argument(
+        "--no-venv-bootstrap",
+        action="store_true",
+        help="Do not auto-relaunch using the project .venv interpreter",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if not args.no_venv_bootstrap:
+        _bootstrap_project_venv()
+    if _paramiko_available():
+        try:
+            _load_paramiko()
+        except RuntimeError:
+            pass
     app = ROVMainApp(args)
     app.mainloop()
 
