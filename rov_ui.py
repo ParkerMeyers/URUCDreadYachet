@@ -185,7 +185,7 @@ class SSHManager:
         self._client = None
         self._lock = threading.Lock()
 
-    def connect(self, host, user, password, port=22):
+    def connect(self, host, user, password, port=22, connect_timeout=20):
         if not HAVE_PARAMIKO:
             return False, "paramiko not installed. Run: pip install paramiko"
         try:
@@ -193,13 +193,15 @@ class SSHManager:
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(
                 host, port=port, username=user, password=password,
-                timeout=20, banner_timeout=30, auth_timeout=30
+                timeout=connect_timeout,
+                banner_timeout=max(connect_timeout, 15),
+                auth_timeout=max(connect_timeout, 15),
             )
-            # Send SSH-level keepalives every 15 s so the connection survives
-            # idle periods on the drive page or between process-status polls.
+            # Keepalive every 5 s — catches a dead link quickly so the
+            # monitor loop notices before exec() blocks on a stale channel.
             t = client.get_transport()
             if t:
-                t.set_keepalive(15)
+                t.set_keepalive(5)
             with self._lock:
                 if self._client:
                     try: self._client.close()
@@ -247,6 +249,10 @@ class SSHManager:
             self._client = None
 
     def exec(self, cmd, timeout=20):
+        # Phase 1: acquire lock only long enough to open the exec channel.
+        # Releasing the lock before stdout.read() lets is_connected() and
+        # other threads proceed while we wait for the command output —
+        # a dead connection won't freeze the entire SSH lock.
         with self._lock:
             if self._client is None:
                 return "", "", "Not connected"
@@ -256,12 +262,18 @@ class SSHManager:
                     self._invalidate_client()
                     return "", "", "SSH session not active"
                 _, stdout, stderr = self._client.exec_command(cmd, timeout=timeout)
-                out = stdout.read().decode("utf-8", errors="replace")
-                err = stderr.read().decode("utf-8", errors="replace")
-                return out.strip(), err.strip(), None
             except Exception as e:
                 self._invalidate_client()
                 return "", "", str(e)
+        # Phase 2: read output outside the lock (may block up to `timeout` s).
+        try:
+            out = stdout.read().decode("utf-8", errors="replace")
+            err = stderr.read().decode("utf-8", errors="replace")
+            return out.strip(), err.strip(), None
+        except Exception as e:
+            with self._lock:
+                self._invalidate_client()
+            return "", "", str(e)
 
     def start_onboard_process(self, script_rel, log_name, extra_args=""):
         rov_path = config["pi_rov_path"]
@@ -618,10 +630,42 @@ def _start_telemetry_listener():
 # BACKGROUND MONITOR
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ssh_monitor_counter = 0   # only query SSH process status every 5 s
+_ssh_monitor_counter  = 0      # only query SSH process status every 5 s
+_ssh_was_connected    = False  # True once user has successfully connected
+_ssh_reconnect_active = False  # guard: only one auto-reconnect attempt at a time
+
+
+def _trigger_ssh_reconnect():
+    """Spawn a background thread that attempts one quick SSH reconnect (5 s
+    timeout).  Only fires if the user previously had a working connection and
+    no reconnect is already in flight."""
+    global _ssh_reconnect_active
+    if _ssh_reconnect_active:
+        return
+    if not config.get("pi_ip") or not config.get("pi_user"):
+        return
+    _ssh_reconnect_active = True
+
+    def _do():
+        global _ssh_reconnect_active
+        try:
+            ok, _ = ssh.connect(
+                config["pi_ip"], config["pi_user"], config["pi_password"],
+                port=int(config["pi_ssh_port"]),
+                connect_timeout=5,
+            )
+            if ok:
+                STATE["ssh_connected"] = True
+                STATE["ssh_error"]     = ""
+                emit_status()
+        finally:
+            _ssh_reconnect_active = False
+
+    threading.Thread(target=_do, daemon=True, name="ssh-auto-reconnect").start()
+
 
 def _monitor_loop():
-    global _ssh_monitor_counter
+    global _ssh_monitor_counter, _ssh_was_connected
     while True:
         time.sleep(1.0)
         STATE["thrust_running"] = is_local_running("thrust")
@@ -635,18 +679,20 @@ def _monitor_loop():
         if not STATE["onboard_starting"] and _ssh_monitor_counter >= 5:
             _ssh_monitor_counter = 0
             if ssh.is_connected():
-                STATE["ssh_connected"] = True
+                _ssh_was_connected            = True
+                STATE["ssh_connected"]         = True
                 status = ssh.get_onboard_status()
                 STATE["onboard_mavproxy"] = status["mavproxy"]
                 STATE["onboard_stab"]     = status["stab"]
                 STATE["onboard_arm"]      = status["arm"]
-                STATE["onboard_cam"]      = status["cam"]
             else:
                 STATE["ssh_connected"]    = False
                 STATE["onboard_mavproxy"] = False
                 STATE["onboard_stab"]     = False
                 STATE["onboard_arm"]      = False
-                STATE["onboard_cam"]      = False
+                # Auto-reconnect only if the user had a working session before.
+                if _ssh_was_connected:
+                    _trigger_ssh_reconnect()
 
         tel_age = time.time() - STATE["last_telemetry_time"]
         if tel_age > 2.0:
@@ -756,6 +802,8 @@ def api_ssh_connect():
 
 @app.route("/api/ssh/disconnect", methods=["POST"])
 def api_ssh_disconnect():
+    global _ssh_was_connected
+    _ssh_was_connected = False   # don't auto-reconnect after deliberate disconnect
     ssh.disconnect()
     STATE["ssh_connected"] = False
     STATE["ssh_error"] = ""
