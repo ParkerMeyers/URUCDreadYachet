@@ -20,13 +20,13 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "onboard"))
-from mavlink_rc import connect_mavlink, send_rc_channels_override
+from mavlink_rc import MAVLINK_ONBOARD, connect_mavlink, send_rc_channels_override
 
 from pymavlink import mavutil
 
 # ── Config ────────────────────────────────────────────────────────────────────
 LISTEN_PORT   = 5010
-MAVLINK_URL   = "udp:127.0.0.1:14551"
+MAVLINK_URL   = MAVLINK_ONBOARD
 NEUTRAL_US    = 1500
 MIN_US        = 1100
 MAX_US        = 1900

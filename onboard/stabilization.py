@@ -22,14 +22,19 @@ from dataclasses import dataclass
 
 from pymavlink import mavutil
 
-from mavlink_rc import connect_mavlink, send_rc_channels_override, wait_for_heartbeat
+from mavlink_rc import (
+    MAVLINK_ONBOARD,
+    connect_mavlink,
+    send_rc_channels_override,
+    wait_for_heartbeat,
+)
 
 
 # ============================================================
 # USER CONFIG
 # ============================================================
 
-MAVLINK_UDP = "udp:127.0.0.1:14551"
+MAVLINK_UDP = MAVLINK_ONBOARD
 UDP_LISTEN_IP = "0.0.0.0"
 UDP_LISTEN_PORT = 5005
 

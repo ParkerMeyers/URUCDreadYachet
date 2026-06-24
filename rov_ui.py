@@ -114,9 +114,8 @@ DEFAULT_CONFIG = {
     "mavproxy_bin":        "/home/uruc/mav_env/bin/mavproxy.py",
     "mavproxy_serial":     "/dev/ttyACM0",
     "mavproxy_baud":       "115200",
-    "mavproxy_out1":       "udp:10.42.0.1:14550",
-    "mavproxy_out2":       "udp:127.0.0.1:14551",   # stabilization.py
-    "mavproxy_out3":       "udp:127.0.0.1:14552",   # new_ar.py (arm)
+    "mavproxy_out1":       "udp:192.168.69.2:14550",
+    "mavproxy_out2":       "tcpin:127.0.0.1:5762",  # onboard: stab + arm (TCP)
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -361,17 +360,15 @@ class SSHManager:
         baud  = config["mavproxy_baud"]
         out1  = config["mavproxy_out1"]
         out2  = config["mavproxy_out2"]
-        out3  = config.get("mavproxy_out3", "udp:127.0.0.1:14552")
-        # No --daemon: we background with nohup+& and redirect to our log file.
-        # --daemon double-forks and makes pgrep unreliable.
-        # </dev/null prevents MAVProxy hanging on stdin when launched over SSH.
+        # --non-interactive: no MAV> shell (exits when stdin closes over SSH/nohup).
+        # setsid: detach from SSH session so SIGHUP does not kill the bridge.
         cmd = (
-            f"nohup {bin_} "
+            f"setsid nohup {bin_} "
             f"--master={ser} "
             f"--baudrate {baud} "
+            f"--non-interactive "
             f"--out={out1} "
             f"--out={out2} "
-            f"--out={out3} "
             f"< /dev/null > /tmp/rov_mavproxy.log 2>&1 & echo $!"
         )
         out, _, error = self.exec(cmd, timeout=10)
@@ -379,6 +376,13 @@ class SSHManager:
             return False, error
         pid = out.strip()
         return True, f"MAVProxy started (PID {pid})"
+
+    def is_mavproxy_fc_connected(self):
+        """True once MAVProxy log shows the flight controller is online."""
+        out, _, _ = self.exec(
+            "grep -E 'Detected vehicle|online system' /tmp/rov_mavproxy.log 2>/dev/null | tail -1"
+        )
+        return bool(out.strip())
 
     def stop_mavproxy(self):
         self.exec("pkill -f mavproxy 2>/dev/null; pkill -f MAVProxy 2>/dev/null || true")
@@ -930,19 +934,47 @@ def api_start_onboard():
                 if mav_log:
                     last_line = mav_log.strip().splitlines()[-1][:150]
                     msg_m = f"{msg_m} | Log: {last_line}"
-            STATE["onboard_mavproxy"] = ok_m
-            _emit_onboard_progress(
-                "mavproxy", "done" if ok_m else "error", msg_m
-            )
-            emit_status()
-
-            if ok_m:
-                for i in range(5):
-                    time.sleep(1.0)
+                STATE["onboard_mavproxy"] = ok_m
+                _emit_onboard_progress(
+                    "mavproxy", "done" if ok_m else "error", msg_m
+                )
+                emit_status()
+            elif ok_m:
+                fc_deadline = time.time() + 45.0
+                fc_wait_i = 0
+                while time.time() < fc_deadline:
+                    if not ssh.is_mavproxy_running():
+                        ok_m = False
+                        msg_m = "MAVProxy exited — check /tmp/rov_mavproxy.log on Pi"
+                        break
+                    if ssh.is_mavproxy_fc_connected():
+                        msg_m = "MAVProxy running — Pix6 online"
+                        break
+                    fc_wait_i += 1
                     _emit_onboard_progress(
                         "mavproxy", "wait",
-                        f"Waiting for MAVProxy to initialize... ({i + 1}/5)"
+                        f"Waiting for Pix6 heartbeat... ({fc_wait_i})"
                     )
+                    time.sleep(2.0)
+                else:
+                    if ok_m:
+                        msg_m = (
+                            "MAVProxy running but Pix6 not detected — "
+                            "check USB (/dev/ttyACM0) and power"
+                        )
+                        ok_m = False
+                STATE["onboard_mavproxy"] = ok_m
+                _emit_onboard_progress(
+                    "mavproxy", "done" if ok_m else "error", msg_m
+                )
+                emit_status()
+                if not ok_m:
+                    _emit_onboard_progress(
+                        "complete", "error",
+                        "✕ Failed: MAVProxy / Pix6 — fix serial link then retry",
+                    )
+                    emit_status()
+                    return
 
             # Step 2: stabilization.py — kill any stale instance first so the
             # new process can bind its UDP ports (5005, 14551) without conflict.

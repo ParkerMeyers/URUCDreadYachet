@@ -34,7 +34,7 @@ import time
 
 from pymavlink import mavutil
 
-from mavlink_rc import connect_mavlink, send_rc_channels_override, wait_for_heartbeat
+from mavlink_rc import MAVLINK_ONBOARD, connect_mavlink, send_rc_channels_override, wait_for_heartbeat
 
 # ── Optional: BNO055 IMU ──────────────────────────────────────────────────────
 try:
@@ -68,7 +68,7 @@ except Exception as _e:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 UDP_PORT    = 5006
-MAVLINK_URL = "udp:127.0.0.1:14552"   # MAVProxy --out=udp:127.0.0.1:14552 (arm link)
+MAVLINK_URL = MAVLINK_ONBOARD
 CENTER_US   = 1500
 MIN_US      = 500
 MAX_US      = 2500

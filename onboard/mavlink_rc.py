@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""RC_CHANNELS_OVERRIDE helper — works with MAVLink 1 and 2 pymavlink bindings."""
+"""MAVLink helpers for onboard companion scripts."""
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 # Select the v20 dialect before pymavlink loads message definitions.
@@ -12,16 +13,19 @@ from pymavlink.dialects.v20 import ardupilotmega as mav_v20
 
 RC_IGNORE = 65535
 
+# Both stabilization.py and new_ar.py connect here.  MAVProxy must expose
+# --out=tcpin:127.0.0.1:5762 so multiple onboard clients can share one link.
+MAVLINK_ONBOARD = "tcp:127.0.0.1:5762"
+
 _ENCODER = mav_v20.MAVLink(None, srcSystem=255, srcComponent=190)
 
 
-def normalize_mavlink_listen_url(url: str) -> str:
+def normalize_mavlink_url(url: str) -> str:
     """
-    Convert udp:HOST:PORT → udpin:0.0.0.0:PORT for MAVProxy companion links.
+    Normalize legacy udp:HOST:PORT URLs to udpin for MAVProxy UDP outputs.
 
-    MAVProxy --out=udp:127.0.0.1:PORT *sends to* PORT.  pymavlink must listen
-    on that port (udpin).  A bare udp: URL often binds an ephemeral port and
-    never receives the vehicle heartbeats MAVProxy forwards.
+    Prefer MAVLINK_ONBOARD (tcp) for new deployments — UDP only supports one
+    listener per port.
     """
     if url.startswith(("udpin:", "udpout:", "tcp:", "serial:", "/dev/")):
         return url
@@ -49,28 +53,23 @@ def _pad_channels(channels, *, ignore: int = RC_IGNORE) -> list[int]:
 
 
 def send_rc_channels_override(master, channels, *, ignore: int = RC_IGNORE) -> None:
-    """
-    Send RC_CHANNELS_OVERRIDE for up to 18 channels.
-
-    Always encodes with the MAVLink 2 dialect.  Pi pymavlink often exposes a
-    MAVLink 1 binding (8 channels only) on master.mav — calling
-    rc_channels_override_send(..., *18) raises TypeError.  Packing via v20
-    avoids that and supports AUX channels 9-16 used by the arm controller.
-    """
+    """Send RC_CHANNELS_OVERRIDE for up to 18 channels (MAVLink 2 encoding)."""
     ts, tc = _targets(master)
     ch = _pad_channels(channels, ignore=ignore)
     msg = _ENCODER.rc_channels_override_encode(ts, tc, *ch)
     master.write(msg.pack(_ENCODER))
 
 
-def connect_mavlink(url: str, *, source_system: int = 255):
-    """Open a MAVLink UDP/serial connection; prefer MAVLink 2 on the wire."""
+def connect_mavlink(url: str | None = None, *, source_system: int = 255):
+    """Open a MAVLink connection to MAVProxy; prefer MAVLink 2 on the wire."""
     from pymavlink import mavutil
 
-    listen_url = normalize_mavlink_listen_url(url)
-    if listen_url != url:
-        print(f"[mavlink] Listening on {listen_url} (from {url})")
-    master = mavutil.mavlink_connection(listen_url, source_system=source_system)
+    url = url or MAVLINK_ONBOARD
+    conn_url = normalize_mavlink_url(url)
+    if conn_url != url:
+        print(f"[mavlink] Using {conn_url} (from {url})")
+    print(f"[mavlink] Connecting to {conn_url} ...")
+    master = mavutil.mavlink_connection(conn_url, source_system=source_system)
     try:
         master.mav.set_protocol(mavutil.mavlink.MAVLINK_V2)
     except Exception:
@@ -79,37 +78,26 @@ def connect_mavlink(url: str, *, source_system: int = 255):
 
 
 def wait_for_heartbeat(master, timeout: float = 20.0):
-    """
-    Wait for a vehicle HEARTBEAT, sending GCS heartbeats while polling.
-
-    MAVProxy only forwards FC traffic after the onboard listener is bound and
-    sometimes after it sees inbound packets from the client.
-    """
+    """Wait for a vehicle HEARTBEAT, pinging as GCS while polling."""
     from pymavlink import mavutil
 
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            master.mav.heartbeat_send(
-                mavutil.mavlink.MAV_TYPE_GCS,
-                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                0, 0, 0,
-            )
-        except Exception:
-            pass
-        remaining = max(0.1, deadline - time.time())
-        msg = master.recv_match(
-            type="HEARTBEAT",
-            blocking=True,
-            timeout=min(1.0, remaining),
-        )
-        if msg is not None:
-            src = msg.get_srcSystem()
-            # Ignore our own GCS heartbeats if they loop back.
-            if src and src != source_system(master):
-                return msg
-    return None
+    stop = threading.Event()
 
+    def _gcs_ping():
+        while not stop.is_set():
+            try:
+                master.mav.heartbeat_send(
+                    mavutil.mavlink.MAV_TYPE_GCS,
+                    mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                    0, 0, 0,
+                )
+            except Exception:
+                pass
+            if stop.wait(1.0):
+                break
 
-def source_system(master) -> int:
-    return int(getattr(master, "source_system", None) or 255)
+    threading.Thread(target=_gcs_ping, daemon=True, name="mavlink-hb-ping").start()
+    try:
+        return master.wait_heartbeat(timeout=timeout)
+    finally:
+        stop.set()
