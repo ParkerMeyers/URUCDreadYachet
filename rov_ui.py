@@ -276,12 +276,16 @@ class SSHManager:
             return "", "", str(e)
 
     def start_onboard_process(self, script_rel, log_name, extra_args=""):
-        rov_path = config["pi_rov_path"]
-        script   = f"{rov_path}/{script_rel}"
-        log_file = f"/tmp/rov_{log_name}.log"
+        rov_path    = config["pi_rov_path"]
+        script      = f"{rov_path}/{script_rel}"
+        script_name = script_rel.split('/')[-1]   # e.g. "stabilization.py"
+        log_file    = f"/tmp/rov_{log_name}.log"
+        # Kill any existing instance first so it cannot hold the UDP port
+        # that the new process needs to bind (same behaviour as start_mavproxy).
         # </dev/null disconnects stdin so the process never hangs waiting for
         # input when launched over an SSH exec channel.
         cmd = (
+            f"pkill -f '{script_name}' 2>/dev/null; sleep 0.5; "
             f"cd {rov_path} && "
             f"nohup python3 {script} {extra_args} "
             f"< /dev/null > {log_file} 2>&1 & "
@@ -858,16 +862,19 @@ def api_start_onboard():
                         f"Waiting for MAVProxy to initialize... ({i + 1}/5)"
                     )
 
-            # Step 2: stabilization.py
+            # Step 2: stabilization.py — kill any stale instance first so the
+            # new process can bind its UDP ports (5005, 14551) without conflict.
+            ssh.stop_onboard_process("stabilization.py")
+            time.sleep(0.5)
             _emit_onboard_progress("stabilization", "starting", "Launching stabilization.py...")
             ok_s, msg_s = ssh.start_onboard_process("onboard/stabilization.py", "stab")
             if ok_s:
-                # stabilization.py blocks up to 15 s waiting for MAVLink heartbeat —
-                # give it 25 s before declaring failure.
+                # stabilization.py does a quick 2 s heartbeat probe then enters
+                # the main loop immediately — 15 s is plenty to confirm it started.
                 ok_s, msg_s = _wait_onboard_running(
                     lambda: ssh.is_onboard_running("stabilization.py"),
                     "stabilization.py",
-                    timeout_sec=25.0,
+                    timeout_sec=15.0,
                 )
 
             # If SSH dropped during the wait, try a single reconnect.

@@ -761,6 +761,7 @@ class PixhawkOutput:
 class ControlReceiver:
     def __init__(self, ip, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((ip, port))
         self.sock.setblocking(False)
 
@@ -953,13 +954,12 @@ def main():
     mav = MavlinkReader(MAVLINK_UDP)
 
     print("Waiting for MAVLink heartbeat from Pix6 via MAVProxy...")
-    hb = mav.master.wait_heartbeat(timeout=15)
+    hb = mav.master.wait_heartbeat(timeout=2)
     if hb:
         print(f"Heartbeat received — system {mav.master.target_system}, "
               f"component {mav.master.target_component}.")
     else:
-        print("[WARN] No heartbeat within 15 s. Continuing anyway — "
-              "check MAVProxy and Pix6 USB connection.")
+        print("[INFO] No heartbeat yet — continuing. Will retry in main loop.")
 
     pixhawk = PixhawkOutput(mav.master)
     pixhawk.neutral_all()
