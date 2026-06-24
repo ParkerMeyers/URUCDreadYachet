@@ -47,6 +47,7 @@ try:
         default_camera_sources,
         camera_display_label,
         _parse_rov_udp_port as _parse_rov_udp,
+        gst_launch_available,
     )
     HAVE_CAMERA_FEED = True
 except Exception:
@@ -63,6 +64,7 @@ except Exception:
         return None
 
     HAVE_CAMERA_FEED = False
+    gst_launch_available = lambda: bool(shutil.which("gst-launch-1.0"))
 
 
 # Password SSH uses Paramiko so the UI never blocks on a console password prompt.
@@ -413,6 +415,43 @@ class ProcessController:
         except Exception:
             return False
 
+    def _guess_topside_ip(self):
+        env_ip = os.getenv("ROV_TOPSIDE_IP", "").strip()
+        if env_ip:
+            return env_ip
+        configured = getattr(self.args, "topside_ip", None)
+        if configured:
+            return str(configured).strip()
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.settimeout(2.0)
+            probe.connect((str(self.args.onboard_host), 1))
+            ip = probe.getsockname()[0]
+            probe.close()
+            return ip
+        except Exception:
+            return None
+
+    def _launch_camera_streamers(self):
+        topside_ip = self._guess_topside_ip()
+        if not topside_ip:
+            return {"status": "skipped", "reason": "topside IP unknown (set ROV_TOPSIDE_IP)"}
+
+        remote_command = (
+            f'cd "{self.args.onboard_root}" && '
+            f'chmod +x onboard/camera_streamer.sh 2>/dev/null || true; '
+            f'ROV_TOPSIDE_IP="{topside_ip}" nohup bash onboard/camera_streamer.sh "{topside_ip}" '
+            f'> /tmp/uru_camera_streamer.log 2>&1 < /dev/null & '
+            f'echo cameras:launched'
+        )
+        result = self._run_remote_command(remote_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Could not start onboard camera streamers: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        return {"status": "started", "topside_ip": topside_ip}
+
     def _check_remote_setup(self):
         remote_root = str(self.args.onboard_root)
         remote_python = self._remote_python_shell()
@@ -421,6 +460,7 @@ class ProcessController:
             f'test -x "{remote_python}" && '
             f'test -f "{remote_root}/onboard/stabilization.py" && '
             f'test -f "{remote_root}/onboard/new_ar.py" && '
+            f'test -f "{remote_root}/onboard/camera_streamer.sh" && '
             'echo remote-ready'
         )
         result = self._run_remote_command(check_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC)
@@ -451,6 +491,8 @@ class ProcessController:
         return (
             'pkill -TERM -f "onboard/stabilization.py" 2>/dev/null || true; '
             'pkill -TERM -f "onboard/new_ar.py" 2>/dev/null || true; '
+            'pkill -TERM -f "onboard/camera_streamer.sh" 2>/dev/null || true; '
+            'pkill -TERM -f "uru_camera_gst_cam" 2>/dev/null || true; '
             "sleep 0.75; "
             f'"{remote_python}" - <<\'PY\'\n'
             "import time\n"
@@ -493,6 +535,8 @@ class ProcessController:
             "sleep 0.2; "
             'pkill -9 -f "onboard/stabilization.py" 2>/dev/null || true; '
             'pkill -9 -f "onboard/new_ar.py" 2>/dev/null || true; '
+            'pkill -9 -f "onboard/camera_streamer.sh" 2>/dev/null || true; '
+            'pkill -9 -f "uru_camera_gst_cam" 2>/dev/null || true; '
             'echo onboard-hw-stop-complete'
         )
 
@@ -668,6 +712,12 @@ class ProcessController:
         for program_name, remote_script_path, remote_log_path in launch_plan:
             self._launch_remote_program(program_name, remote_script_path, remote_log_path)
 
+        camera_info = {"status": "skipped"}
+        try:
+            camera_info = self._launch_camera_streamers()
+        except Exception:
+            pass
+
         time.sleep(0.3)
         if not self._onboard_processes_running():
             raise RuntimeError(
@@ -688,6 +738,7 @@ class ProcessController:
             "user": self.args.onboard_user,
             "remote_root": remote_root,
             "logs": remote_logs,
+            "cameras": camera_info,
         }
 
     def launch_onboard_programs(self):
@@ -700,6 +751,11 @@ class ProcessController:
                 self.set_mosfet_state(False)
             except Exception:
                 pass
+            camera_info = {"status": "skipped"}
+            try:
+                camera_info = self._launch_camera_streamers()
+            except Exception:
+                pass
             return {
                 "status": "already_running",
                 "host": self.args.onboard_host,
@@ -709,6 +765,7 @@ class ProcessController:
                     "stabilization": "/tmp/uru_stabilization.log",
                     "new_ar": "/tmp/uru_new_ar.log",
                 },
+                "cameras": camera_info,
             }
         return self._launch_onboard_programs_remote()
 
@@ -1184,7 +1241,14 @@ class ROVMainApp(tk.Tk):
         self.remote_status_var.set(
             f"Remote root: {result['remote_root']}"
         )
-        self.launch_progress_var.set("Onboard stack ready. Start topside programs if you have not already.")
+        self.launch_progress_var.set(
+            "Onboard stack ready. Cameras stream from the Pi to this laptop. Start topside if needed."
+        )
+        cam = result.get("cameras") or {}
+        if cam.get("status") == "started":
+            self.launch_progress_var.set(
+                f"Onboard ready. Cameras sending to {cam.get('topside_ip', 'this laptop')} on UDP 5600/5601."
+            )
         self.mosfet_enabled = False
         self._update_mosfet_button()
         self._refresh_next_state()
@@ -1461,7 +1525,7 @@ class ROVMainApp(tk.Tk):
                             font=("Segoe UI", 10, "bold"),
                         )
                         return
-                    self.camera_status[index] = "waiting for stream"
+                    self.camera_status[index] = "waiting for robot stream"
                 except Exception as exc:
                     self.camera_status[index] = f"read error: {exc}"
                     try:
@@ -1507,7 +1571,7 @@ class ROVMainApp(tk.Tk):
                 fill="#fbbf24",
                 font=("Segoe UI", 9),
             )
-        elif not shutil.which("gst-launch-1.0") and _parse_rov_udp(source) is not None:
+        elif not gst_launch_available() and _parse_rov_udp(source) is not None:
             canvas.create_text(
                 width / 2,
                 height / 2 + 78,
@@ -1629,6 +1693,11 @@ def parse_args():
         "--no-venv-bootstrap",
         action="store_true",
         help="Do not auto-relaunch using the project .venv interpreter",
+    )
+    parser.add_argument(
+        "--topside-ip",
+        default=os.getenv("ROV_TOPSIDE_IP", ""),
+        help="Laptop IP for the Pi to send camera RTP to (auto-detected if omitted)",
     )
     return parser.parse_args()
 

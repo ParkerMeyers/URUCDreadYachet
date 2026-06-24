@@ -105,9 +105,11 @@ ROV_VENV=venv
 # Arm serial (Windows: COM3, Linux: /dev/ttyACM0)
 ROV_ARM_SERIAL=COM3
 
-# Camera RTP/UDP ports (see topside/ROV_Cameras.sh)
+# Camera RTP/UDP ports (robot sends to laptop — see onboard/camera_streamer.sh)
+ROV_TOPSIDE_IP=192.168.2.50
 ROV_CAMERA_1_URL=rov-udp:5600
 ROV_CAMERA_2_URL=rov-udp:5601
+# Pi camera devices (if defaults wrong): ROV_CAM1_DEVICE=/dev/video0 ROV_CAM2_DEVICE=/dev/video2
 
 # Optional mission commands on the Pi
 # ROV_COLMAP_CMD=colmap automatic_reconstructor --workspace_path /home/uruc/colmap_ws
@@ -119,10 +121,11 @@ ROV_CAMERA_2_URL=rov-udp:5601
 
 
 def chmod_scripts():
-    cameras = REPO_ROOT / "topside" / "ROV_Cameras.sh"
-    if cameras.exists() and os.name != "nt":
-        cameras.chmod(cameras.stat().st_mode | 0o111)
-        log(f"Made executable: {cameras}")
+    for rel in ("topside/ROV_Cameras.sh", "onboard/camera_streamer.sh"):
+        script = REPO_ROOT / rel
+        if script.exists() and os.name != "nt":
+            script.chmod(script.stat().st_mode | 0o111)
+            log(f"Made executable: {script}")
 
 
 def verify_imports(py: Path, modules):
