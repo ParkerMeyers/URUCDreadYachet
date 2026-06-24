@@ -89,6 +89,23 @@ class CameraStream:
         t.start()
         return self
 
+    def _open_capture(self) -> "cv2.VideoCapture":
+        """
+        Open the V4L2 device, bypassing GStreamer.
+
+        The apt-packaged OpenCV on Raspberry Pi OS uses GStreamer as its
+        default backend and misinterprets "/dev/videoN" paths as URIs,
+        printing "no source element for URI" errors.  Passing CAP_V4L2
+        (or converting a bare integer string to int) forces the correct
+        backend.
+        """
+        try:
+            # Accept bare integer indices ("0", "2") as well as device paths
+            return cv2.VideoCapture(int(self.device))
+        except ValueError:
+            # Full path like "/dev/video0" — force the V4L2 backend explicitly
+            return cv2.VideoCapture(self.device, cv2.CAP_V4L2)
+
     def _capture_loop(self) -> None:
         cap = None
         retry_delay = 5.0
@@ -96,7 +113,7 @@ class CameraStream:
         while self._running:
             # (Re-)open the camera device
             if cap is None or not cap.isOpened():
-                cap = cv2.VideoCapture(self.device)
+                cap = self._open_capture()
                 if cap.isOpened():
                     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
                     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
