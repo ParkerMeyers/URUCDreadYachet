@@ -118,7 +118,20 @@ DEFAULT_CONFIG = {
     "mavproxy_out2":       "tcpin:127.0.0.1:5762",  # onboard: stab + arm (TCP)
 }
 
+# Must match onboard/mavlink_rc.py MAVLINK_ONBOARD tcp port.
+MAVPROXY_TCP_PORT = 5762
+MAVPROXY_ONBOARD_OUT = f"tcpin:127.0.0.1:{MAVPROXY_TCP_PORT}"
+
 config = DEFAULT_CONFIG.copy()
+
+
+def normalize_onboard_config():
+    """Force the onboard MAVProxy output to TCP — scripts connect to tcp:127.0.0.1:5762."""
+    global config
+    out2 = str(config.get("mavproxy_out2", "")).strip()
+    if "tcpin" not in out2.lower() or str(MAVPROXY_TCP_PORT) not in out2:
+        config["mavproxy_out2"] = MAVPROXY_ONBOARD_OUT
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GLOBAL STATE
@@ -374,15 +387,15 @@ class SSHManager:
         except Exception as e:
             return False, str(e)
 
-    def start_mavproxy(self):
+    def _start_mavproxy_fresh(self):
+        """Kill any existing MAVProxy and launch a fresh bridge."""
         self.exec("pkill -f mavproxy 2>/dev/null; pkill -f MAVProxy 2>/dev/null; sleep 0.5")
+        normalize_onboard_config()
         bin_  = config["mavproxy_bin"]
         ser   = config["mavproxy_serial"]
         baud  = config["mavproxy_baud"]
         out1  = config["mavproxy_out1"]
         out2  = config["mavproxy_out2"]
-        # --non-interactive: no MAV> shell (exits when stdin closes over SSH/nohup).
-        # setsid: detach from SSH session so SIGHUP does not kill the bridge.
         cmd = (
             f"setsid nohup {bin_} "
             f"--master={ser} "
@@ -397,6 +410,38 @@ class SSHManager:
             return False, error
         pid = out.strip()
         return True, f"MAVProxy started (PID {pid})"
+
+    def ensure_mavproxy(self):
+        """Start MAVProxy only if not already healthy — avoids killing a working bridge."""
+        normalize_onboard_config()
+        if (
+            self.is_mavproxy_running()
+            and self.is_mavproxy_fc_connected()
+            and self.is_mavproxy_tcp_ready()
+        ):
+            return True, "MAVProxy already running — Pix6 online"
+        return self._start_mavproxy_fresh()
+
+    def start_mavproxy(self):
+        """Legacy name — always forces a fresh MAVProxy."""
+        return self._start_mavproxy_fresh()
+
+    def is_mavproxy_tcp_ready(self):
+        """True when MAVProxy is listening for onboard script TCP connections."""
+        port = MAVPROXY_TCP_PORT
+        out, _, _ = self.exec(
+            f"(ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -q ':{port} ' "
+            f"&& echo ok"
+        )
+        return "ok" in out
+
+    def wait_mavproxy_tcp_ready(self, timeout_sec: float = 20.0) -> bool:
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if self.is_mavproxy_tcp_ready():
+                return True
+            time.sleep(1.0)
+        return False
 
     def is_mavproxy_fc_connected(self):
         """True once MAVProxy log shows the flight controller is online."""
@@ -884,7 +929,9 @@ def api_config():
         for k, v in data.items():
             if k in config:
                 config[k] = v
+        normalize_onboard_config()
         return jsonify({"ok": True, "config": config})
+    normalize_onboard_config()
     return jsonify(config)
 
 
@@ -935,10 +982,12 @@ def api_start_onboard():
             ok_sync, msg_sync = ssh.sync_onboard_files()
             _emit_onboard_progress("sync", "done" if ok_sync else "error", msg_sync)
 
-            # Step 1: MAVProxy
+            # Step 1: MAVProxy (reuse if already healthy — prevents motor/arm glitch on retry)
+            normalize_onboard_config()
             _emit_onboard_progress("mavproxy", "starting", "Launching MAVProxy bridge...")
-            ok_m, msg_m = ssh.start_mavproxy()
-            if ok_m:
+            ok_m, msg_m = ssh.ensure_mavproxy()
+            fresh_mav = ok_m and "already running" not in msg_m
+            if ok_m and fresh_mav:
                 ok_m, msg_m = _wait_onboard_running(
                     ssh.is_mavproxy_running, "MAVProxy", timeout_sec=30.0
                 )
@@ -953,13 +1002,19 @@ def api_start_onboard():
                 )
                 emit_status()
             elif ok_m:
+                time.sleep(2.0)  # grace period — pgrep may lag right after launch
                 fc_deadline = time.time() + 45.0
                 fc_wait_i = 0
+                miss_running = 0
                 while time.time() < fc_deadline:
-                    if not ssh.is_mavproxy_running():
-                        ok_m = False
-                        msg_m = "MAVProxy exited — check /tmp/rov_mavproxy.log on Pi"
-                        break
+                    if ssh.is_mavproxy_running():
+                        miss_running = 0
+                    else:
+                        miss_running += 1
+                        if miss_running >= 3:
+                            ok_m = False
+                            msg_m = "MAVProxy exited — check /tmp/rov_mavproxy.log on Pi"
+                            break
                     if ssh.is_mavproxy_fc_connected():
                         msg_m = "MAVProxy running — Pix6 online"
                         break
@@ -976,6 +1031,12 @@ def api_start_onboard():
                             "check USB (/dev/ttyACM0) and power"
                         )
                         ok_m = False
+                if ok_m and not ssh.wait_mavproxy_tcp_ready(timeout_sec=20.0):
+                    ok_m = False
+                    msg_m = (
+                        f"MAVProxy TCP :{MAVPROXY_TCP_PORT} not listening — "
+                        f"onboard link must be {MAVPROXY_ONBOARD_OUT}"
+                    )
                 STATE["onboard_mavproxy"] = ok_m
                 _emit_onboard_progress(
                     "mavproxy", "done" if ok_m else "error", msg_m

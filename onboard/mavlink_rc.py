@@ -60,8 +60,8 @@ def send_rc_channels_override(master, channels, *, ignore: int = RC_IGNORE) -> N
     master.write(msg.pack(_ENCODER))
 
 
-def connect_mavlink(url: str | None = None, *, source_system: int = 255):
-    """Open a MAVLink connection to MAVProxy; prefer MAVLink 2 on the wire."""
+def connect_mavlink(url: str | None = None, *, source_system: int = 255, timeout: float = 45.0):
+    """Open a MAVLink connection to MAVProxy; retry until TCP/UDP endpoint is up."""
     from pymavlink import mavutil
 
     url = url or MAVLINK_ONBOARD
@@ -69,12 +69,32 @@ def connect_mavlink(url: str | None = None, *, source_system: int = 255):
     if conn_url != url:
         print(f"[mavlink] Using {conn_url} (from {url})")
     print(f"[mavlink] Connecting to {conn_url} ...")
-    master = mavutil.mavlink_connection(conn_url, source_system=source_system)
-    try:
-        master.mav.set_protocol(mavutil.mavlink.MAVLINK_V2)
-    except Exception:
-        pass
-    return master
+
+    deadline = time.time() + timeout
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        try:
+            master = mavutil.mavlink_connection(conn_url, source_system=source_system)
+            try:
+                master.mav.set_protocol(mavutil.mavlink.MAVLINK_V2)
+            except Exception:
+                pass
+            return master
+        except (ConnectionRefusedError, OSError) as e:
+            last_err = e
+            if "Connection refused" not in str(e) and not isinstance(e, ConnectionRefusedError):
+                raise
+            time.sleep(1.0)
+        except Exception as e:
+            if "Connection refused" in str(e):
+                last_err = e
+                time.sleep(1.0)
+            else:
+                raise
+
+    raise ConnectionRefusedError(
+        f"MAVLink endpoint {conn_url} not available after {int(timeout)}s: {last_err}"
+    )
 
 
 def wait_for_heartbeat(master, timeout: float = 20.0):
