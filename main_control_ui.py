@@ -225,6 +225,17 @@ class ProcessController:
             self.sshpass_executable = self._resolve_executable(["sshpass", "sshpass.exe"])
         return self.sshpass_executable
 
+    def _onboard_venv_name(self):
+        return getattr(self.args, "onboard_venv", None) or os.getenv("ROV_VENV", "venv")
+
+    def _remote_python_shell(self):
+        """POSIX path to python3 inside the onboard venv on the Pi."""
+        venv = str(self._onboard_venv_name()).strip().replace("\\", "/")
+        if venv.startswith("/"):
+            return f"{venv.rstrip('/')}/bin/python3"
+        root = str(self.args.onboard_root).rstrip("/").replace("\\", "/")
+        return f"{root}/{venv.strip('/')}/bin/python3"
+
     def _build_ssh_command(self, remote_command):
         ssh_executable = self._ensure_ssh_available()
         ssh_args = [
@@ -368,8 +379,10 @@ class ProcessController:
 
     def _check_remote_setup(self):
         remote_root = str(self.args.onboard_root)
+        remote_python = self._remote_python_shell()
         check_command = (
             f'test -d "{remote_root}" && '
+            f'test -x "{remote_python}" && '
             f'test -f "{remote_root}/onboard/stabilization.py" && '
             f'test -f "{remote_root}/onboard/new_ar.py" && '
             'echo remote-ready'
@@ -377,15 +390,16 @@ class ProcessController:
         result = self._run_remote_command(check_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC)
         if result.returncode != 0:
             raise RuntimeError(
-                "The onboard side is not set up yet or the remote root is wrong. "
-                f"Expected files at {remote_root}/onboard/stabilization.py and "
-                f"{remote_root}/onboard/new_ar.py. Copy the repo to the Pi and verify SSH access first."
+                "The onboard side is not set up yet or the remote root/venv is wrong. "
+                f"Expected venv python at {remote_python} and scripts at "
+                f"{remote_root}/onboard/stabilization.py and {remote_root}/onboard/new_ar.py."
             )
 
     def _launch_remote_program(self, program_name, remote_script_path, remote_log_path):
+        remote_python = self._remote_python_shell()
         remote_command = (
             f'cd "{self.args.onboard_root}" && '
-            f'nohup python3 -u "{remote_script_path}" > "{remote_log_path}" 2>&1 < /dev/null & '
+            f'nohup "{remote_python}" -u "{remote_script_path}" > "{remote_log_path}" 2>&1 < /dev/null & '
             f'echo "{program_name}:launched"'
         )
         result = self._run_remote_command(remote_command, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC)
@@ -397,11 +411,12 @@ class ProcessController:
         return result
 
     def _build_onboard_hardware_stop_command(self):
+        remote_python = self._remote_python_shell()
         return (
             'pkill -TERM -f "onboard/stabilization.py" 2>/dev/null || true; '
             'pkill -TERM -f "onboard/new_ar.py" 2>/dev/null || true; '
             "sleep 0.75; "
-            "python3 - <<'PY'\n"
+            f'"{remote_python}" - <<\'PY\'\n'
             "import time\n"
             "time.sleep(0.1)\n"
             "try:\n"
@@ -493,8 +508,9 @@ class ProcessController:
 
     def set_mosfet_state(self, enabled):
         state_value = 1 if enabled else 0
+        remote_python = self._remote_python_shell()
         remote_command = (
-            "python3 - <<'PY'\n"
+            f'"{remote_python}" - <<\'PY\'\n'
             "import lgpio\n"
             "handle = lgpio.gpiochip_open(0)\n"
             "try:\n"
@@ -1568,6 +1584,11 @@ def parse_args():
     parser.add_argument("--onboard-user", default=os.getenv("ROV_USER", "uruc"))
     parser.add_argument("--onboard-password", default=os.getenv("ROV_PASSWORD", "yahboom"))
     parser.add_argument("--onboard-root", default=os.getenv("ROV_ROOT", "/home/uruc/URUCDreadYachet"))
+    parser.add_argument(
+        "--onboard-venv",
+        default=os.getenv("ROV_VENV", "venv"),
+        help="Onboard venv directory on the Pi (relative to --onboard-root, or absolute path)",
+    )
     return parser.parse_args()
 
 

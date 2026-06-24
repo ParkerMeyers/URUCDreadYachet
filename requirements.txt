@@ -1,7 +1,8 @@
 # Topside control laptop + main_control_ui.py
 #   pip install -r requirements.txt
 #
-# Onboard Raspberry Pi dependencies are in requirements-onboard.txt
+# Onboard Raspberry Pi dependencies — install inside the Pi venv:
+#   python3 -m venv venv && source venv/bin/activate
 #   pip install -r requirements-onboard.txt
 
 # SSH launch from UI (password auth, no console prompts)

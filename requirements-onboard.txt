@@ -1,6 +1,12 @@
 # Raspberry Pi onboard only (stabilization.py, new_ar.py)
-# Do not install on Windows — these target Pi hardware.
+# Create and use the project venv on the Pi, then install:
+#   cd /home/uruc/URUCDreadYachet
+#   python3 -m venv venv
+#   source venv/bin/activate
 #   pip install -r requirements-onboard.txt
+#
+# The UI launches onboard scripts with: {ROV_ROOT}/venv/bin/python3
+# Override venv location with ROV_VENV (e.g. onboard/venv).
 
 smbus2>=0.4
 pymavlink>=2.4
