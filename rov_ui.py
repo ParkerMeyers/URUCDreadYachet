@@ -553,10 +553,17 @@ def _emit_onboard_progress(step: str, status: str, msg: str = ""):
 
 def _wait_onboard_running(check_fn, label: str, timeout_sec: float = 12.0) -> tuple[bool, str]:
     """Poll until an onboard process is running or timeout.
-    Polls every 2 s (not 0.5 s) so we don't flood the SSH connection while
-    the monitor loop is also making SSH calls every second."""
+    Polls every 2 s so we don't flood the SSH connection while
+    the monitor loop is also making SSH calls every second.
+    While SSH is disconnected the countdown is paused — disconnected time
+    does not count against the budget, since the process may be running fine
+    (it's nohup'd) and we just can't reach the Pi temporarily."""
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
+        if not ssh.is_connected():
+            time.sleep(2.0)
+            deadline += 2.0  # don't count time we can't even poll against timeout
+            continue
         if check_fn():
             return True, f"{label} running"
         time.sleep(2.0)
@@ -875,6 +882,7 @@ def api_start_onboard():
                 )
                 if ok_r:
                     STATE["ssh_connected"] = True
+                    time.sleep(1.0)  # let the new connection settle before exec
                     if ssh.is_onboard_running("stabilization.py"):
                         ok_s   = True
                         msg_s  = "stabilization.py running"
@@ -916,6 +924,29 @@ def api_start_onboard():
                     "new_ar.py",
                     timeout_sec=20.0,
                 )
+
+            # If SSH dropped during the wait, try a single reconnect.
+            # new_ar.py may have started fine — it's nohup'd and keeps running
+            # regardless of SSH state.
+            if not ssh.is_connected():
+                _emit_onboard_progress("arm_ctrl", "wait",
+                                       "SSH dropped — attempting reconnect...")
+                ok_r, _ = ssh.connect(
+                    config["pi_ip"], config["pi_user"], config["pi_password"],
+                    port=int(config["pi_ssh_port"])
+                )
+                if ok_r:
+                    STATE["ssh_connected"] = True
+                    time.sleep(1.0)  # let the new connection settle before exec
+                    if ssh.is_onboard_running("new_ar.py"):
+                        ok_a  = True
+                        msg_a = "new_ar.py running"
+                    else:
+                        msg_a = "new_ar.py not found after SSH reconnect"
+                else:
+                    STATE["ssh_connected"] = False
+                    msg_a = "new_ar.py timed out and SSH reconnect failed"
+
             if not ok_a:
                 log_tail = ssh.get_onboard_log("arm", lines=8)
                 if log_tail:
