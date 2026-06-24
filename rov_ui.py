@@ -882,6 +882,14 @@ def api_status():
     })
 
 
+@app.route("/api/ctrl", methods=["POST"])
+def api_ctrl():
+    """HTTP fallback for gamepad control (when WebSocket is unavailable)."""
+    data = request.get_json(force=True) or {}
+    _apply_browser_ctrl(data)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/logs/<name>")
 def api_logs(name):
     with _state_lock:
@@ -931,6 +939,10 @@ def on_request_status():
 @socketio.on("ctrl_packet")
 def on_ctrl_packet(data):
     """Receive gamepad control packet from browser, forward to Pi via UDP."""
+    _apply_browser_ctrl(data)
+
+
+def _apply_browser_ctrl(data: dict):
     global _last_browser_ctrl, _last_browser_ctrl_time
     with _ctrl_lock:
         _last_browser_ctrl = data
@@ -1128,6 +1140,17 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 .cam-no-signal .ns-text { font-size:0.75rem; letter-spacing:2px;
   text-transform:uppercase; opacity:0.5; }
 .cam-hud { position:absolute; inset:0; pointer-events:none; }
+
+/* Disarmed overlay */
+.disarmed-banner {
+  position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+  background:rgba(255,61,90,0.92); color:#fff;
+  padding:8px 20px; border-radius:8px; font-weight:700; font-size:0.85rem;
+  letter-spacing:0.5px; z-index:5; pointer-events:none;
+  box-shadow:0 4px 20px rgba(0,0,0,0.5);
+}
+.disarmed-banner.hidden { display:none; }
+
 .cam-label {
   position:absolute; top:8px; left:10px;
   font-size:0.65rem; letter-spacing:1.5px; text-transform:uppercase;
@@ -1498,6 +1521,7 @@ html,body { height:100%; background:var(--bg); color:var(--text);
       </div>
       <img id="cam1" class="cam-img" style="display:none" alt="Camera 1"/>
       <canvas id="hud1" class="cam-hud"></canvas>
+      <div id="disarmed-banner" class="disarmed-banner hidden">⚠ DISARMED — select DRIVE/ARMED to move thrusters</div>
       <div class="cam-label">CAM 1 / FORWARD</div>
       <div class="cam-telemetry" id="cam1-tel">
         <div>DEPTH <span class="val-hi" id="c1-depth">--</span>m</div>
@@ -2043,7 +2067,9 @@ function updateModeUI(mode) {
     if (btn) btn.className = 'mode-btn' + (mode === m ? ' active-' + m : '');
   });
 
-  // Update mode pill
+  const banner = document.getElementById('disarmed-banner');
+  if (banner) banner.classList.toggle('hidden', mode !== 'disarmed');
+
   const pillMode = document.getElementById('pill-mode');
   const modeColors = { disarmed:'err', armed:'warn', stabilize:'ok' };
   if (pillMode) {
@@ -2435,6 +2461,22 @@ function _updateGamepadPill() {
   if (actBtn && gp) actBtn.textContent = '✓ Gamepad Active';
 }
 
+let _lastHttpCtrlSend = 0;
+
+function sendCtrlPacket(packet) {
+  socketEmit('ctrl_packet', packet);
+  const nowMs = performance.now();
+  const useHttp = !socket || !socket.connected || (nowMs - _lastHttpCtrlSend > 250);
+  if (useHttp) {
+    _lastHttpCtrlSend = nowMs;
+    fetch('/api/ctrl', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(packet),
+    }).catch(() => {});
+  }
+}
+
 // ── Main gamepad + control send loop ──
 function _gamepadControlLoop() {
   requestAnimationFrame(_gamepadControlLoop);
@@ -2510,8 +2552,10 @@ function _gamepadControlLoop() {
     _dpadDownPrev = dpadDown;
   }
 
+  // Show raw stick demand when disarmed (HUD preview) but send zeros to Pi
   const sending = onCtrl && (_currentMode === 'armed' || _currentMode === 'stabilize');
-  if (!sending) { forward = 0; lateral = 0; yaw = 0; vertical = 0; }
+  let sendForward = forward, sendLateral = lateral, sendYaw = yaw, sendVertical = vertical;
+  if (!sending) { sendForward = 0; sendLateral = 0; sendYaw = 0; sendVertical = 0; }
 
   _localCmds = { forward, lateral, yaw, vertical };
   _tel.cmd_forward  = forward;
@@ -2520,29 +2564,25 @@ function _gamepadControlLoop() {
   _tel.cmd_vertical = vertical;
 
   const fmtCmd = v => (Math.abs(v) < 0.005 ? '0.00' : (v >= 0 ? '+' : '') + v.toFixed(2));
-  setText('tel-cmd-f', fmtCmd(forward));
-  setText('tel-cmd-l', fmtCmd(lateral));
-  setText('tel-cmd-y', fmtCmd(yaw));
-  setText('tel-cmd-v', fmtCmd(vertical));
+  setText('tel-cmd-f', fmtCmd(sendForward));
+  setText('tel-cmd-l', fmtCmd(sendLateral));
+  setText('tel-cmd-y', fmtCmd(sendYaw));
+  setText('tel-cmd-v', fmtCmd(sendVertical));
 
-  // Always send when browser is open — server keepalive handles gaps, but
-  // browser packets carry live gamepad input when on control screen.
-  if (socket && socket.connected) {
-    const packet = {
-      seq:         _ctrlState.seq++,
-      time:        nowMs / 1000,
-      forward,
-      lateral,
-      yaw,
-      vertical,
-      stabilize:   sending ? _ctrlState.stabilize  : false,
-      depth_hold:  sending ? _ctrlState.depth_hold : false,
-      yaw_hold:    sending ? _ctrlState.yaw_hold   : false,
-      gain_percent: _ctrlState.gain_percent,
-      telemetry_port: CTRL_CFG.TELEMETRY_PORT,
-    };
-    socketEmit('ctrl_packet', packet);
-  }
+  const packet = {
+    seq:         _ctrlState.seq++,
+    time:        nowMs / 1000,
+    forward:     sendForward,
+    lateral:     sendLateral,
+    yaw:         sendYaw,
+    vertical:    sendVertical,
+    stabilize:   sending ? _ctrlState.stabilize  : false,
+    depth_hold:  sending ? _ctrlState.depth_hold : false,
+    yaw_hold:    sending ? _ctrlState.yaw_hold   : false,
+    gain_percent: _ctrlState.gain_percent,
+    telemetry_port: CTRL_CFG.TELEMETRY_PORT,
+  };
+  sendCtrlPacket(packet);
 }
 
 // ── Axis layout setter ──
