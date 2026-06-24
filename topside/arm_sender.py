@@ -7,8 +7,8 @@ import argparse
 
 # ── Argument parsing (allows web UI to pass config at launch) ────────────────
 _parser = argparse.ArgumentParser(description="ROV Arm Sender")
-_parser.add_argument("--ip",   type=str, default="10.42.0.181",
-                     help="Pi IP address (default 10.42.0.181)")
+_parser.add_argument("--ip",   type=str, default="192.168.2.249",
+                     help="Pi IP address (default 192.168.2.249)")
 _parser.add_argument("--port", type=str, default="/dev/ttyACM0",
                      help="Serial port (default /dev/ttyACM0, Windows: COM3)")
 _parser.add_argument("--udp-port", type=int, default=5006,

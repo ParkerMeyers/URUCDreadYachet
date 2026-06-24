@@ -86,14 +86,14 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    "pi_ip":              "10.42.0.181",
-    "pi_user":            "pi",
-    "pi_password":        "",
+    "pi_ip":              "192.168.2.249",
+    "pi_user":            "uruc",
+    "pi_password":        "yahboom",
     "pi_ssh_port":        22,
-    "pi_rov_path":        "/home/pi/rov",
+    "pi_rov_path":        "/home/uruc/URUCDreadYachet",
     "serial_port":        "COM3" if IS_WINDOWS else "/dev/ttyACM0",
-    "camera1_url":        "http://10.42.0.181:8160",
-    "camera2_url":        "http://10.42.0.181:8161",
+    "camera1_url":        "http://192.168.2.249:8160",
+    "camera2_url":        "http://192.168.2.249:8161",
     "thrust_udp_port":    5005,
     "telemetry_port":     5006,
     "arm_udp_port":       5006,
@@ -1125,15 +1125,15 @@ html,body { height:100%; background:var(--bg); color:var(--text);
     <div class="config-group">
       <h3>Pi Connection</h3>
       <div class="field"><label>Pi IP Address</label>
-        <input id="cfg-pi_ip" type="text" value="10.42.0.181"/></div>
+        <input id="cfg-pi_ip" type="text" value="192.168.2.249"/></div>
       <div class="field"><label>SSH User</label>
-        <input id="cfg-pi_user" type="text" value="pi"/></div>
+        <input id="cfg-pi_user" type="text" value="uruc"/></div>
       <div class="field"><label>SSH Password</label>
-        <input id="cfg-pi_password" type="password" placeholder="leave blank for key auth"/></div>
+        <input id="cfg-pi_password" type="password" value="yahboom"/></div>
       <div class="field"><label>SSH Port</label>
         <input id="cfg-pi_ssh_port" type="text" value="22"/></div>
       <div class="field"><label>ROV Project Path on Pi</label>
-        <input id="cfg-pi_rov_path" type="text" value="/home/pi/rov"/></div>
+        <input id="cfg-pi_rov_path" type="text" value="/home/uruc/URUCDreadYachet"/></div>
       <div class="btn-row">
         <button class="btn btn-secondary" onclick="sshConnect()">Connect SSH</button>
         <span id="ssh-status" class="ssh-badge">Disconnected</span>
@@ -1145,9 +1145,9 @@ html,body { height:100%; background:var(--bg); color:var(--text);
       <div class="field"><label>Serial Port (Arm Controller)</label>
         <input id="cfg-serial_port" type="text" value="/dev/ttyACM0"/></div>
       <div class="field"><label>Camera 1 URL (MJPEG)</label>
-        <input id="cfg-camera1_url" type="text" value="http://10.42.0.181:8160"/></div>
+        <input id="cfg-camera1_url" type="text" value="http://192.168.2.249:8160"/></div>
       <div class="field"><label>Camera 2 URL (MJPEG)</label>
-        <input id="cfg-camera2_url" type="text" value="http://10.42.0.181:8161"/></div>
+        <input id="cfg-camera2_url" type="text" value="http://192.168.2.249:8161"/></div>
     </div>
 
     <div class="config-group">
