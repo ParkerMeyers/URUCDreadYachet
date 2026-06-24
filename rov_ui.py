@@ -83,6 +83,12 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 # UDP socket for sending control packets to Pi (replaces thrust_sender.py)
 _pi_ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+# Control keepalive — Pi only sends telemetry after it receives control UDP packets
+_ctrl_lock = threading.Lock()
+_last_browser_ctrl: dict | None = None
+_last_browser_ctrl_time = 0.0
+_ctrl_keepalive_seq = 0
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DEFAULT CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -126,6 +132,9 @@ STATE = {
     "mode":                "disarmed",
     "mosfet_on":           False,
     "last_telemetry_time": 0.0,
+    "telemetry_listener_ok": False,
+    "onboard_starting":      False,
+    "onboard_progress":      [],
     "telemetry": {
         "rx_state":                "NO_TELEMETRY",
         "gain_percent":            100,
@@ -396,6 +405,76 @@ def _drain_process_output(name: str, proc: subprocess.Popen):
 # TELEMETRY RECEIVER — parses JSON directly from stabilization.py
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _forward_ctrl_to_pi(packet: dict):
+    """Send a control JSON packet to stabilization.py on the Pi."""
+    ip = config["pi_ip"]
+    port = int(config["thrust_udp_port"])
+    try:
+        _pi_ctrl_sock.sendto(json.dumps(packet).encode("utf-8"), (ip, port))
+    except Exception as e:
+        print(f"[WARN] Control UDP send failed: {e}")
+
+
+def _make_keepalive_packet() -> dict:
+    """Neutral packet so Pi learns our telemetry return address."""
+    global _ctrl_keepalive_seq
+    with _ctrl_lock:
+        _ctrl_keepalive_seq += 1
+        seq = _ctrl_keepalive_seq
+
+    mode = STATE.get("mode", "disarmed")
+    armed = mode in ("armed", "stabilize")
+    return {
+        "seq": seq,
+        "time": time.time(),
+        "forward": 0.0,
+        "lateral": 0.0,
+        "yaw": 0.0,
+        "vertical": 0.0,
+        "stabilize": armed and mode == "stabilize",
+        "depth_hold": False,
+        "yaw_hold": False,
+        "gain_percent": STATE["telemetry"].get("gain_percent", 100),
+        "telemetry_port": int(config["telemetry_port"]),
+    }
+
+
+def _start_control_keepalive():
+    """Send control UDP at 20 Hz so Pi always has a telemetry return address."""
+    def _loop():
+        while True:
+            time.sleep(0.05)
+            with _ctrl_lock:
+                recent = (time.time() - _last_browser_ctrl_time) < 0.2
+                pkt = _last_browser_ctrl if (recent and _last_browser_ctrl) else _make_keepalive_packet()
+            _forward_ctrl_to_pi(pkt)
+
+    threading.Thread(target=_loop, daemon=True, name="ctrl-keepalive").start()
+
+
+def _emit_onboard_progress(step: str, status: str, msg: str = ""):
+    """Record onboard start progress and push to all connected browsers."""
+    entry = {"step": step, "status": status, "msg": msg, "time": time.time()}
+    with _state_lock:
+        STATE["onboard_progress"].append(entry)
+        if len(STATE["onboard_progress"]) > 50:
+            STATE["onboard_progress"] = STATE["onboard_progress"][-50:]
+        if step == "complete":
+            STATE["onboard_starting"] = False
+
+    socketio.emit("onboard_progress", entry)
+
+
+def _wait_onboard_running(check_fn, label: str, timeout_sec: float = 12.0) -> tuple[bool, str]:
+    """Poll until an onboard process is running or timeout."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if check_fn():
+            return True, f"{label} running"
+        time.sleep(0.5)
+    return False, f"{label} did not start within {int(timeout_sec)}s — check onboard logs"
+
+
 def _update_telemetry_from_json(pkt: dict):
     """Map stabilization.py JSON telemetry → UI state and emit to browser."""
     tel = STATE["telemetry"]
@@ -428,10 +507,17 @@ def _start_telemetry_listener():
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("0.0.0.0", config["telemetry_port"]))
+            s.bind(("0.0.0.0", int(config["telemetry_port"])))
             s.settimeout(1.0)
+            STATE["telemetry_listener_ok"] = True
+            emit_status()
         except Exception as e:
-            print(f"[WARN] Telemetry listener bind failed on port {config['telemetry_port']}: {e}")
+            STATE["telemetry_listener_ok"] = False
+            emit_status()
+            print(
+                f"[ERROR] Telemetry listener bind failed on port {config['telemetry_port']}: {e}\n"
+                f"        Stop thrust_sender.py or any other program using UDP {config['telemetry_port']}."
+            )
             return
 
         print(f"[INFO] Telemetry listener active on UDP port {config['telemetry_port']}")
@@ -480,16 +566,21 @@ def _monitor_loop():
 
 
 def emit_status():
+    with _state_lock:
+        progress = list(STATE["onboard_progress"])
     socketio.emit("status", {
-        "thrust_running":   STATE["thrust_running"],
-        "arm_running":      STATE["arm_running"],
-        "onboard_stab":     STATE["onboard_stab"],
-        "onboard_arm":      STATE["onboard_arm"],
-        "onboard_mavproxy": STATE["onboard_mavproxy"],
-        "ssh_connected":    STATE["ssh_connected"],
-        "ssh_error":        STATE["ssh_error"],
-        "mode":             STATE["mode"],
-        "mosfet_on":        STATE["mosfet_on"],
+        "thrust_running":        STATE["thrust_running"],
+        "arm_running":           STATE["arm_running"],
+        "onboard_stab":          STATE["onboard_stab"],
+        "onboard_arm":           STATE["onboard_arm"],
+        "onboard_mavproxy":      STATE["onboard_mavproxy"],
+        "ssh_connected":         STATE["ssh_connected"],
+        "ssh_error":             STATE["ssh_error"],
+        "mode":                  STATE["mode"],
+        "mosfet_on":             STATE["mosfet_on"],
+        "telemetry_listener_ok": STATE["telemetry_listener_ok"],
+        "onboard_starting":      STATE["onboard_starting"],
+        "onboard_progress":      progress,
     })
 
 
@@ -581,64 +672,91 @@ def api_start_onboard():
     if not ssh.is_connected():
         return jsonify({"ok": False, "msg": "SSH not connected"})
 
+    if STATE["onboard_starting"]:
+        return jsonify({"ok": False, "msg": "Onboard start already in progress"})
+
+    STATE["onboard_starting"] = True
+    STATE["onboard_progress"] = []
+    emit_status()
+
     def _do_start():
-        # Step 1: MAVProxy
-        socketio.emit("onboard_progress", {
-            "step": "mavproxy", "status": "starting",
-            "msg": "Launching MAVProxy bridge..."
-        })
-        ok_m, msg_m = ssh.start_mavproxy()
-        STATE["onboard_mavproxy"] = ok_m
-        socketio.emit("onboard_progress", {
-            "step": "mavproxy",
-            "status": "done" if ok_m else "error",
-            "msg": msg_m
-        })
+        try:
+            # Step 1: MAVProxy
+            _emit_onboard_progress("mavproxy", "starting", "Launching MAVProxy bridge...")
+            ok_m, msg_m = ssh.start_mavproxy()
+            if ok_m:
+                ok_m, msg_m = _wait_onboard_running(
+                    ssh.is_mavproxy_running, "MAVProxy", timeout_sec=15.0
+                )
+            STATE["onboard_mavproxy"] = ok_m
+            _emit_onboard_progress(
+                "mavproxy", "done" if ok_m else "error", msg_m
+            )
+            emit_status()
 
-        if ok_m:
-            # Allow MAVProxy to bind before Python scripts connect
-            for i in range(4):
-                time.sleep(0.5)
-                socketio.emit("onboard_progress", {
-                    "step": "mavproxy", "status": "wait",
-                    "msg": f"Waiting for MAVProxy to initialize... ({i+1}/4)"
-                })
+            if ok_m:
+                for i in range(4):
+                    time.sleep(0.5)
+                    _emit_onboard_progress(
+                        "mavproxy", "wait",
+                        f"Waiting for MAVProxy to initialize... ({i + 1}/4)"
+                    )
 
-        # Step 2: stabilization.py
-        socketio.emit("onboard_progress", {
-            "step": "stabilization", "status": "starting",
-            "msg": "Launching stabilization.py..."
-        })
-        ok_s, msg_s = ssh.start_onboard_process("onboard/stabilization.py", "stab")
-        STATE["onboard_stab"] = ok_s
-        socketio.emit("onboard_progress", {
-            "step": "stabilization",
-            "status": "done" if ok_s else "error",
-            "msg": msg_s
-        })
+            # Step 2: stabilization.py
+            _emit_onboard_progress("stabilization", "starting", "Launching stabilization.py...")
+            ok_s, msg_s = ssh.start_onboard_process("onboard/stabilization.py", "stab")
+            if ok_s:
+                ok_s, msg_s = _wait_onboard_running(
+                    lambda: ssh.is_onboard_running("stabilization.py"),
+                    "stabilization.py",
+                    timeout_sec=10.0,
+                )
+            STATE["onboard_stab"] = ok_s
+            _emit_onboard_progress(
+                "stabilization", "done" if ok_s else "error", msg_s
+            )
+            emit_status()
 
-        # Step 3: new_ar.py
-        socketio.emit("onboard_progress", {
-            "step": "arm_ctrl", "status": "starting",
-            "msg": "Launching new_ar.py (arm controller)..."
-        })
-        ok_a, msg_a = ssh.start_onboard_process("onboard/new_ar.py", "arm")
-        STATE["onboard_arm"] = ok_a
-        socketio.emit("onboard_progress", {
-            "step": "arm_ctrl",
-            "status": "done" if ok_a else "error",
-            "msg": msg_a
-        })
+            # Step 3: new_ar.py
+            _emit_onboard_progress("arm_ctrl", "starting", "Launching new_ar.py (arm controller)...")
+            ok_a, msg_a = ssh.start_onboard_process("onboard/new_ar.py", "arm")
+            if ok_a:
+                ok_a, msg_a = _wait_onboard_running(
+                    lambda: ssh.is_onboard_running("new_ar.py"),
+                    "new_ar.py",
+                    timeout_sec=10.0,
+                )
+            STATE["onboard_arm"] = ok_a
+            _emit_onboard_progress(
+                "arm_ctrl", "done" if ok_a else "error", msg_a
+            )
+            emit_status()
 
-        all_ok = ok_m and ok_s and ok_a
-        socketio.emit("onboard_progress", {
-            "step": "complete",
-            "status": "done" if all_ok else "error",
-            "msg": "All onboard programs started" if all_ok else "Some programs failed — check SSH connection"
-        })
-        emit_status()
+            all_ok = ok_m and ok_s and ok_a
+            if all_ok:
+                summary = "✓ All onboard programs running (MAVProxy, stabilization, new_ar)"
+            else:
+                parts = []
+                if not ok_m:
+                    parts.append("MAVProxy")
+                if not ok_s:
+                    parts.append("stabilization")
+                if not ok_a:
+                    parts.append("new_ar")
+                summary = "✕ Failed: " + ", ".join(parts) + " — open Logs for details"
 
-    threading.Thread(target=_do_start, daemon=True).start()
+            _emit_onboard_progress(
+                "complete",
+                "done" if all_ok else "error",
+                summary,
+            )
+            emit_status()
+        except Exception as e:
+            _emit_onboard_progress("complete", "error", f"Onboard start error: {e}")
+            STATE["onboard_starting"] = False
+            emit_status()
+
+    socketio.start_background_task(_do_start)
     return jsonify({"ok": True, "msg": "Starting onboard programs..."})
 
 
@@ -729,15 +847,21 @@ def api_crabs():
 
 @app.route("/api/status")
 def api_status():
+    with _state_lock:
+        progress = list(STATE["onboard_progress"])
     return jsonify({
-        "thrust_running": STATE["thrust_running"],
-        "arm_running":    STATE["arm_running"],
-        "onboard_stab":   STATE["onboard_stab"],
-        "onboard_arm":    STATE["onboard_arm"],
-        "ssh_connected":  STATE["ssh_connected"],
-        "mode":           STATE["mode"],
-        "mosfet_on":      STATE["mosfet_on"],
-        "telemetry":      STATE["telemetry"],
+        "thrust_running":        STATE["thrust_running"],
+        "arm_running":           STATE["arm_running"],
+        "onboard_stab":          STATE["onboard_stab"],
+        "onboard_arm":           STATE["onboard_arm"],
+        "onboard_mavproxy":      STATE["onboard_mavproxy"],
+        "ssh_connected":         STATE["ssh_connected"],
+        "mode":                  STATE["mode"],
+        "mosfet_on":             STATE["mosfet_on"],
+        "telemetry_listener_ok": STATE["telemetry_listener_ok"],
+        "onboard_starting":      STATE["onboard_starting"],
+        "onboard_progress":      progress,
+        "telemetry":             STATE["telemetry"],
     })
 
 
@@ -746,6 +870,18 @@ def api_logs(name):
     with _state_lock:
         lines = list(STATE["logs"].get(name, []))
     return jsonify({"lines": lines})
+
+
+@app.route("/api/onboard/progress")
+def api_onboard_progress():
+    with _state_lock:
+        return jsonify({
+            "starting": STATE["onboard_starting"],
+            "events": list(STATE["onboard_progress"]),
+            "onboard_mavproxy": STATE["onboard_mavproxy"],
+            "onboard_stab": STATE["onboard_stab"],
+            "onboard_arm": STATE["onboard_arm"],
+        })
 
 
 @app.route("/api/onboard_log/<name>")
@@ -765,6 +901,9 @@ def api_onboard_log(name):
 def on_connect():
     emit_status()
     socketio.emit("telemetry", dict(STATE["telemetry"]))
+    with _state_lock:
+        for entry in STATE["onboard_progress"]:
+            socketio.emit("onboard_progress", entry)
 
 
 @socketio.on("request_status")
@@ -775,12 +914,11 @@ def on_request_status():
 @socketio.on("ctrl_packet")
 def on_ctrl_packet(data):
     """Receive gamepad control packet from browser, forward to Pi via UDP."""
-    ip   = config["pi_ip"]
-    port = int(config["thrust_udp_port"])
-    try:
-        _pi_ctrl_sock.sendto(json.dumps(data).encode("utf-8"), (ip, port))
-    except Exception:
-        pass
+    global _last_browser_ctrl, _last_browser_ctrl_time
+    with _ctrl_lock:
+        _last_browser_ctrl = data
+        _last_browser_ctrl_time = time.time()
+    _forward_ctrl_to_pi(data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -793,7 +931,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <title>DreadYachet ROV</title>
-<script src="/socket.io/socket.io.js"></script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
 <style>
 :root {
   --bg:      #080b12;
@@ -1260,6 +1398,7 @@ html,body { height:100%; background:var(--bg); color:var(--text);
         <button class="btn btn-primary" id="btn-start-onboard" onclick="startOnboard()">Start Onboard</button>
         <button class="btn btn-danger" onclick="stopOnboard()">Stop</button>
       </div>
+      <div id="onboard-summary" style="font-size:.8rem;font-weight:600;min-height:20px;font-family:var(--mono)"></div>
       <div class="progress-log" id="onboard-progress-log" style="display:none"></div>
     </div>
 
@@ -1270,12 +1409,17 @@ html,body { height:100%; background:var(--bg); color:var(--text);
         Gamepad thruster control is built into this web UI — no separate script needed.</p>
       <div class="program-status">
         <div class="prog-row">
-          <div class="dot running" style="background:var(--accent);box-shadow:0 0 6px var(--accent)"></div>
-          <span>Web UI gamepad control (built-in)</span>
+          <div class="dot" id="dot-gamepad-launch"></div>
+          <span id="gamepad-launch-label">Gamepad — press any button to connect</span>
         </div>
         <div class="prog-row"><div class="dot" id="dot-armlocal"></div><span>arm_sender.py</span></div>
+        <div class="prog-row">
+          <div class="dot" id="dot-telem-launch"></div>
+          <span id="telem-launch-label">Telemetry listener (UDP 5006)</span>
+        </div>
       </div>
       <div class="btn-row">
+        <button class="btn btn-secondary" id="btn-activate-gp" onclick="activateGamepad()">Activate Gamepad</button>
         <button class="btn btn-primary" id="btn-start-topside" onclick="startTopside()">Start Arm Sender</button>
         <button class="btn btn-danger" onclick="stopTopside()">Stop</button>
       </div>
@@ -1317,6 +1461,8 @@ html,body { height:100%; background:var(--bg); color:var(--text);
     <span style="font-family:var(--mono);font-size:.75rem;color:var(--dim);white-space:nowrap;flex-shrink:0">
       GAIN: <span id="tb-gain" style="color:var(--accent)">100</span>%
     </span>
+    <button class="btn btn-secondary" style="padding:4px 12px;font-size:.75rem;flex-shrink:0"
+            onclick="activateGamepad()">🎮 GP</button>
     <button class="btn btn-secondary" style="padding:4px 12px;font-size:.75rem;flex-shrink:0"
             onclick="showKeybinds()">⌨ Keybinds</button>
     <button class="btn btn-secondary" style="padding:4px 12px;font-size:.75rem;flex-shrink:0"
@@ -1578,54 +1724,140 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 
 <script>
 // ─────────────────────────────────────────────────────────────
-// SOCKET.IO
+// GLOBAL STATE (must be first — before Socket.IO connect)
 // ─────────────────────────────────────────────────────────────
-const socket = io({ transports: ['websocket', 'polling'] });
 let _tel    = {};
 let _status = {};
 let _currentLog  = 'arm';
 const _logs = { thrust: [], arm: [], onboard_stab: [], onboard_arm: [] };
+let _onboardPollTimer = null;
+const _onboardProgressSeen = new Set();
+let socket = null;
 
-socket.on('connect', () => {
-  socket.emit('request_status');
-});
+function socketEmit(event, data) {
+  if (socket && socket.connected) socket.emit(event, data);
+}
 
-socket.on('telemetry', (data) => {
-  _tel = data;
-  updateTelemetry();
-  updateCtrlCmdsFromTelemetry();
-});
+// ─────────────────────────────────────────────────────────────
+// SOCKET.IO
+// ─────────────────────────────────────────────────────────────
+if (typeof io !== 'undefined') {
+  socket = io({ transports: ['websocket', 'polling'] });
 
-socket.on('status', (data) => {
-  _status = data;
-  updateStatus();
-});
+  socket.on('connect', () => {
+    socketEmit('request_status');
+  });
 
-socket.on('process_log', ({ name, line }) => {
-  const logs = _logs[name] || (_logs[name] = []);
-  logs.push(line);
-  if (logs.length > 300) logs.splice(0, logs.length - 300);
-  if (name === _currentLog) appendLogLine(line);
-});
+  socket.on('telemetry', (data) => {
+    _tel = data;
+    updateTelemetry();
+    updateCtrlCmdsFromTelemetry();
+  });
 
-socket.on('onboard_progress', ({ step, status, msg }) => {
+  socket.on('status', (data) => {
+    _status = data;
+    updateStatus();
+  });
+
+  socket.on('process_log', ({ name, line }) => {
+    const logs = _logs[name] || (_logs[name] = []);
+    logs.push(line);
+    if (logs.length > 300) logs.splice(0, logs.length - 300);
+    if (name === _currentLog) appendLogLine(line);
+  });
+
+  socket.on('onboard_progress', (entry) => {
+    handleOnboardProgress(entry);
+  });
+} else {
+  console.error('Socket.IO client failed to load — live updates use HTTP polling fallback');
+}
+
+function handleOnboardProgress({ step, status, msg, time }) {
+  const key = `${time || ''}|${step}|${status}|${msg}`;
+  if (_onboardProgressSeen.has(key)) return;
+  _onboardProgressSeen.add(key);
+
   const logEl = document.getElementById('onboard-progress-log');
-  if (!logEl) return;
-  logEl.style.display = 'block';
-  const icons = { starting: '⟳', wait: '…', done: '✓', error: '✕', complete: '★' };
-  const cls   = { starting: 'info', wait: 'wait', done: 'ok', error: 'err', complete: 'ok' };
-  const div = document.createElement('div');
-  div.className = 'pl-step ' + (cls[status] || 'info');
-  div.textContent = `${icons[status] || '?'} [${step}] ${msg || status}`;
-  logEl.appendChild(div);
-  logEl.scrollTop = logEl.scrollHeight;
+  if (logEl) {
+    logEl.style.display = 'block';
+    const icons = { starting: '⟳', wait: '…', done: '✓', error: '✕', complete: '★' };
+    const cls   = { starting: 'info', wait: 'wait', done: 'ok', error: 'err', complete: 'ok' };
+    const div = document.createElement('div');
+    div.className = 'pl-step ' + (cls[status] || 'info');
+    div.textContent = `${icons[status] || '?'} [${step}] ${msg || status}`;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  // Update status dots immediately from progress events
+  if (step === 'mavproxy') {
+    if (status === 'done') setDot('dot-mavproxy', true);
+    if (status === 'error') setDotError('dot-mavproxy');
+  }
+  if (step === 'stabilization') {
+    if (status === 'done') setDot('dot-stab', true);
+    if (status === 'error') setDotError('dot-stab');
+  }
+  if (step === 'arm_ctrl') {
+    if (status === 'done') setDot('dot-arm', true);
+    if (status === 'error') setDotError('dot-arm');
+  }
+
+  const summary = document.getElementById('onboard-summary');
+  if (summary && msg) {
+    if (status === 'done' || status === 'complete') {
+      summary.style.color = 'var(--green)';
+      summary.textContent = msg;
+    } else if (status === 'error') {
+      summary.style.color = 'var(--red)';
+      summary.textContent = msg;
+    } else if (status === 'starting' || status === 'wait') {
+      summary.style.color = 'var(--amber)';
+      summary.textContent = msg;
+    }
+  }
 
   if (step === 'complete') {
-    toast(status === 'done' ? '✓ Onboard programs started' : '✕ Some programs failed', status === 'done' ? 'ok' : 'err');
+    toast(msg, status === 'done' ? 'ok' : 'err');
     const btn = document.getElementById('btn-start-onboard');
     if (btn) btn.disabled = false;
+    stopOnboardPoll();
   }
-});
+}
+
+function startOnboardPoll() {
+  stopOnboardPoll();
+
+  async function pollOnce() {
+    try {
+      const r = await fetch('/api/onboard/progress');
+      const d = await r.json();
+      if (d.events && d.events.length) {
+        const lastSeen = _onboardPollTimer ? (_onboardPollTimer._lastCount || 0) : 0;
+        for (let i = lastSeen; i < d.events.length; i++) {
+          handleOnboardProgress(d.events[i]);
+        }
+        if (_onboardPollTimer) _onboardPollTimer._lastCount = d.events.length;
+      }
+      if (d.onboard_mavproxy) setDot('dot-mavproxy', true);
+      if (d.onboard_stab)     setDot('dot-stab', true);
+      if (d.onboard_arm)      setDot('dot-arm', true);
+      if (!d.starting) stopOnboardPoll();
+    } catch (_) {}
+  }
+
+  _onboardPollTimer = setInterval(pollOnce, 800);
+  _onboardPollTimer._lastCount = 0;
+  pollOnce();
+}
+
+function stopOnboardPoll() {
+  if (_onboardPollTimer) {
+    clearInterval(_onboardPollTimer);
+    _onboardPollTimer = null;
+  }
+}
 
 // ─────────────────────────────────────────────────────────────
 // CONFIG HELPERS
@@ -1680,9 +1912,14 @@ async function sshConnect() {
 async function startOnboard() {
   await saveConfig();
   const logEl = document.getElementById('onboard-progress-log');
+  const summary = document.getElementById('onboard-summary');
   if (logEl) { logEl.innerHTML = ''; logEl.style.display = 'block'; }
+  if (summary) { summary.textContent = 'Starting onboard programs…'; summary.style.color = 'var(--amber)'; }
+  _onboardProgressSeen.clear();
   const btn = document.getElementById('btn-start-onboard');
   if (btn) btn.disabled = true;
+
+  startOnboardPoll();
 
   const r = await fetch('/api/onboard/start', { method: 'POST' });
   const d = await r.json();
@@ -1693,10 +1930,11 @@ async function startOnboard() {
       div.textContent = '✕ ' + d.msg;
       logEl.appendChild(div);
     }
+    if (summary) { summary.textContent = '✕ ' + d.msg; summary.style.color = 'var(--red)'; }
     if (btn) btn.disabled = false;
+    stopOnboardPoll();
     toast('Onboard start failed: ' + d.msg, 'err');
   }
-  // Progress comes via WebSocket onboard_progress events
 }
 
 async function stopOnboard() {
@@ -1863,6 +2101,30 @@ function updateStatus() {
   setDot('dot-arm',      s.onboard_arm);
   setDot('dot-armlocal', s.arm_running);
 
+  // Telemetry listener status on launch screen
+  const telemDot = document.getElementById('dot-telem-launch');
+  const telemLbl = document.getElementById('telem-launch-label');
+  if (telemDot) {
+    if (s.telemetry_listener_ok) {
+      telemDot.className = 'dot running';
+      if (telemLbl) telemLbl.textContent = 'Telemetry listener active (UDP 5006)';
+    } else {
+      telemDot.className = 'dot error';
+      if (telemLbl) telemLbl.textContent = 'Telemetry listener FAILED — port 5006 in use?';
+    }
+  }
+
+  // Replay onboard progress if we connected mid-start
+  if (s.onboard_progress && s.onboard_progress.length) {
+    const last = s.onboard_progress[s.onboard_progress.length - 1];
+    const summary = document.getElementById('onboard-summary');
+    if (summary && last.msg) {
+      summary.textContent = last.msg;
+      summary.style.color = last.status === 'error' ? 'var(--red)'
+        : (last.status === 'done' || last.step === 'complete') ? 'var(--green)' : 'var(--amber)';
+    }
+  }
+
   const badge = document.getElementById('ssh-status');
   if (s.ssh_connected) {
     badge.textContent = '✓ Connected';
@@ -1894,6 +2156,12 @@ function setDot(id, running) {
   el.className = 'dot ' + (running ? 'running' : '');
 }
 
+function setDotError(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = 'dot error';
+}
+
 // ─────────────────────────────────────────────────────────────
 // TELEMETRY UPDATES
 // ─────────────────────────────────────────────────────────────
@@ -1909,9 +2177,14 @@ function updateTelemetry() {
   const pillTel = document.getElementById('pill-telemetry');
   const telOk   = t.rx_state === 'OK';
   if (pillTel) {
-    pillTel.innerHTML  = `<span class="status-dot"></span> ${t.rx_state || '--'}`;
+    let label = t.rx_state || '--';
+    if (label === 'NO_TELEMETRY') label = 'NO TELEM';
+    pillTel.innerHTML  = `<span class="status-dot"></span> ${label}`;
+    pillTel.title = (t.rx_state === 'NO_TELEMETRY')
+      ? 'Start onboard programs, then telemetry appears on UDP 5006'
+      : '';
     pillTel.className  = 'status-pill ' + (
-      telOk ? 'ok' : (t.rx_state === 'NO_TELEMETRY' ? '' : 'warn')
+      telOk ? 'ok' : (t.rx_state === 'NO_TELEMETRY' ? 'err' : 'warn')
     );
   }
 
@@ -2080,32 +2353,72 @@ document.addEventListener('keydown', (e) => {
 document.addEventListener('keyup', (e) => { _keyDown[e.key] = false; });
 
 // ── Gamepad connection events ──
+let _gamepadActivated = false;
+
+function activateGamepad() {
+  _gamepadActivated = true;
+  const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
+  let found = false;
+  for (let i = 0; i < gamepads.length; i++) {
+    if (gamepads[i]) { found = true; break; }
+  }
+  if (found) {
+    toast('Gamepad detected!', 'ok');
+  } else {
+    toast('Press ANY button on your gamepad now…', 'warn');
+  }
+  _updateGamepadPill();
+}
+
 window.addEventListener('gamepadconnected', (e) => {
+  _gamepadActivated = true;
   toast(`Gamepad connected: ${e.gamepad.id.substring(0, 40)}`, 'ok');
   _updateGamepadPill();
 });
-window.addEventListener('gamepaddisconnected', (e) => {
+window.addEventListener('gamepaddisconnected', () => {
   toast('Gamepad disconnected!', 'err');
   _updateGamepadPill();
 });
 
-function _updateGamepadPill() {
-  const pill = document.getElementById('pill-gamepad');
-  if (!pill) return;
+function _findGamepad() {
   const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
-  let gp = null;
-  for (let i = 0; i < gamepads.length; i++) { if (gamepads[i]) { gp = gamepads[i]; break; } }
-  if (gp) {
-    const name = gp.id.length > 22 ? gp.id.substring(0, 22) + '…' : gp.id;
-    pill.innerHTML = `<span class="status-dot"></span> GP: ${name}`;
-    pill.className = 'status-pill ok';
-  } else {
-    pill.innerHTML = `<span class="status-dot"></span> GP: NONE`;
-    pill.className = 'status-pill err';
+  for (let i = 0; i < gamepads.length; i++) {
+    if (gamepads[i]) return gamepads[i];
   }
+  return null;
 }
 
-// ── Main gamepad + control send loop (runs at requestAnimationFrame rate, throttled to SEND_HZ) ──
+function _updateGamepadPill() {
+  const gp = _findGamepad();
+
+  const pill = document.getElementById('pill-gamepad');
+  if (pill) {
+    if (gp) {
+      const name = gp.id.length > 22 ? gp.id.substring(0, 22) + '…' : gp.id;
+      pill.innerHTML = `<span class="status-dot"></span> GP: ${name}`;
+      pill.className = 'status-pill ok';
+    } else {
+      pill.innerHTML = `<span class="status-dot"></span> GP: NONE`;
+      pill.className = 'status-pill err';
+    }
+  }
+
+  const launchDot = document.getElementById('dot-gamepad-launch');
+  const launchLbl = document.getElementById('gamepad-launch-label');
+  if (launchDot) {
+    launchDot.className = 'dot ' + (gp ? 'running' : '');
+  }
+  if (launchLbl) {
+    launchLbl.textContent = gp
+      ? `Gamepad: ${gp.id.substring(0, 36)}`
+      : 'Gamepad — click Activate, then press any button';
+  }
+
+  const actBtn = document.getElementById('btn-activate-gp');
+  if (actBtn && gp) actBtn.textContent = '✓ Gamepad Active';
+}
+
+// ── Main gamepad + control send loop ──
 function _gamepadControlLoop() {
   requestAnimationFrame(_gamepadControlLoop);
 
@@ -2114,41 +2427,40 @@ function _gamepadControlLoop() {
   if (nowMs - _lastSendMs < intervalMs) return;
   _lastSendMs = nowMs;
 
-  // Only send when control screen is active
   const onCtrl = document.getElementById('control')?.classList.contains('active');
+  const gp = _findGamepad();
+  _updateGamepadPill();
 
-  const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
-  let gp = null;
-  for (let i = 0; i < gamepads.length; i++) { if (gamepads[i]) { gp = gamepads[i]; break; } }
+  // Any button press wakes gamepad in most browsers
+  if (gp) {
+    for (let b = 0; b < gp.buttons.length; b++) {
+      if (gp.buttons[b].pressed) { _gamepadActivated = true; break; }
+    }
+  }
 
   let forward = 0, lateral = 0, yaw = 0, vertical = 0;
 
-  if (gp && onCtrl) {
-    // ── Raw axis reads ──
+  if (gp && _gamepadActivated) {
     const leftX  = gp.axes[CTRL_CFG.AXIS_LEFT_X]  || 0;
     const leftY  = gp.axes[CTRL_CFG.AXIS_LEFT_Y]  || 0;
     const rightX = gp.axes[CTRL_CFG.AXIS_RIGHT_X] || 0;
     const rightY = gp.axes[CTRL_CFG.AXIS_RIGHT_Y] || 0;
 
-    // ── Layout mapping (mirrors thrust_sender.py get_layout_axes()) ──
     let axisYaw, axisLateral;
     if (_ctrlLayout === 'original') {
-      axisYaw     = leftX;   // Left X = Yaw
-      axisLateral = rightX;  // Right X = Strafe
+      axisYaw     = leftX;
+      axisLateral = rightX;
     } else {
-      axisYaw     = rightX;  // Right X = Yaw
-      axisLateral = leftX;   // Left X = Strafe
+      axisYaw     = rightX;
+      axisLateral = leftX;
     }
 
-    // ── Apply sign, deadzone, clamp (matches thrust_sender.py exactly) ──
     const yawRaw  = _clamp(_applyDeadzone(CTRL_CFG.SIGN_YAW      * axisYaw,    CTRL_CFG.DEADZONE), -1, 1);
     const vertRaw = _clamp(_applyDeadzone(CTRL_CFG.SIGN_VERTICAL  * leftY,      CTRL_CFG.DEADZONE), -1, 1);
     const latRaw  = _clamp(_applyDeadzone(CTRL_CFG.SIGN_LATERAL   * axisLateral,CTRL_CFG.DEADZONE), -1, 1);
     const fwdRaw  = _clamp(_applyDeadzone(CTRL_CFG.SIGN_FORWARD   * rightY,     CTRL_CFG.DEADZONE), -1, 1);
 
     const gain = _ctrlState.gain_percent / 100.0;
-
-    // ── Apply combined group limit ──
     const r = _applyCombinedLimit(
       fwdRaw * gain, latRaw * gain, yawRaw * gain, vertRaw * gain,
       CTRL_CFG.COMBINED_LIMIT
@@ -2158,59 +2470,47 @@ function _gamepadControlLoop() {
     yaw      = r.y;
     vertical = r.v;
 
-    // ── Button edge detection ──
     const numBtns = gp.buttons.length;
     if (_btnPrev.length !== numBtns) _btnPrev = new Array(numBtns).fill(false);
 
     for (let b = 0; b < numBtns; b++) {
       const pressed = gp.buttons[b].pressed;
       if (pressed && !_btnPrev[b]) {
-        // Log all button presses for debugging
         console.log(`[Gamepad] Button ${b} pressed`);
-
-        if (b === CTRL_CFG.BUTTON_STABILIZE) {
-          toggleStabilize();
-        }
+        if (onCtrl && b === CTRL_CFG.BUTTON_STABILIZE) toggleStabilize();
       }
       _btnPrev[b] = pressed;
     }
 
-    // ── D-pad gain control ──
-    // Xbox/standard: buttons 12=up, 13=down, 14=left, 15=right
-    // Some controllers use axes 6/7 for D-pad
     const dpadAxisY = (gp.axes.length > 7) ? (gp.axes[7] || 0) : 0;
     const dpadUp   = (gp.buttons[12] && gp.buttons[12].pressed) || dpadAxisY < -0.5;
     const dpadDown = (gp.buttons[13] && gp.buttons[13].pressed) || dpadAxisY > 0.5;
-
-    if (dpadUp   && !_dpadUpPrev)   _adjustGain( CTRL_CFG.GAIN_STEP);
-    if (dpadDown && !_dpadDownPrev) _adjustGain(-CTRL_CFG.GAIN_STEP);
+    if (onCtrl) {
+      if (dpadUp   && !_dpadUpPrev)   _adjustGain( CTRL_CFG.GAIN_STEP);
+      if (dpadDown && !_dpadDownPrev) _adjustGain(-CTRL_CFG.GAIN_STEP);
+    }
     _dpadUpPrev   = dpadUp;
     _dpadDownPrev = dpadDown;
   }
 
-  // ── Mode enforcement ──
-  // disarmed → send zeros to keep Pi connection alive but zero thrusters
-  // armed / stabilize → send actual joystick values
-  const sending = (_currentMode === 'armed' || _currentMode === 'stabilize');
+  const sending = onCtrl && (_currentMode === 'armed' || _currentMode === 'stabilize');
   if (!sending) { forward = 0; lateral = 0; yaw = 0; vertical = 0; }
 
-  // Store locally for HUD
   _localCmds = { forward, lateral, yaw, vertical };
-  // Feed into _tel so HUD can display them
   _tel.cmd_forward  = forward;
   _tel.cmd_lateral  = lateral;
   _tel.cmd_yaw      = yaw;
   _tel.cmd_vertical = vertical;
 
-  // Update cmd cells in telemetry bar
   const fmtCmd = v => (Math.abs(v) < 0.005 ? '0.00' : (v >= 0 ? '+' : '') + v.toFixed(2));
   setText('tel-cmd-f', fmtCmd(forward));
   setText('tel-cmd-l', fmtCmd(lateral));
   setText('tel-cmd-y', fmtCmd(yaw));
   setText('tel-cmd-v', fmtCmd(vertical));
 
-  // ── Emit control packet to server (forwarded to Pi via UDP) ──
-  if (onCtrl) {
+  // Always send when browser is open — server keepalive handles gaps, but
+  // browser packets carry live gamepad input when on control screen.
+  if (socket && socket.connected) {
     const packet = {
       seq:         _ctrlState.seq++,
       time:        nowMs / 1000,
@@ -2224,7 +2524,7 @@ function _gamepadControlLoop() {
       gain_percent: _ctrlState.gain_percent,
       telemetry_port: CTRL_CFG.TELEMETRY_PORT,
     };
-    socket.emit('ctrl_packet', packet);
+    socketEmit('ctrl_packet', packet);
   }
 }
 
@@ -2423,6 +2723,7 @@ function setupCamera(imgId, noSigId, camNum) {
 // VIEW SWITCHING
 // ─────────────────────────────────────────────────────────────
 function openControl() {
+  activateGamepad();
   document.getElementById('launch').classList.remove('active');
   document.getElementById('control').classList.add('active');
   setupCamera('cam1', 'no-sig-1', 1);
@@ -2545,9 +2846,24 @@ window.addEventListener('load', () => {
 
   // Start gamepad control loop
   requestAnimationFrame(_gamepadControlLoop);
+  _updateGamepadPill();
 
   // Poll status every 2s as WebSocket fallback
-  setInterval(() => socket.emit('request_status'), 2000);
+  setInterval(() => socketEmit('request_status'), 2000);
+  // HTTP fallback when Socket.IO is down
+  setInterval(async () => {
+    if (socket && socket.connected) return;
+    try {
+      const r = await fetch('/api/status');
+      const d = await r.json();
+      _status = d;
+      updateStatus();
+      if (d.telemetry) { _tel = d.telemetry; updateTelemetry(); }
+      if (d.onboard_progress) {
+        for (const entry of d.onboard_progress) handleOnboardProgress(entry);
+      }
+    } catch (_) {}
+  }, 2000);
 });
 </script>
 </body>
@@ -2572,7 +2888,9 @@ def main():
         print("[WARN] requests not installed — camera proxy disabled. Run: pip install requests")
 
     # Start background threads
+    stop_local_process("thrust")  # free UDP telemetry port if old thrust_sender was running
     _start_telemetry_listener()
+    _start_control_keepalive()
     threading.Thread(target=_monitor_loop, daemon=True).start()
 
     url = f"http://localhost:{args.port}"
