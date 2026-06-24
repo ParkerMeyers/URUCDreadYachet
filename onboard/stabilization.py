@@ -734,7 +734,7 @@ class PixhawkOutput:
         """
         self._send_heartbeat_if_due()
 
-        rc = [self.IGNORE] * 18
+        rc = [self.IGNORE] * 8      # all 8 motors live on channels 1-8 (indices 0-7)
         for motor_name, pwm in pwm_by_name.items():
             idx = MOTORS[motor_name]          # 0-based → rc[0..7] = RC ch 1..8
             rc[idx] = int(clamp(pwm, MIN_US, MAX_US))
