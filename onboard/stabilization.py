@@ -16,7 +16,6 @@ This version:
 
 import json
 import math
-import signal
 import socket
 import struct
 import time
@@ -928,11 +927,6 @@ def calculate_direct_yaw_correction(yaw_hold_active, current_yaw_deg, hold_yaw_d
 # ============================================================
 
 def main():
-    def _handle_shutdown_signal(signum, frame):
-        raise KeyboardInterrupt()
-
-    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
-
     pca = PCA9685(I2C_BUS, PCA9685_ADDR)
     pca.neutral_all()
     print("PCA9685 initialized. All channels neutral.")

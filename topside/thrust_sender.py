@@ -60,13 +60,6 @@ UDP_PORT = 5005
 TELEMETRY_PORT = 5006
 SEND_HZ = 50
 
-UI_TELEMETRY_FORWARD_PORT = os.getenv("ROV_TELEMETRY_UI_PORT")
-UI_MODE_FILE = os.getenv("ROV_UI_MODE_FILE", "")
-UI_MANAGED = os.getenv("ROV_UI_MANAGED", "").strip().lower() in ("1", "true", "yes")
-
-if UI_MANAGED:
-    USE_DISPLAY = False
-
 USE_DISPLAY = True
 
 # Choose:
@@ -174,22 +167,6 @@ def make_neutral_packet(seq):
     }
 
 
-def read_ui_mode():
-    if not UI_MODE_FILE:
-        return "Drive/Armed"
-
-    try:
-        with open(UI_MODE_FILE, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except Exception:
-        return "Drive/Armed"
-
-    mode = str(payload.get("mode", "Drive/Armed")).strip()
-    if mode in {"Stabilization", "Drive/Armed", "Disarmed"}:
-        return mode
-    return "Drive/Armed"
-
-
 def format_depth(value):
     if value is None:
         return "N/A"
@@ -261,18 +238,15 @@ def main():
             font = None
 
     if pygame.joystick.get_count() == 0:
-        if UI_MANAGED:
-            print("No joystick found. UI-managed mode: sending neutral thrust until a controller is connected.")
-            joy = None
-        else:
-            print("No joystick found.")
-            print("Plug in controller, then run again.")
-            sys.exit(1)
-    else:
-        joy = pygame.joystick.Joystick(0)
-        joy.init()
-        print(f"Using joystick: {joy.get_name()}")
-        print(f"Axes: {joy.get_numaxes()}, Buttons: {joy.get_numbuttons()}, Hats: {joy.get_numhats()}")
+        print("No joystick found.")
+        print("Plug in controller, then run again.")
+        sys.exit(1)
+
+    joy = pygame.joystick.Joystick(0)
+    joy.init()
+
+    print(f"Using joystick: {joy.get_name()}")
+    print(f"Axes: {joy.get_numaxes()}, Buttons: {joy.get_numbuttons()}, Hats: {joy.get_numhats()}")
     print(f"Sending UDP to {pi_ip}:{UDP_PORT}")
     print(f"Listening for telemetry on UDP port {TELEMETRY_PORT}")
     print()
@@ -306,21 +280,6 @@ def main():
     telemetry_sock.bind(("0.0.0.0", TELEMETRY_PORT))
     telemetry_sock.setblocking(False)
 
-    telemetry_forward_sock = None
-    telemetry_forward_addr = None
-    if UI_TELEMETRY_FORWARD_PORT:
-        try:
-            telemetry_forward_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            telemetry_forward_addr = ("127.0.0.1", int(UI_TELEMETRY_FORWARD_PORT))
-            print(f"Forwarding telemetry to UI on 127.0.0.1:{UI_TELEMETRY_FORWARD_PORT}")
-        except Exception as exc:
-            print(f"Could not configure UI telemetry forward port: {exc}")
-            telemetry_forward_sock = None
-            telemetry_forward_addr = None
-
-    if UI_MODE_FILE:
-        print(f"Reading UI mode from: {UI_MODE_FILE}")
-
     stabilize = False
     depth_hold = False
     yaw_hold = False
@@ -331,8 +290,8 @@ def main():
     clock = pygame.time.Clock()
     last_print = 0.0
 
-    button_previous = [False] * (joy.get_numbuttons() if joy is not None else 0)
-    hat_previous = [(0, 0)] * (joy.get_numhats() if joy is not None else 0)
+    button_previous = [False] * joy.get_numbuttons()
+    hat_previous = [(0, 0)] * joy.get_numhats()
 
     telemetry = {
         "depth_m": None,
@@ -428,12 +387,6 @@ def main():
                 except BlockingIOError:
                     break
 
-                if telemetry_forward_sock is not None and telemetry_forward_addr is not None:
-                    try:
-                        telemetry_forward_sock.sendto(data, telemetry_forward_addr)
-                    except Exception:
-                        pass
-
                 try:
                     telemetry = json.loads(data.decode("utf-8"))
                     last_telemetry_time = time.time()
@@ -503,78 +456,74 @@ def main():
                 print(f"Gain: {gain_percent}%")
 
             # ----------------------------------------------------
-            # Controller buttons / axes (optional when UI-managed).
+            # Controller buttons.
             # ----------------------------------------------------
-            if joy is None and pygame.joystick.get_count() > 0:
-                joy = pygame.joystick.Joystick(0)
-                joy.init()
-                button_previous = [False] * joy.get_numbuttons()
-                hat_previous = [(0, 0)] * joy.get_numhats()
-                print(f"Joystick connected: {joy.get_name()}")
+            num_buttons = joy.get_numbuttons()
 
-            if joy is not None:
-                num_buttons = joy.get_numbuttons()
+            if len(button_previous) != num_buttons:
+                button_previous = [False] * num_buttons
 
-                if len(button_previous) != num_buttons:
-                    button_previous = [False] * num_buttons
+            for b in range(num_buttons):
+                pressed = bool(joy.get_button(b))
 
-                for b in range(num_buttons):
-                    pressed = bool(joy.get_button(b))
+                if pressed and not button_previous[b]:
+                    if PRINT_BUTTON_DEBUG:
+                        print(f"Button pressed: {b}")
 
-                    if pressed and not button_previous[b]:
-                        if PRINT_BUTTON_DEBUG:
-                            print(f"Button pressed: {b}")
+                    if b == BUTTON_STABILIZE:
+                        stabilize = not stabilize
+                        print(f"Stabilization toggled by controller button {b}: {stabilize}")
 
-                        if b == BUTTON_STABILIZE:
-                            stabilize = not stabilize
-                            print(f"Stabilization toggled by controller button {b}: {stabilize}")
+                    if BUTTON_DEPTH_HOLD is not None and b == BUTTON_DEPTH_HOLD:
+                        depth_hold = not depth_hold
+                        print(f"Depth hold toggled by controller button {b}: {depth_hold}")
 
-                        if BUTTON_DEPTH_HOLD is not None and b == BUTTON_DEPTH_HOLD:
-                            depth_hold = not depth_hold
-                            print(f"Depth hold toggled by controller button {b}: {depth_hold}")
+                    if BUTTON_YAW_HOLD is not None and b == BUTTON_YAW_HOLD:
+                        yaw_hold = not yaw_hold
+                        print(f"Yaw hold toggled by controller button {b}: {yaw_hold}")
 
-                        if BUTTON_YAW_HOLD is not None and b == BUTTON_YAW_HOLD:
-                            yaw_hold = not yaw_hold
-                            print(f"Yaw hold toggled by controller button {b}: {yaw_hold}")
-
-                        if BUTTON_GAIN_UP is not None and b == BUTTON_GAIN_UP:
-                            gain_percent = adjust_gain(gain_percent, GAIN_STEP_PERCENT)
-                            print(f"Gain: {gain_percent}%")
-
-                        if BUTTON_GAIN_DOWN is not None and b == BUTTON_GAIN_DOWN:
-                            gain_percent = adjust_gain(gain_percent, -GAIN_STEP_PERCENT)
-                            print(f"Gain: {gain_percent}%")
-
-                        if BUTTON_QUIT is not None and b == BUTTON_QUIT:
-                            running = False
-
-                    button_previous[b] = pressed
-
-                num_hats = joy.get_numhats()
-
-                if len(hat_previous) != num_hats:
-                    hat_previous = [(0, 0)] * num_hats
-
-                for h in range(num_hats):
-                    hat_x, hat_y = joy.get_hat(h)
-                    prev_x, prev_y = hat_previous[h]
-
-                    if hat_y == 1 and prev_y != 1:
+                    if BUTTON_GAIN_UP is not None and b == BUTTON_GAIN_UP:
                         gain_percent = adjust_gain(gain_percent, GAIN_STEP_PERCENT)
                         print(f"Gain: {gain_percent}%")
 
-                    elif hat_y == -1 and prev_y != -1:
+                    if BUTTON_GAIN_DOWN is not None and b == BUTTON_GAIN_DOWN:
                         gain_percent = adjust_gain(gain_percent, -GAIN_STEP_PERCENT)
                         print(f"Gain: {gain_percent}%")
 
-                    hat_previous[h] = (hat_x, hat_y)
+                    if BUTTON_QUIT is not None and b == BUTTON_QUIT:
+                        running = False
 
-                left_x = get_axis_safe(joy, AXIS_LEFT_X)
-                left_y = get_axis_safe(joy, AXIS_LEFT_Y)
-                right_x = get_axis_safe(joy, AXIS_RIGHT_X)
-                right_y = get_axis_safe(joy, AXIS_RIGHT_Y)
-            else:
-                left_x = left_y = right_x = right_y = 0.0
+                button_previous[b] = pressed
+
+            # ----------------------------------------------------
+            # D-pad / hat gain control.
+            # ----------------------------------------------------
+            num_hats = joy.get_numhats()
+
+            if len(hat_previous) != num_hats:
+                hat_previous = [(0, 0)] * num_hats
+
+            for h in range(num_hats):
+                hat_x, hat_y = joy.get_hat(h)
+                prev_x, prev_y = hat_previous[h]
+
+                if hat_y == 1 and prev_y != 1:
+                    gain_percent = adjust_gain(gain_percent, GAIN_STEP_PERCENT)
+                    print(f"Gain: {gain_percent}%")
+
+                elif hat_y == -1 and prev_y != -1:
+                    gain_percent = adjust_gain(gain_percent, -GAIN_STEP_PERCENT)
+                    print(f"Gain: {gain_percent}%")
+
+                hat_previous[h] = (hat_x, hat_y)
+
+            # ----------------------------------------------------
+            # Raw axes.
+            # ----------------------------------------------------
+            left_x = get_axis_safe(joy, AXIS_LEFT_X)
+            left_y = get_axis_safe(joy, AXIS_LEFT_Y)
+            right_x = get_axis_safe(joy, AXIS_RIGHT_X)
+            right_y = get_axis_safe(joy, AXIS_RIGHT_Y)
 
             # ----------------------------------------------------
             # Mapped controls.
@@ -612,24 +561,19 @@ def main():
                 vertical,
             )
 
-            ui_mode = read_ui_mode()
-            if ui_mode == "Disarmed":
-                packet = make_neutral_packet(seq)
-            else:
-                packet_stabilize = True if ui_mode == "Stabilization" else stabilize
-                packet = {
-                    "seq": seq,
-                    "time": time.time(),
-                    "forward": forward,
-                    "lateral": lateral,
-                    "yaw": yaw,
-                    "vertical": vertical,
-                    "stabilize": packet_stabilize,
-                    "depth_hold": depth_hold,
-                    "yaw_hold": yaw_hold,
-                    "gain_percent": gain_percent,
-                    "telemetry_port": TELEMETRY_PORT,
-                }
+            packet = {
+                "seq": seq,
+                "time": time.time(),
+                "forward": forward,
+                "lateral": lateral,
+                "yaw": yaw,
+                "vertical": vertical,
+                "stabilize": stabilize,
+                "depth_hold": depth_hold,
+                "yaw_hold": yaw_hold,
+                "gain_percent": gain_percent,
+                "telemetry_port": TELEMETRY_PORT,
+            }
 
             send_sock.sendto(json.dumps(packet).encode("utf-8"), (pi_ip, UDP_PORT))
             seq += 1

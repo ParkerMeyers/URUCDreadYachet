@@ -1,22 +1,21 @@
-# Topside control laptop + main_control_ui.py
-#   python install.py --topside
-#   (or: pip install -r requirements.txt)
-#
-# Onboard Raspberry Pi dependencies — install inside the Pi venv:
-#   python3 -m venv venv && source venv/bin/activate
-#   pip install -r requirements-onboard.txt
+# ── Topside (this computer) ──────────────────────────────────
+# Web UI
+flask>=3.0
+flask-socketio>=5.3
 
-# SSH launch from UI (password auth, no console prompts)
+# SSH to Pi
 paramiko>=3.4
 
-# thrust_sender.py
-pygame>=2.5
-pynput>=1.7.6
+# Camera stream proxy
+requests>=2.31
 
-# arm_sender.py
+# Joystick / thrust sender
+pygame>=2.5
+pynput>=1.7          # optional: global keyboard shortcuts
+
+# Arm sender serial communication
 pyserial>=3.5
 
-# Camera panels in main_control_ui.py (RTP/UDP H.264 via OpenCV)
-opencv-python>=4.8
-Pillow>=10.0
-numpy>=1.24
+# ── Onboard (Raspberry Pi) ───────────────────────────────────
+# Install separately on the Pi:
+#   pip3 install smbus2 pymavlink adafruit-circuitpython-bno055 adafruit-circuitpython-servokit lgpio

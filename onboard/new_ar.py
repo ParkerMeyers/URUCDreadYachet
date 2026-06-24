@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
-import socket, time, sys, select, termios, tty, math, signal
+import socket, time, sys, select, termios, tty, math
+import threading, json as _json
 import board, busio, adafruit_bno055
 from adafruit_servokit import ServoKit
 import lgpio
@@ -9,7 +10,8 @@ UDP_IP = "0.0.0.0"
 UDP_PORT = 5006
 BNO055_ADDR = 0x29
 
-MOSFET_GPIO = 17  # BCM GPIO17, HIGH = servo power ON
+MOSFET_GPIO = 17          # BCM GPIO17, HIGH = servo power ON
+MOSFET_CONTROL_PORT = 5007  # UDP port for web-UI MOSFET commands
 
 MIN_US, MAX_US, CENTER_US = 500, 2500, 1500
 
@@ -332,7 +334,43 @@ print("Expected: J1,J2,J3,J4,J5,J6_PWM,Claw,J6_TARGET_ANGLE")
 print("All joint PWM values expected from 500 to 2500.")
 print("Startup defaults: claw=700, regular servos=1500, J6 continuous rotation neutral=1460.")
 print("Also accepts PWM: prefix.")
+print(f"MOSFET control port: UDP {MOSFET_CONTROL_PORT} (web UI)")
 print()
+
+# ── Web-UI MOSFET control listener ──────────────────────────────────────────
+_mosfet_lock = threading.Lock()
+
+def _mosfet_udp_listener():
+    """Background thread: accept MOSFET on/off commands from the web UI."""
+    try:
+        ctl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ctl_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        ctl_sock.bind(("0.0.0.0", MOSFET_CONTROL_PORT))
+        ctl_sock.settimeout(1.0)
+    except Exception as e:
+        print(f"MOSFET control listener bind failed: {e}")
+        return
+
+    while True:
+        try:
+            data, _ = ctl_sock.recvfrom(256)
+            cmd = _json.loads(data.decode("utf-8"))
+            if cmd.get("cmd") == "mosfet":
+                want_on = bool(cmd.get("state", False))
+                with _mosfet_lock:
+                    if want_on and not servo_power_enabled:
+                        enable_power()
+                        print("\nMOSFET: ON  (web UI command)")
+                    elif not want_on and servo_power_enabled:
+                        disable_power()
+                        print("\nMOSFET: OFF (web UI command)")
+        except socket.timeout:
+            pass
+        except Exception:
+            pass
+
+threading.Thread(target=_mosfet_udp_listener, daemon=True).start()
+# ────────────────────────────────────────────────────────────────────────────
 
 old_terminal = termios.tcgetattr(sys.stdin)
 
@@ -341,13 +379,6 @@ last_print = time.time()
 j6_err = None
 j6_pwm = CENTER_US
 j6_status = "off"
-
-
-def _handle_shutdown_signal(signum, frame):
-    raise KeyboardInterrupt()
-
-
-signal.signal(signal.SIGTERM, _handle_shutdown_signal)
 
 try:
     tty.setcbreak(sys.stdin.fileno())
