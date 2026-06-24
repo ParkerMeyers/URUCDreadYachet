@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
 """Main UI and control launcher for the ROV project.
 
-This file ties together the existing topside and onboard scripts by:
-- launching the topside sender programs locally
-- launching the onboard control programs remotely over SSH
-- exposing the outline-requested UI stages (launch and control)
-- providing placeholders for the requested control features
+Ties together topside senders and onboard control programs:
+- Launch screen: SSH onboard (stabilization.py, new_ar.py) + local topside (arm_sender, thrust_sender)
+- Control screen: dual cameras, heading compass, telemetry, MOSFET, mode, Colmap/Crabs, system bar
 
-The implementation is intentionally robust and dependency-light:
-- Tkinter is used for the GUI so it works on most Python installs
-- local process launching uses subprocess
-- remote launching uses SSH if available
+Run: python main_control_ui.py
 """
 
 import argparse
 import importlib.util
 import json
+import math
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from tkinter import messagebox
 import tkinter as tk
 from tkinter import ttk
+from tkinter import font as tkfont
 
 
 HAVE_CV2 = importlib.util.find_spec("cv2") is not None
@@ -56,10 +54,32 @@ else:
     paramiko = None
 
 
-TELEMETRY_PORT = 5006
+TELEMETRY_PORT = 5007
 TELEMETRY_TIMEOUT_SEC = 1.0
 REMOTE_CONNECT_TIMEOUT_SEC = 10
 REMOTE_LAUNCH_TIMEOUT_SEC = 45
+UI_REFRESH_MS = 120
+UI_MODE_FILENAME = "rov_ui_mode.json"
+
+
+class UiModeBridge:
+    """Writes the operator-selected mode for thrust_sender to consume."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def write(self, mode):
+        payload = {"mode": mode, "time": time.time()}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    def read(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                return json.load(handle).get("mode", "Drive/Armed")
+        except Exception:
+            return "Drive/Armed"
 
 
 class TelemetryReceiver:
@@ -307,6 +327,46 @@ class ProcessController:
             )
         return result
 
+    def _build_onboard_hardware_stop_command(self):
+        return (
+            'pkill -f "onboard/stabilization.py" || true; '
+            'pkill -f "onboard/new_ar.py" || true; '
+            "sleep 0.25; "
+            "python3 - <<'PY'\n"
+            "import time\n"
+            "try:\n"
+            "    from smbus2 import SMBus\n"
+            "    bus = SMBus(1)\n"
+            "    addr = 0x40\n"
+            "    for ch in range(16):\n"
+            "        reg = 0x06 + 4 * ch\n"
+            "        bus.write_i2c_block_data(addr, reg, [0, 0, 0, 0])\n"
+            "    bus.close()\n"
+            "    print('PCA9685 outputs cleared')\n"
+            "except Exception as exc:\n"
+            "    print(f'PCA9685 stop warning: {exc}')\n"
+            "try:\n"
+            "    import lgpio\n"
+            "    handle = lgpio.gpiochip_open(0)\n"
+            "    try:\n"
+            "        lgpio.gpio_claim_output(handle, 17, 0)\n"
+            "        lgpio.gpio_write(handle, 17, 0)\n"
+            "    finally:\n"
+            "        lgpio.gpiochip_close(handle)\n"
+            "    print('MOSFET GPIO pulled low')\n"
+            "except Exception as exc:\n"
+            "    print(f'MOSFET stop warning: {exc}')\n"
+            "open('/tmp/uru_mosfet_state', 'w', encoding='utf-8').write('0')\n"
+            "PY"
+        )
+
+    def _stop_onboard_hardware(self):
+        self._ensure_ssh_available()
+        self._run_remote_command(
+            self._build_onboard_hardware_stop_command(),
+            timeout_sec=20,
+        )
+
     def set_mosfet_state(self, enabled):
         state_value = 1 if enabled else 0
         remote_command = (
@@ -328,6 +388,22 @@ class ProcessController:
             )
         return result
 
+    def launch_remote_mission(self, mission_name, remote_command, log_path):
+        wrapped = (
+            f'nohup bash -lc {json.dumps(remote_command)} > {json.dumps(log_path)} 2>&1 < /dev/null & '
+            f'echo "{mission_name}:launched"'
+        )
+        result = self._run_remote_command(wrapped, timeout_sec=REMOTE_LAUNCH_TIMEOUT_SEC)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Could not launch {mission_name}: {result.stderr.strip() or result.stdout.strip()}"
+            )
+        return result
+
+    def stop_remote_mission(self, mission_name, process_pattern):
+        stop_command = f'pkill -f {json.dumps(process_pattern)} || true; echo "{mission_name}:stopped"'
+        return self._run_remote_command(stop_command, timeout_sec=20)
+
     def _launch_topside_programs_visible(self):
         results = {}
         for name, rel_path in [
@@ -342,6 +418,9 @@ class ProcessController:
             log_handle = open(log_path, "a", encoding="utf-8")
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
+            if name == "thrust_sender":
+                env["ROV_TELEMETRY_UI_PORT"] = str(TELEMETRY_PORT)
+                env["ROV_UI_MODE_FILE"] = str(self.log_dir / UI_MODE_FILENAME)
 
             launch_args = [sys.executable, str(script_path)]
             if name in {"arm_sender", "thrust_sender"}:
@@ -417,19 +496,13 @@ class ProcessController:
             self.local_processes.pop(name, None)
 
         if self.remote_ready:
-            self._ensure_ssh_available()
-            stop_command = (
-                'pkill -f "onboard/stabilization.py" || true; '
-                'pkill -f "onboard/new_ar.py" || true'
-            )
             try:
-                self._run_remote_command(stop_command, timeout_sec=15)
+                self._stop_onboard_hardware()
             except Exception:
-                pass
-            try:
-                self.set_mosfet_state(False)
-            except Exception:
-                pass
+                try:
+                    self.set_mosfet_state(False)
+                except Exception:
+                    pass
             self.remote_ready = False
 
     def get_process_state(self, name):
@@ -451,15 +524,21 @@ class ROVMainApp(tk.Tk):
         self.configure(padx=16, pady=16)
 
         self.controller = ProcessController(self.args.repo_root, self.args)
+        self.mode_bridge = UiModeBridge(Path(self.args.repo_root) / "logs" / UI_MODE_FILENAME)
         self.launch_frame = None
         self.control_frame = None
 
         self.topside_started = False
         self.onboard_started = False
+        self._onboard_launch_in_progress = False
         self.mosfet_enabled = False
         self.control_mode = "Stabilization"
         self.colmap_running = False
         self.crabs_running = False
+        self.colmap_button = None
+        self.crabs_button = None
+        self.colmap_cmd = os.getenv("ROV_COLMAP_CMD", "colmap automatic_reconstructor --workspace_path /home/uruc/colmap_ws")
+        self.crabs_cmd = os.getenv("ROV_CRABS_CMD", "python3 /home/uruc/crabs/run_crabs.py")
         self.current_heading_deg = 0.0
         self.telemetry = {
             "depth_m": 0.0,
@@ -483,14 +562,25 @@ class ROVMainApp(tk.Tk):
         self.onboard_host_var = tk.StringVar(value=self.args.onboard_host)
         self.onboard_user_var = tk.StringVar(value=self.args.onboard_user)
         self.onboard_password_var = tk.StringVar(value=self.args.onboard_password)
+        self.telemetry_status_var = tk.StringVar(value="Telemetry: waiting")
+        self.launch_progress_var = tk.StringVar(value="")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        try:
+            self.mode_bridge.write("Stabilization")
+        except Exception:
+            pass
 
         self._apply_dark_theme()
         self._build_ui()
         self._refresh_ui_loop()
 
     def _on_close(self):
+        try:
+            self.controller.stop_all()
+        except Exception:
+            pass
         try:
             self.telemetry_receiver.close()
         except Exception:
@@ -510,9 +600,18 @@ class ROVMainApp(tk.Tk):
             pass
 
         self.configure(bg="#020617")
-        self.option_add("*Font", "Segoe UI 10")
+
+        default_font = tkfont.nametofont("TkDefaultFont")
+        default_font.configure(family="Segoe UI", size=10)
+        text_font = tkfont.nametofont("TkTextFont")
+        text_font.configure(family="Segoe UI", size=10)
+        fixed_font = tkfont.nametofont("TkFixedFont")
+        fixed_font.configure(family="Consolas", size=10)
+
         self.option_add("*Background", "#020617")
         self.option_add("*Foreground", "#f8fafc")
+        self.option_add("*selectBackground", "#1d4ed8")
+        self.option_add("*selectForeground", "#f8fafc")
 
         style.configure(".", background="#020617", foreground="#f8fafc", fieldbackground="#0f172a")
         style.configure("TFrame", background="#020617")
@@ -528,198 +627,238 @@ class ROVMainApp(tk.Tk):
         style.configure("TEntry", fieldbackground="#0f172a", foreground="#f8fafc", background="#0f172a")
         style.configure("TRadiobutton", background="#020617", foreground="#f8fafc")
         style.configure("TCheckbutton", background="#020617", foreground="#f8fafc")
+        style.configure("Card.TLabelframe", background="#0f172a", relief="flat")
+        style.configure("Card.TLabelframe.Label", background="#0f172a", foreground="#94a3b8", font=("Segoe UI", 10, "bold"))
+        style.configure("Hero.TLabel", background="#020617", foreground="#f8fafc", font=("Segoe UI", 26, "bold"))
+        style.configure("Subtle.TLabel", background="#020617", foreground="#94a3b8", font=("Segoe UI", 10))
+        style.configure("StatusOk.TLabel", background="#0f172a", foreground="#34d399", font=("Segoe UI", 10, "bold"))
+        style.configure("StatusWarn.TLabel", background="#0f172a", foreground="#fbbf24", font=("Segoe UI", 10, "bold"))
+        style.configure("StatusBad.TLabel", background="#0f172a", foreground="#f87171", font=("Segoe UI", 10, "bold"))
+        style.configure("Primary.TButton", background="#1d4ed8", foreground="#f8fafc", padding=(12, 8))
+        style.map(
+            "Primary.TButton",
+            background=[("active", "#2563eb"), ("pressed", "#1e40af"), ("!disabled", "#1d4ed8")],
+            foreground=[("!disabled", "#f8fafc")],
+        )
+        style.configure("Success.TButton", background="#0f766e", foreground="#f8fafc", padding=(10, 6))
+        style.map(
+            "Success.TButton",
+            background=[("active", "#14b8a6"), ("pressed", "#0d9488"), ("!disabled", "#0f766e")],
+        )
+        style.configure("Danger.TButton", background="#b91c1c", foreground="#f8fafc", padding=(10, 6))
+        style.map(
+            "Danger.TButton",
+            background=[("active", "#dc2626"), ("pressed", "#991b1b"), ("!disabled", "#b91c1c")],
+        )
+        style.configure("Accent.TButton", background="#334155", foreground="#f8fafc", padding=(10, 6))
+        style.map(
+            "Accent.TButton",
+            background=[("active", "#475569"), ("pressed", "#1e293b"), ("!disabled", "#334155")],
+        )
 
     def _build_ui(self):
         self.launch_frame = ttk.Frame(self)
         self.launch_frame.pack(fill="both", expand=True)
+        self.launch_frame.columnconfigure(0, weight=1)
 
-        title = ttk.Label(
-            self.launch_frame,
-            text="ROV Launch & Control",
-            font=("Segoe UI", 22, "bold"),
-        )
-        title.pack(pady=(0, 12))
+        hero = ttk.Label(self.launch_frame, text="ROV Launch & Control", style="Hero.TLabel")
+        hero.pack(pady=(8, 4))
 
         intro = ttk.Label(
             self.launch_frame,
             text=(
-                "Start the topside control programs and the onboard ROV control programs, "
-                "then move to the live control screen."
+                "Start the topside sender programs and the onboard ROV control stack, "
+                "then continue to the live control dashboard."
             ),
-            wraplength=900,
+            style="Subtle.TLabel",
+            wraplength=920,
             justify="center",
         )
-        intro.pack(pady=(0, 18))
+        intro.pack(pady=(0, 14))
 
-        prereq = ttk.Label(
-            self.launch_frame,
-            text=(
-                "Tip: the onboard Pi must already be reachable over SSH and have the repo at the remote root "
-                "before starting the onboard programs."
-            ),
-            wraplength=900,
-            justify="center",
-            foreground="#475569",
-        )
-        prereq.pack(pady=(0, 10))
-
-        host_frame = ttk.LabelFrame(self.launch_frame, text="SSH target")
-        host_frame.pack(fill="x", padx=18, pady=(0, 10))
-        ttk.Label(host_frame, text="IP/hostname to SSH into:").grid(
-            row=0, column=0, padx=12, pady=8, sticky="w"
-        )
-        ttk.Entry(host_frame, textvariable=self.onboard_host_var, width=28).grid(
-            row=0, column=1, padx=12, pady=8, sticky="ew"
-        )
-        ttk.Label(host_frame, text="Username:").grid(
-            row=1, column=0, padx=12, pady=8, sticky="w"
-        )
-        ttk.Entry(host_frame, textvariable=self.onboard_user_var, width=28).grid(
-            row=1, column=1, padx=12, pady=8, sticky="ew"
-        )
-        ttk.Label(host_frame, text="Password:").grid(
-            row=2, column=0, padx=12, pady=8, sticky="w"
-        )
-        ttk.Entry(host_frame, textvariable=self.onboard_password_var, width=28, show="*").grid(
-            row=2, column=1, padx=12, pady=8, sticky="ew"
-        )
+        host_frame = ttk.LabelFrame(self.launch_frame, text="SSH target", style="Card.TLabelframe")
+        host_frame.pack(fill="x", padx=24, pady=(0, 12))
         host_frame.columnconfigure(1, weight=1)
 
+        ttk.Label(host_frame, text="IP / hostname").grid(row=0, column=0, padx=14, pady=8, sticky="w")
+        ttk.Entry(host_frame, textvariable=self.onboard_host_var).grid(row=0, column=1, padx=14, pady=8, sticky="ew")
+        ttk.Label(host_frame, text="Username").grid(row=1, column=0, padx=14, pady=8, sticky="w")
+        ttk.Entry(host_frame, textvariable=self.onboard_user_var).grid(row=1, column=1, padx=14, pady=8, sticky="ew")
+        ttk.Label(host_frame, text="Password").grid(row=2, column=0, padx=14, pady=8, sticky="w")
+        ttk.Entry(host_frame, textvariable=self.onboard_password_var, show="*").grid(
+            row=2, column=1, padx=14, pady=8, sticky="ew"
+        )
+
         button_frame = ttk.Frame(self.launch_frame)
-        button_frame.pack(pady=6)
+        button_frame.pack(pady=8)
 
         self.onboard_button = ttk.Button(
             button_frame,
             text="Start onboard program",
             command=self._start_onboard_programs,
-            width=24,
+            style="Primary.TButton",
+            width=26,
         )
-        self.onboard_button.grid(row=0, column=0, padx=12, pady=8)
+        self.onboard_button.grid(row=0, column=0, padx=10, pady=8)
 
         self.topside_button = ttk.Button(
             button_frame,
             text="Start topside programs",
             command=self._start_topside_programs,
-            width=24,
+            style="Primary.TButton",
+            width=26,
         )
-        self.topside_button.grid(row=0, column=1, padx=12, pady=8)
+        self.topside_button.grid(row=0, column=1, padx=10, pady=8)
+
+        nav_frame = ttk.Frame(self.launch_frame)
+        nav_frame.pack(pady=(10, 6))
 
         self.next_button = ttk.Button(
-            self.launch_frame,
-            text="Next",
+            nav_frame,
+            text="Next → Live Control",
             command=self._show_control_screen,
             state="disabled",
-            width=18,
+            style="Success.TButton",
+            width=22,
         )
-        self.next_button.pack(pady=(16, 8))
+        self.next_button.grid(row=0, column=0, padx=8)
 
         self.stop_all_button = ttk.Button(
-            self.launch_frame,
+            nav_frame,
             text="Stop all",
             command=self._stop_all,
-            width=18,
+            style="Danger.TButton",
+            width=16,
         )
-        self.stop_all_button.pack(pady=(0, 20))
+        self.stop_all_button.grid(row=0, column=1, padx=8)
 
-        self.status_frame = ttk.LabelFrame(self.launch_frame, text="Launch status")
-        self.status_frame.pack(fill="x", padx=18, pady=8)
+        self.status_frame = ttk.LabelFrame(self.launch_frame, text="Launch status", style="Card.TLabelframe")
+        self.status_frame.pack(fill="x", padx=24, pady=10)
 
-        self.onboard_status_var = tk.StringVar(value="Not started")
-        self.topside_status_var = tk.StringVar(value="Not started")
-        self.remote_status_var = tk.StringVar(value="No remote launch")
+        self.onboard_status_var = tk.StringVar(value="Onboard: not started")
+        self.topside_status_var = tk.StringVar(value="Topside: not started")
+        self.remote_status_var = tk.StringVar(value="Remote: idle")
 
-        ttk.Label(self.status_frame, textvariable=self.onboard_status_var).grid(
-            row=0, column=0, padx=12, pady=8, sticky="w"
-        )
-        ttk.Label(self.status_frame, textvariable=self.topside_status_var).grid(
-            row=1, column=0, padx=12, pady=8, sticky="w"
-        )
-        ttk.Label(self.status_frame, textvariable=self.remote_status_var).grid(
-            row=2, column=0, padx=12, pady=8, sticky="w"
+        ttk.Label(self.status_frame, textvariable=self.onboard_status_var).pack(anchor="w", padx=14, pady=4)
+        ttk.Label(self.status_frame, textvariable=self.topside_status_var).pack(anchor="w", padx=14, pady=4)
+        ttk.Label(self.status_frame, textvariable=self.remote_status_var).pack(anchor="w", padx=14, pady=4)
+        ttk.Label(self.status_frame, textvariable=self.launch_progress_var, style="Subtle.TLabel").pack(
+            anchor="w", padx=14, pady=(2, 10)
         )
 
         self.control_frame = ttk.Frame(self)
         self.control_frame.pack(fill="both", expand=True)
         self.control_frame.pack_forget()
+        self.control_frame.rowconfigure(1, weight=1)
+        self.control_frame.columnconfigure(0, weight=1)
 
         self._build_control_screen()
 
     def _build_control_screen(self):
         title_bar = ttk.Frame(self.control_frame)
-        title_bar.pack(fill="x", pady=(0, 10))
+        title_bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        title_bar.columnconfigure(0, weight=1)
 
-        ttk.Label(
-            title_bar,
-            text="ROV Live Control",
-            font=("Segoe UI", 20, "bold"),
-        ).pack(side="left")
-
-        ttk.Button(title_bar, text="Back", command=self._show_launch_screen).pack(side="right")
+        ttk.Label(title_bar, text="ROV Live Control", font=("Segoe UI", 22, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(title_bar, textvariable=self.telemetry_status_var, style="Subtle.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(2, 0)
+        )
+        ttk.Button(title_bar, text="← Back to launch", command=self._show_launch_screen, style="Accent.TButton").grid(
+            row=0, column=1, rowspan=2, padx=(12, 0), sticky="e"
+        )
 
         content = ttk.Frame(self.control_frame)
-        content.pack(fill="both", expand=True)
+        content.grid(row=1, column=0, sticky="nsew")
+        content.rowconfigure(1, weight=1)
+        content.columnconfigure(0, weight=3)
+        content.columnconfigure(1, weight=2)
 
-        top_row = ttk.Frame(content)
-        top_row.pack(fill="x", pady=(0, 12))
+        cameras = ttk.Frame(content)
+        cameras.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 10))
+        cameras.columnconfigure(0, weight=1)
+        cameras.columnconfigure(1, weight=1)
+        cameras.rowconfigure(0, weight=1)
 
-        self.camera_left = ttk.LabelFrame(top_row, text="Camera 1")
-        self.camera_left.pack(side="left", fill="both", expand=True, padx=(0, 8))
-        self.camera_left_canvas = tk.Canvas(self.camera_left, width=480, height=270, bg="#101820")
-        self.camera_left_canvas.pack(fill="both", expand=True)
+        self.camera_left = ttk.LabelFrame(cameras, text="Camera 1", style="Card.TLabelframe")
+        self.camera_left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.camera_left.rowconfigure(0, weight=1)
+        self.camera_left.columnconfigure(0, weight=1)
+        self.camera_left_canvas = tk.Canvas(self.camera_left, bg="#101820", highlightthickness=0)
+        self.camera_left_canvas.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 
-        self.camera_right = ttk.LabelFrame(top_row, text="Camera 2")
-        self.camera_right.pack(side="right", fill="both", expand=True, padx=(8, 0))
-        self.camera_right_canvas = tk.Canvas(self.camera_right, width=480, height=270, bg="#101820")
-        self.camera_right_canvas.pack(fill="both", expand=True)
+        self.camera_right = ttk.LabelFrame(cameras, text="Camera 2", style="Card.TLabelframe")
+        self.camera_right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self.camera_right.rowconfigure(0, weight=1)
+        self.camera_right.columnconfigure(0, weight=1)
+        self.camera_right_canvas = tk.Canvas(self.camera_right, bg="#101820", highlightthickness=0)
+        self.camera_right_canvas.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 
-        middle_row = ttk.Frame(content)
-        middle_row.pack(fill="x", pady=(0, 12))
+        self.direction_frame = ttk.LabelFrame(content, text="Direction", style="Card.TLabelframe")
+        self.direction_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(0, 10))
+        self.direction_frame.rowconfigure(0, weight=1)
+        self.direction_frame.columnconfigure(0, weight=1)
+        self.direction_canvas = tk.Canvas(self.direction_frame, bg="#0f1720", highlightthickness=0)
+        self.direction_canvas.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
-        self.direction_frame = ttk.LabelFrame(middle_row, text="Direction overlay")
-        self.direction_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
-        self.direction_canvas = tk.Canvas(self.direction_frame, width=360, height=240, bg="#0f1720")
-        self.direction_canvas.pack(fill="both", expand=True)
-
-        self.telemetry_frame = ttk.LabelFrame(middle_row, text="Telemetry overlay")
-        self.telemetry_frame.pack(side="right", fill="both", expand=True, padx=(8, 0))
+        self.telemetry_frame = ttk.LabelFrame(content, text="Telemetry", style="Card.TLabelframe")
+        self.telemetry_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(0, 10))
         self.telemetry_text = tk.StringVar(value="")
         ttk.Label(
             self.telemetry_frame,
             textvariable=self.telemetry_text,
             justify="left",
-            font=("Consolas", 11),
+            font=("Consolas", 10),
             wraplength=420,
-        ).pack(anchor="w", padx=10, pady=10)
+        ).pack(anchor="nw", padx=12, pady=12)
 
         controls = ttk.Frame(content)
-        controls.pack(fill="x", pady=(0, 12))
+        controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        controls.columnconfigure(3, weight=1)
 
         self.mosfet_button = ttk.Button(
             controls,
-            text="Toggle MOSFET (OFF)",
+            text="MOSFET OFF",
             command=self._toggle_mosfet,
-            width=24,
+            style="Accent.TButton",
+            width=22,
         )
-        self.mosfet_button.pack(side="left", padx=(0, 8))
+        self.mosfet_button.grid(row=0, column=0, padx=(0, 10), sticky="w")
         self._update_mosfet_button()
 
         self.mode_var = tk.StringVar(value=self.control_mode)
-        mode_frame = ttk.LabelFrame(controls, text="Mode")
-        mode_frame.pack(side="left", padx=(0, 8))
-        ttk.Radiobutton(mode_frame, text="Stabilization", variable=self.mode_var, value="Stabilization").pack(anchor="w")
-        ttk.Radiobutton(mode_frame, text="Drive/Armed", variable=self.mode_var, value="Drive/Armed").pack(anchor="w")
-        ttk.Radiobutton(mode_frame, text="Disarmed", variable=self.mode_var, value="Disarmed").pack(anchor="w")
+        mode_frame = ttk.LabelFrame(controls, text="Mode", style="Card.TLabelframe")
+        mode_frame.grid(row=0, column=1, padx=(0, 10), sticky="w")
+        for idx, mode in enumerate(("Stabilization", "Drive/Armed", "Disarmed")):
+            ttk.Radiobutton(mode_frame, text=mode, variable=self.mode_var, value=mode).grid(
+                row=idx, column=0, sticky="w", padx=8, pady=2
+            )
         self.mode_var.trace_add("write", lambda *_: self._set_mode(self.mode_var.get()))
 
-        action_frame = ttk.LabelFrame(controls, text="Mission actions")
-        action_frame.pack(side="left", padx=(0, 8))
-        ttk.Button(action_frame, text="Start Colmap", command=self._start_colmap).pack(anchor="w", padx=6, pady=2)
-        ttk.Button(action_frame, text="Start Crabs", command=self._start_crabs).pack(anchor="w", padx=6, pady=2)
+        action_frame = ttk.LabelFrame(controls, text="Mission actions", style="Card.TLabelframe")
+        action_frame.grid(row=0, column=2, sticky="w")
+        self.colmap_button = ttk.Button(
+            action_frame,
+            text="Start Colmap",
+            command=self._start_colmap,
+            style="Accent.TButton",
+            width=16,
+        )
+        self.colmap_button.pack(anchor="w", padx=8, pady=3)
+        self.crabs_button = ttk.Button(
+            action_frame,
+            text="Start Crabs",
+            command=self._start_crabs,
+            style="Accent.TButton",
+            width=16,
+        )
+        self.crabs_button.pack(anchor="w", padx=8, pady=3)
 
-        bottom = ttk.LabelFrame(content, text="System info")
-        bottom.pack(fill="x")
+        bottom = ttk.LabelFrame(self.control_frame, text="System status", style="Card.TLabelframe")
+        bottom.grid(row=2, column=0, sticky="ew")
         self.bottom_text = tk.StringVar(value="")
-        ttk.Label(bottom, textvariable=self.bottom_text, justify="left", font=("Consolas", 11)).pack(anchor="w", padx=10, pady=10)
+        ttk.Label(bottom, textvariable=self.bottom_text, justify="left", font=("Consolas", 10)).pack(
+            anchor="w", padx=12, pady=10
+        )
 
     def _show_launch_screen(self):
         self.launch_frame.pack(fill="both", expand=True)
@@ -733,51 +872,71 @@ class ROVMainApp(tk.Tk):
         self.control_frame.pack(fill="both", expand=True)
 
     def _start_onboard_programs(self):
-        try:
-            host = self.onboard_host_var.get().strip()
-            user = self.onboard_user_var.get().strip()
-            password = self.onboard_password_var.get().strip()
-            self.args.onboard_host = host or self.args.onboard_host
-            self.args.onboard_user = user or self.args.onboard_user
-            self.args.onboard_password = password or self.args.onboard_password
-            self.controller.args.onboard_host = self.args.onboard_host
-            self.controller.args.onboard_user = self.args.onboard_user
-            self.controller.args.onboard_password = self.args.onboard_password
-            result = self.controller.launch_onboard_programs()
-            self.onboard_started = True
-            self.onboard_status_var.set(
-                f"Onboard launched on {result['host']} ({result['user']})"
-            )
-            self.remote_status_var.set(
-                f"Remote root: {result['remote_root']}"
-            )
-            self.mosfet_enabled = False
+        if getattr(self, "_onboard_launch_in_progress", False):
+            return
+
+        host = self.onboard_host_var.get().strip()
+        user = self.onboard_user_var.get().strip()
+        password = self.onboard_password_var.get().strip()
+        self.args.onboard_host = host or self.args.onboard_host
+        self.args.onboard_user = user or self.args.onboard_user
+        self.args.onboard_password = password or self.args.onboard_password
+        self.controller.args.onboard_host = self.args.onboard_host
+        self.controller.args.onboard_user = self.args.onboard_user
+        self.controller.args.onboard_password = self.args.onboard_password
+
+        self._onboard_launch_in_progress = True
+        self.onboard_button.config(state="disabled")
+        self.onboard_status_var.set("Onboard: launching over SSH...")
+        self.launch_progress_var.set("Connecting to Pi and starting stabilization.py + new_ar.py")
+
+        def worker():
             try:
-                self.controller.set_mosfet_state(False)
+                result = self.controller.launch_onboard_programs()
+                self.after(0, lambda: self._on_onboard_launch_success(result))
             except Exception as exc:
-                self.remote_status_var.set(f"Remote root: {result['remote_root']} (MOSFET init warning: {exc})")
-            self._update_mosfet_button()
-            self._refresh_next_state()
-        except Exception as exc:
-            self.onboard_started = False
-            self.onboard_status_var.set(f"Error: {exc}")
-            messagebox.showerror("Onboard launch failed", str(exc))
+                self.after(0, lambda: self._on_onboard_launch_failure(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_onboard_launch_success(self, result):
+        self._onboard_launch_in_progress = False
+        self.onboard_button.config(state="normal")
+        self.onboard_started = True
+        self.onboard_status_var.set(
+            f"Onboard: running on {result['host']} ({result['user']})"
+        )
+        self.remote_status_var.set(
+            f"Remote root: {result['remote_root']}"
+        )
+        self.launch_progress_var.set("Onboard stack ready. Start topside programs if you have not already.")
+        self.mosfet_enabled = False
+        self._update_mosfet_button()
+        self._refresh_next_state()
+
+    def _on_onboard_launch_failure(self, exc):
+        self._onboard_launch_in_progress = False
+        self.onboard_button.config(state="normal")
+        self.onboard_started = False
+        self.onboard_status_var.set(f"Onboard: error — {exc}")
+        self.launch_progress_var.set("")
+        messagebox.showerror("Onboard launch failed", str(exc))
+        self._refresh_next_state()
 
     def _start_topside_programs(self):
         try:
+            self.mode_bridge.write(self.control_mode)
             result = self.controller.launch_topside_programs()
             self.topside_started = True
-            self.topside_status_var.set(
-                "Topside launched: arm_sender.py + thrust_sender.py"
+            self.topside_status_var.set("Topside: arm_sender.py + thrust_sender.py running")
+            self.launch_progress_var.set(
+                "Topside senders active. Use Next when both stacks are running."
             )
-            for name, info in result.items():
-                self.topside_status_var.set(
-                    f"Topside launched: {name} -> {info['log']}"
-                )
             self._refresh_next_state()
         except Exception as exc:
             self.topside_started = False
-            self.topside_status_var.set(f"Error: {exc}")
+            self.topside_status_var.set(f"Topside: error — {exc}")
+            self.launch_progress_var.set("")
             messagebox.showerror("Topside launch failed", str(exc))
 
     def _refresh_next_state(self):
@@ -787,38 +946,29 @@ class ROVMainApp(tk.Tk):
             self.next_button.config(state="disabled")
 
     def _stop_all(self):
-        for name, process in list(self.local_processes.items()):
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-            handle = self.local_log_handles.pop(name, None)
-            if handle is not None:
-                handle.close()
-            self.local_processes.pop(name, None)
+        try:
+            self.controller.stop_all()
+        except Exception as exc:
+            messagebox.showwarning("Stop all warning", f"Some stop steps failed: {exc}")
 
-        if self.remote_ready:
-            self._ensure_ssh_available()
-            stop_command = (
-                'pkill -f "onboard/stabilization.py" || true; '
-                'pkill -f "onboard/new_ar.py" || true'
-            )
-            try:
-                self._run_remote_command(stop_command, timeout_sec=15)
-            except Exception:
-                pass
-            try:
-                self.set_mosfet_state(False)
-            except Exception:
-                pass
-            self.remote_ready = False
+        self.onboard_started = False
+        self.topside_started = False
+        self.mosfet_enabled = False
+        self.onboard_status_var.set("Onboard: not started")
+        self.topside_status_var.set("Topside: not started")
+        self.remote_status_var.set("Remote: idle")
+        self.launch_progress_var.set("")
+        self._update_mosfet_button()
+        self._refresh_next_state()
+        self._show_launch_screen()
 
     def _update_mosfet_button(self):
         if getattr(self, "mosfet_button", None) is None:
             return
-        self.mosfet_button.config(text=f"Toggle MOSFET ({'ON' if self.mosfet_enabled else 'OFF'})")
+        self.mosfet_button.config(
+            text=f"MOSFET {'ON' if self.mosfet_enabled else 'OFF'}",
+            style="Success.TButton" if self.mosfet_enabled else "Accent.TButton",
+        )
 
     def _toggle_mosfet(self):
         if not self.onboard_started:
@@ -838,19 +988,75 @@ class ROVMainApp(tk.Tk):
 
     def _set_mode(self, mode):
         self.control_mode = mode
-        self.telemetry["state"] = mode
+        try:
+            self.mode_bridge.write(mode)
+        except Exception as exc:
+            messagebox.showwarning("Mode update failed", f"Could not write UI mode file: {exc}")
+        if not self.colmap_running and not self.crabs_running:
+            self.telemetry["state"] = mode
+
+    def _toggle_mission(self, mission_name, running_attr, button_attr, start_cmd, stop_pattern):
+        running = getattr(self, running_attr)
+        button = getattr(self, button_attr, None)
+
+        if not self.onboard_started:
+            messagebox.showwarning("Not ready", "Start the onboard programs first.")
+            return
+
+        if running:
+            def worker():
+                try:
+                    self.controller.stop_remote_mission(mission_name, stop_pattern)
+                    self.after(0, lambda: self._on_mission_stopped(mission_name, running_attr, button_attr))
+                except Exception as exc:
+                    self.after(0, lambda: messagebox.showwarning(f"{mission_name} stop failed", str(exc)))
+
+            if button is not None:
+                button.config(state="disabled")
+            threading.Thread(target=worker, daemon=True).start()
+            return
+
+        def worker():
+            try:
+                log_path = f"/tmp/uru_{mission_name.lower()}.log"
+                self.controller.launch_remote_mission(mission_name, start_cmd, log_path)
+                self.after(0, lambda: self._on_mission_started(mission_name, running_attr, button_attr))
+            except Exception as exc:
+                self.after(0, lambda: self._on_mission_failed(mission_name, button_attr, exc))
+
+        if button is not None:
+            button.config(state="disabled")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_mission_started(self, mission_name, running_attr, button_attr):
+        setattr(self, running_attr, True)
+        button = getattr(self, button_attr, None)
+        if button is not None:
+            button.config(state="normal", text=f"Stop {mission_name}")
+        self.telemetry["state"] = f"{mission_name.upper()} RUNNING"
+
+    def _on_mission_stopped(self, mission_name, running_attr, button_attr):
+        setattr(self, running_attr, False)
+        button = getattr(self, button_attr, None)
+        if button is not None:
+            button.config(state="normal", text=f"Start {mission_name}")
+        self.telemetry["state"] = self.control_mode
+
+    def _on_mission_failed(self, mission_name, button_attr, exc):
+        button = getattr(self, button_attr, None)
+        if button is not None:
+            button.config(state="normal")
+        messagebox.showwarning(f"{mission_name} launch failed", str(exc))
 
     def _start_colmap(self):
-        self.colmap_running = not self.colmap_running
-        self.telemetry["state"] = "COLMAP RUNNING" if self.colmap_running else self.control_mode
+        self._toggle_mission("Colmap", "colmap_running", "colmap_button", self.colmap_cmd, "colmap")
 
     def _start_crabs(self):
-        self.crabs_running = not self.crabs_running
-        self.telemetry["state"] = "CRABS RUNNING" if self.crabs_running else self.control_mode
+        self._toggle_mission("Crabs", "crabs_running", "crabs_button", self.crabs_cmd, "run_crabs.py")
 
     def _refresh_ui_loop(self, *args):
         self._update_control_panels()
-        self.after(250, self._refresh_ui_loop, None)
+        self.after(UI_REFRESH_MS, self._refresh_ui_loop, None)
 
     def _as_float(self, value):
         try:
@@ -909,6 +1115,11 @@ class ROVMainApp(tk.Tk):
 
         if not self.telemetry_online:
             self.telemetry["state"] = self.telemetry.get("state", "NO_TELEMETRY")
+
+        self.telemetry_status_var.set(
+            f"Telemetry: {'ONLINE' if self.telemetry_online else 'WAITING'}  |  "
+            f"Mode: {self.control_mode}  |  MOSFET: {'ON' if self.mosfet_enabled else 'OFF'}"
+        )
 
         self._draw_camera_view(self.camera_left_canvas, "Camera 1", 0)
         self._draw_camera_view(self.camera_right_canvas, "Camera 2", 1)
@@ -979,45 +1190,95 @@ class ROVMainApp(tk.Tk):
         canvas.create_line(40, height - 40, width - 40, 40, fill="#1d4ed8", width=2)
 
     def _draw_direction_overlay(self):
-        self.direction_canvas.delete("all")
-        self.direction_canvas.create_rectangle(0, 0, 360, 240, fill="#0f1720", outline="#334155")
-        self.direction_canvas.create_text(180, 25, text="Direction overlay", fill="#f8fafc", font=("Segoe UI", 14, "bold"))
-        self.direction_canvas.create_oval(120, 70, 240, 190, outline="#3b82f6", width=2)
-        self.direction_canvas.create_line(180, 130, 180, 80, fill="#f59e0b", width=3)
-        self.direction_canvas.create_line(180, 130, 230, 105, fill="#f59e0b", width=3)
-        self.direction_canvas.create_line(180, 130, 130, 105, fill="#f59e0b", width=3)
-        angle = self.current_heading_deg
-        self.direction_canvas.create_text(180, 220, text=f"Heading {angle:.1f}°", fill="#f8fafc", font=("Segoe UI", 12, "bold"))
+        canvas = self.direction_canvas
+        canvas.delete("all")
+
+        width = max(220, canvas.winfo_width())
+        height = max(220, canvas.winfo_height())
+        cx = width / 2
+        cy = height / 2
+        radius = min(width, height) * 0.36
+
+        canvas.create_rectangle(0, 0, width, height, fill="#0f1720", outline="#334155")
+        canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius, outline="#3b82f6", width=2)
+
+        for bearing, label in ((0, "N"), (90, "E"), (180, "S"), (270, "W")):
+            angle_rad = math.radians(bearing - self.current_heading_deg - 90)
+            tx = cx + math.cos(angle_rad) * (radius + 18)
+            ty = cy + math.sin(angle_rad) * (radius + 18)
+            canvas.create_text(tx, ty, text=label, fill="#64748b", font=("Segoe UI", 10, "bold"))
+
+        heading_rad = math.radians(-self.current_heading_deg)
+        nx = cx + math.sin(heading_rad) * (radius - 12)
+        ny = cy - math.cos(heading_rad) * (radius - 12)
+        canvas.create_line(cx, cy, nx, ny, fill="#f59e0b", width=4, arrow=tk.LAST, arrowshape=(14, 16, 6))
+
+        pitch = self.telemetry.get("pitch_deg", 0.0)
+        roll = self.telemetry.get("roll_deg", 0.0)
+        canvas.create_text(
+            cx,
+            height - 42,
+            text=f"Heading {self.current_heading_deg:.1f}°",
+            fill="#f8fafc",
+            font=("Segoe UI", 12, "bold"),
+        )
+        canvas.create_text(
+            cx,
+            height - 22,
+            text=f"Pitch {pitch:+.1f}°   Roll {roll:+.1f}°",
+            fill="#94a3b8",
+            font=("Segoe UI", 10),
+        )
 
     def _update_telemetry_text(self):
         payload = self.telemetry_payload if self.telemetry_online else {}
+        battery_v = payload.get("battery_v")
+        battery_a = payload.get("battery_a")
+        if battery_v is not None and battery_a is not None:
+            battery_line = f"Battery: {self._as_float(battery_v):.2f} V / {self._as_float(battery_a):.1f} A"
+        else:
+            battery_line = "Battery: awaiting sensor"
+
         text = (
-            f"Telemetry: {'ONLINE' if self.telemetry_online else 'WAITING'}\n"
+            f"Link: {'ONLINE' if self.telemetry_online else 'WAITING'}\n"
             f"State: {self.telemetry['state']}\n"
             f"Depth: {self.telemetry['depth_m']:.2f} m\n"
             f"Yaw: {self.telemetry['yaw_deg']:.1f}°\n"
             f"Pitch: {self.telemetry['pitch_deg']:.1f}°\n"
             f"Roll: {self.telemetry['roll_deg']:.1f}°\n"
-            f"Battery: {self.telemetry['battery_v']:.2f} V / {self.telemetry['battery_a']:.1f} A\n"
+            f"{battery_line}\n"
             f"Mode: {self.control_mode}\n"
             f"MOSFET: {'ON' if self.mosfet_enabled else 'OFF'}\n"
             f"Colmap: {'RUNNING' if self.colmap_running else 'IDLE'}\n"
             f"Crabs: {'RUNNING' if self.crabs_running else 'IDLE'}"
         )
         if payload:
-            text += f"\nHold depth: {payload.get('hold_depth_m', 'n/a')}"
-            text += f"\nDepth correction: {payload.get('depth_correction', 'n/a')}"
-            text += f"\nDepth source: {payload.get('depth_source', 'n/a')}"
+            if payload.get("hold_depth_m") is not None:
+                text += f"\nHold depth: {payload.get('hold_depth_m')}"
+            if payload.get("depth_correction") is not None:
+                text += f"\nDepth correction: {payload.get('depth_correction')}"
+            if payload.get("depth_source") is not None:
+                text += f"\nDepth source: {payload.get('depth_source')}"
+            if payload.get("pressure_hpa") is not None:
+                text += f"\nPressure: {payload.get('pressure_hpa')} hPa"
+            if payload.get("gain_percent") is not None:
+                text += f"\nGain: {payload.get('gain_percent')}%"
+            if payload.get("stabilize") is not None:
+                text += f"\nStabilize active: {payload.get('stabilize')}"
         self.telemetry_text.set(text)
 
     def _update_bottom_text(self):
+        arm_state = self.controller.get_process_state("arm_sender")
+        thrust_state = self.controller.get_process_state("thrust_sender")
         self.bottom_text.set(
             "Status: "
             f"Onboard={'RUNNING' if self.onboard_started else 'STOPPED'} | "
-            f"Topside={'RUNNING' if self.topside_started else 'STOPPED'} | "
+            f"Topside arm={arm_state} thrust={thrust_state} | "
             f"Mode={self.control_mode} | "
+            f"Telemetry={'ONLINE' if self.telemetry_online else 'OFFLINE'} | "
             f"Battery={self.telemetry['battery_v']:.2f} V | "
-            f"Current={self.telemetry['battery_a']:.1f} A"
+            f"Current={self.telemetry['battery_a']:.1f} A | "
+            f"Depth={self.telemetry['depth_m']:.2f} m"
         )
 
 

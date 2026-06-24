@@ -14,3 +14,19 @@ Traceback (most recent call last):
   File "C:\Users\parke\PycharmProjects\URUCDreadYachet\topside\arm_sender.py", line 4, in <module>
     import serial
 ModuleNotFoundError: No module named 'serial'
+Traceback (most recent call last):
+  File "C:\Users\parke\PycharmProjects\URUCDreadYachet\topside\arm_sender.py", line 6, in <module>
+    import serial
+ModuleNotFoundError: No module named 'serial'
+Traceback (most recent call last):
+  File "C:\Users\parke\PycharmProjects\URUCDreadYachet\topside\arm_sender.py", line 6, in <module>
+    import serial
+ModuleNotFoundError: No module named 'serial'
+Traceback (most recent call last):
+  File "C:\Users\parke\PycharmProjects\URUCDreadYachet - Copy\topside\arm_sender.py", line 4, in <module>
+    import serial
+ModuleNotFoundError: No module named 'serial'
+Traceback (most recent call last):
+  File "C:\Users\parke\PycharmProjects\URUCDreadYachet - Copy\topside\arm_sender.py", line 4, in <module>
+    import serial
+ModuleNotFoundError: No module named 'serial'
