@@ -100,6 +100,11 @@ DEFAULT_CONFIG = {
     "mosfet_control_port": 5007,
     "colmap_command":     "python3 colmap_run.py",
     "crabs_command":      "python3 crabs.py",
+    "mavproxy_bin":       "/home/uruc/mav_env/bin/mavproxy.py",
+    "mavproxy_serial":    "/dev/ttyACM1",
+    "mavproxy_baud":      "115200",
+    "mavproxy_out1":      "udp:10.42.0.1:14550",
+    "mavproxy_out2":      "udp:127.0.0.1:14551",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -113,6 +118,7 @@ STATE = {
     "arm_running":         False,
     "onboard_stab":        False,
     "onboard_arm":         False,
+    "onboard_mavproxy":    False,
     "ssh_connected":       False,
     "ssh_error":           "",
     "mode":                "disarmed",
@@ -251,6 +257,40 @@ class SSHManager:
             return True, "sent"
         except Exception as e:
             return False, str(e)
+
+    def start_mavproxy(self):
+        """Kill any existing MAVProxy, then launch a fresh daemon."""
+        # Kill existing instances first
+        self.exec("pkill -f mavproxy 2>/dev/null; pkill -f MAVProxy 2>/dev/null; sleep 0.5")
+
+        bin_  = config["mavproxy_bin"]
+        ser   = config["mavproxy_serial"]
+        baud  = config["mavproxy_baud"]
+        out1  = config["mavproxy_out1"]
+        out2  = config["mavproxy_out2"]
+
+        cmd = (
+            f"nohup {bin_} "
+            f"--master={ser} "
+            f"--baudrate {baud} "
+            f"--out={out1} "
+            f"--out={out2} "
+            f"--daemon "
+            f"> /tmp/rov_mavproxy.log 2>&1 &"
+        )
+        _, _, error = self.exec(cmd, timeout=10)
+        if error:
+            return False, error
+        return True, "MAVProxy started"
+
+    def stop_mavproxy(self):
+        self.exec("pkill -f mavproxy 2>/dev/null; pkill -f MAVProxy 2>/dev/null || true")
+
+    def is_mavproxy_running(self):
+        out, _, error = self.exec("pgrep -f mavproxy")
+        if error:
+            return False
+        return bool(out.strip())
 
     def run_colmap(self):
         rov_path = config["pi_rov_path"]
@@ -500,13 +540,15 @@ def _monitor_loop():
         STATE["arm_running"]    = is_local_running("arm")
 
         if ssh.is_connected():
-            STATE["ssh_connected"]  = True
-            STATE["onboard_stab"]   = ssh.is_onboard_running("stabilization.py")
-            STATE["onboard_arm"]    = ssh.is_onboard_running("new_ar.py")
+            STATE["ssh_connected"]    = True
+            STATE["onboard_mavproxy"] = ssh.is_mavproxy_running()
+            STATE["onboard_stab"]     = ssh.is_onboard_running("stabilization.py")
+            STATE["onboard_arm"]      = ssh.is_onboard_running("new_ar.py")
         else:
-            STATE["ssh_connected"] = False
-            STATE["onboard_stab"]  = False
-            STATE["onboard_arm"]   = False
+            STATE["ssh_connected"]    = False
+            STATE["onboard_mavproxy"] = False
+            STATE["onboard_stab"]     = False
+            STATE["onboard_arm"]      = False
 
         tel_age = time.time() - STATE["last_telemetry_time"]
         if tel_age > 2.0:
@@ -517,14 +559,15 @@ def _monitor_loop():
 
 def emit_status():
     socketio.emit("status", {
-        "thrust_running":  STATE["thrust_running"],
-        "arm_running":     STATE["arm_running"],
-        "onboard_stab":    STATE["onboard_stab"],
-        "onboard_arm":     STATE["onboard_arm"],
-        "ssh_connected":   STATE["ssh_connected"],
-        "ssh_error":       STATE["ssh_error"],
-        "mode":            STATE["mode"],
-        "mosfet_on":       STATE["mosfet_on"],
+        "thrust_running":   STATE["thrust_running"],
+        "arm_running":      STATE["arm_running"],
+        "onboard_stab":     STATE["onboard_stab"],
+        "onboard_arm":      STATE["onboard_arm"],
+        "onboard_mavproxy": STATE["onboard_mavproxy"],
+        "ssh_connected":    STATE["ssh_connected"],
+        "ssh_error":        STATE["ssh_error"],
+        "mode":             STATE["mode"],
+        "mosfet_on":        STATE["mosfet_on"],
     })
 
 
@@ -625,12 +668,22 @@ def api_start_onboard():
 
     results = {}
 
+    # 1. MAVProxy must come first — stabilization.py connects to udp:127.0.0.1:14551
+    ok_m, msg_m = ssh.start_mavproxy()
+    results["mavproxy"] = {"ok": ok_m, "msg": msg_m}
+    STATE["onboard_mavproxy"] = ok_m
+
+    # Give MAVProxy a moment to bind before the Python scripts connect to it
+    import time as _t; _t.sleep(2.0)
+
+    # 2. Thruster stabilization
     ok_s, msg_s = ssh.start_onboard_process(
         "onboard/stabilization.py", "stab"
     )
     results["stabilization"] = {"ok": ok_s, "msg": msg_s}
     STATE["onboard_stab"] = ok_s
 
+    # 3. Arm controller
     ok_a, msg_a = ssh.start_onboard_process(
         "onboard/new_ar.py", "arm"
     )
@@ -638,15 +691,17 @@ def api_start_onboard():
     STATE["onboard_arm"] = ok_a
 
     emit_status()
-    return jsonify({"ok": ok_s and ok_a, "results": results})
+    return jsonify({"ok": ok_m and ok_s and ok_a, "results": results})
 
 
 @app.route("/api/onboard/stop", methods=["POST"])
 def api_stop_onboard():
     ssh.stop_onboard_process("stabilization.py")
     ssh.stop_onboard_process("new_ar.py")
-    STATE["onboard_stab"] = False
-    STATE["onboard_arm"] = False
+    ssh.stop_mavproxy()
+    STATE["onboard_stab"]     = False
+    STATE["onboard_arm"]      = False
+    STATE["onboard_mavproxy"] = False
     emit_status()
     return jsonify({"ok": True})
 
@@ -1163,6 +1218,20 @@ html,body { height:100%; background:var(--bg); color:var(--text);
     </div>
 
     <div class="config-group">
+      <h3>MAVProxy</h3>
+      <div class="field"><label>MAVProxy Binary Path</label>
+        <input id="cfg-mavproxy_bin" type="text" value="/home/uruc/mav_env/bin/mavproxy.py"/></div>
+      <div class="field"><label>Pixhawk Serial Port</label>
+        <input id="cfg-mavproxy_serial" type="text" value="/dev/ttyACM1"/></div>
+      <div class="field"><label>Baud Rate</label>
+        <input id="cfg-mavproxy_baud" type="text" value="115200"/></div>
+      <div class="field"><label>UDP Out 1 (topside)</label>
+        <input id="cfg-mavproxy_out1" type="text" value="udp:10.42.0.1:14550"/></div>
+      <div class="field"><label>UDP Out 2 (local → stabilization.py)</label>
+        <input id="cfg-mavproxy_out2" type="text" value="udp:127.0.0.1:14551"/></div>
+    </div>
+
+    <div class="config-group">
       <h3>Onboard Commands</h3>
       <div class="field"><label>COLMAP Command (on Pi)</label>
         <input id="cfg-colmap_command" type="text" value="python3 colmap_run.py"/></div>
@@ -1181,6 +1250,10 @@ html,body { height:100%; background:var(--bg); color:var(--text);
       <p class="panel-desc">Launches <code>stabilization.py</code> (thruster control) and
         <code>new_ar.py</code> (arm + MOSFET control) on the ROV Pi via SSH.</p>
       <div class="program-status">
+        <div class="prog-row">
+          <div class="dot" id="dot-mavproxy"></div>
+          <span>mavproxy (UDP bridge)</span>
+        </div>
         <div class="prog-row">
           <div class="dot" id="dot-stab"></div>
           <span>stabilization.py</span>
@@ -1451,7 +1524,9 @@ function getCfg() {
   const keys = ['pi_ip','pi_user','pi_password','pi_ssh_port','pi_rov_path',
                  'serial_port','camera1_url','camera2_url',
                  'thrust_udp_port','telemetry_port','arm_udp_port',
-                 'mosfet_control_port','colmap_command','crabs_command'];
+                 'mosfet_control_port','colmap_command','crabs_command',
+                 'mavproxy_bin','mavproxy_serial','mavproxy_baud',
+                 'mavproxy_out1','mavproxy_out2'];
   const obj = {};
   keys.forEach(k => {
     const el = document.getElementById('cfg-' + k);
@@ -1596,6 +1671,7 @@ function updateStatus() {
   const s = _status;
 
   // Launch screen dots
+  setDot('dot-mavproxy', s.onboard_mavproxy);
   setDot('dot-stab',     s.onboard_stab);
   setDot('dot-arm',      s.onboard_arm);
   setDot('dot-thrust',   s.thrust_running);
