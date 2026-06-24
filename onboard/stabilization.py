@@ -17,11 +17,9 @@ This version:
 import json
 import math
 import socket
-import struct
 import time
 from dataclasses import dataclass
 
-from smbus2 import SMBus
 from pymavlink import mavutil
 
 
@@ -36,9 +34,19 @@ UDP_LISTEN_PORT = 5005
 DEFAULT_TELEMETRY_PORT = 5006
 TELEMETRY_HZ = 10
 
-I2C_BUS = 1
-PCA9685_ADDR = 0x40
-PCA_FREQ_HZ = 50
+# ── Pix6 RC output ──────────────────────────────────────────────────────────
+# Pix6 PWM outputs must be set to RCPassThru in QGroundControl (Advanced Params):
+#   SERVO1_FUNCTION = 51   → front_left_h   (MOTORS index 0)
+#   SERVO2_FUNCTION = 52   → back_left_h    (MOTORS index 1)
+#   SERVO3_FUNCTION = 53   → front_left_v   (MOTORS index 2)
+#   SERVO4_FUNCTION = 54   → front_right_v  (MOTORS index 3)
+#   SERVO5_FUNCTION = 55   → front_right_h  (MOTORS index 4)
+#   SERVO6_FUNCTION = 56   → back_right_h   (MOTORS index 5)
+#   SERVO7_FUNCTION = 57   → back_right_v   (MOTORS index 6)
+#   SERVO8_FUNCTION = 58   → back_left_v    (MOTORS index 7)
+# Also set RC_OVERRIDE_TIME to e.g. 3 (seconds) so overrides persist briefly
+# if the loop hiccups, but fail-safe to neutral on actual loss of comms.
+# ─────────────────────────────────────────────────────────────────────────────
 
 NEUTRAL_US = 1500
 MIN_US = 1100
@@ -341,64 +349,6 @@ def fmt_float_or_none(value, digits=2):
     if value is None:
         return "NA"
     return f"{value:.{digits}f}"
-
-
-# ============================================================
-# PCA9685 DRIVER
-# ============================================================
-
-class PCA9685:
-    MODE1 = 0x00
-    PRESCALE = 0xFE
-    LED0_ON_L = 0x06
-
-    def __init__(self, bus_num: int, address: int):
-        self.bus = SMBus(bus_num)
-        self.address = address
-        self.reset()
-        self.set_pwm_freq(PCA_FREQ_HZ)
-
-    def write8(self, reg, value):
-        self.bus.write_byte_data(self.address, reg, value & 0xFF)
-
-    def read8(self, reg):
-        return self.bus.read_byte_data(self.address, reg)
-
-    def reset(self):
-        self.write8(self.MODE1, 0x00)
-        time.sleep(0.01)
-
-    def set_pwm_freq(self, freq_hz):
-        prescaleval = 25_000_000.0
-        prescaleval /= 4096.0
-        prescaleval /= float(freq_hz)
-        prescaleval -= 1.0
-        prescale = int(math.floor(prescaleval + 0.5))
-
-        oldmode = self.read8(self.MODE1)
-        sleepmode = (oldmode & 0x7F) | 0x10
-
-        self.write8(self.MODE1, sleepmode)
-        self.write8(self.PRESCALE, prescale)
-        self.write8(self.MODE1, oldmode)
-        time.sleep(0.005)
-        self.write8(self.MODE1, oldmode | 0xA1)
-
-    def set_pwm_counts(self, channel, on_count, off_count):
-        reg = self.LED0_ON_L + 4 * channel
-        data = struct.pack("<HH", on_count & 0x0FFF, off_count & 0x0FFF)
-        self.bus.write_i2c_block_data(self.address, reg, list(data))
-
-    def set_pwm_us(self, channel, pulse_us):
-        pulse_us = int(clamp(pulse_us, MIN_US, MAX_US))
-        period_us = 1_000_000.0 / PCA_FREQ_HZ
-        counts = int(round((pulse_us / period_us) * 4096.0))
-        counts = int(clamp(counts, 0, 4095))
-        self.set_pwm_counts(channel, 0, counts)
-
-    def neutral_all(self):
-        for ch in range(16):
-            self.set_pwm_us(ch, NEUTRAL_US)
 
 
 # ============================================================
@@ -733,6 +683,78 @@ class MavlinkReader:
 
 
 # ============================================================
+# PIXHAWK RC OUTPUT
+# ============================================================
+
+class PixhawkOutput:
+    """
+    Drives the Pix6's PWM outputs via MAVLink RC_CHANNELS_OVERRIDE, bypassing
+    ArduSub's built-in motor mixer entirely.  All stabilization, mixing, and
+    gain logic stays in this Python process; the Pix6 is a dumb PWM output
+    board + IMU/depth sensor.
+
+    Requires SERVO1..8_FUNCTION = 51..58 (RCPassThru) in QGroundControl.
+    MOTORS index 0-7 maps directly to Pix6 outputs 1-8 (RC channels 1-8).
+    """
+
+    IGNORE = 65535  # MAVLink sentinel: leave this RC channel unchanged
+
+    def __init__(self, master):
+        self.master = master
+        self._last_heartbeat = 0.0
+
+    def _target(self):
+        ts = self.master.target_system or 1
+        tc = self.master.target_component or 1
+        return ts, tc
+
+    def _send_heartbeat_if_due(self):
+        """
+        Periodically send a GCS heartbeat so ArduSub accepts RC overrides.
+        MAVProxy also heartbeats, but this ensures our system ID is known.
+        """
+        now = time.time()
+        if now - self._last_heartbeat < 1.0:
+            return
+        self._last_heartbeat = now
+        try:
+            self.master.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                0, 0, 0,
+            )
+        except Exception:
+            pass
+
+    def send_pwm(self, pwm_by_name: dict):
+        """
+        Send one RC_CHANNELS_OVERRIDE frame covering all 8 thruster channels.
+        pwm_by_name maps motor name → PWM microseconds (1100-1900).
+        Channels not in pwm_by_name are set to IGNORE (unchanged on the FC).
+        """
+        self._send_heartbeat_if_due()
+
+        rc = [self.IGNORE] * 18
+        for motor_name, pwm in pwm_by_name.items():
+            idx = MOTORS[motor_name]          # 0-based → rc[0..7] = RC ch 1..8
+            rc[idx] = int(clamp(pwm, MIN_US, MAX_US))
+
+        ts, tc = self._target()
+        try:
+            self.master.mav.rc_channels_override_send(ts, tc, *rc)
+        except Exception as e:
+            print(f"[WARN] RC_CHANNELS_OVERRIDE send failed: {e}")
+
+    def neutral_all(self):
+        """Set all thruster channels to neutral (1500 µs)."""
+        self.send_pwm({name: NEUTRAL_US for name in MOTORS})
+
+    def stop_all(self):
+        """Alias for neutral_all — stops all thrusters without disarming."""
+        self.neutral_all()
+
+
+# ============================================================
 # UDP CONTROL RECEIVER
 # ============================================================
 
@@ -927,12 +949,21 @@ def calculate_direct_yaw_correction(yaw_hold_active, current_yaw_deg, hold_yaw_d
 # ============================================================
 
 def main():
-    pca = PCA9685(I2C_BUS, PCA9685_ADDR)
-    pca.neutral_all()
-    print("PCA9685 initialized. All channels neutral.")
-
     control = ControlReceiver(UDP_LISTEN_IP, UDP_LISTEN_PORT)
     mav = MavlinkReader(MAVLINK_UDP)
+
+    print("Waiting for MAVLink heartbeat from Pix6 via MAVProxy...")
+    hb = mav.master.wait_heartbeat(timeout=15)
+    if hb:
+        print(f"Heartbeat received — system {mav.master.target_system}, "
+              f"component {mav.master.target_component}.")
+    else:
+        print("[WARN] No heartbeat within 15 s. Continuing anyway — "
+              "check MAVProxy and Pix6 USB connection.")
+
+    pixhawk = PixhawkOutput(mav.master)
+    pixhawk.neutral_all()
+    print("Pix6 RC output ready. All channels set to neutral (1500 µs).")
 
     pitch_pid = SmoothPID(
         PITCH_KP,
@@ -1308,10 +1339,11 @@ def main():
             h_group = group_max(cmds, HORIZONTAL_MOTORS)
             v_group = group_max(cmds, VERTICAL_MOTORS)
 
-            for motor_name, cmd in cmds.items():
-                ch = MOTORS[motor_name]
-                pwm = command_to_pwm_us(motor_name, cmd)
-                pca.set_pwm_us(ch, pwm)
+            pwm_out = {
+                motor_name: command_to_pwm_us(motor_name, cmd)
+                for motor_name, cmd in cmds.items()
+            }
+            pixhawk.send_pwm(pwm_out)
 
             # ----------------------------------------------------
             # Telemetry back to sender.
@@ -1456,8 +1488,8 @@ def main():
             time.sleep(sleep_time)
 
     except KeyboardInterrupt:
-        print("\nStopping. Setting all PCA channels neutral.")
-        pca.neutral_all()
+        print("\nStopping. Setting all Pix6 channels to neutral.")
+        pixhawk.neutral_all()
         time.sleep(0.2)
 
 

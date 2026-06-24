@@ -18,4 +18,5 @@ pyserial>=3.5
 
 # ── Onboard (Raspberry Pi) ───────────────────────────────────
 # Install separately on the Pi:
-#   pip3 install smbus2 pymavlink adafruit-circuitpython-bno055 adafruit-circuitpython-servokit lgpio
+#   pip3 install pymavlink
+# smbus2 / adafruit-circuitpython-* are no longer required (PCA9685 replaced by Pix6 RC output).
