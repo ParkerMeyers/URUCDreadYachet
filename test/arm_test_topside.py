@@ -7,7 +7,7 @@ commands.  Sends UDP packets to arm_test_onboard.py running on the Pi.
 
 Usage:
     python test/arm_test_topside.py
-    python test/arm_test_topside.py --ip 192.168.2.249
+    python test/arm_test_topside.py --ip 192.168.69.100
 
 Commands at the prompt:
     1 1600      set AUX1 (J1) to 1600 µs
@@ -40,7 +40,7 @@ import socket
 import sys
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DEFAULT_PI_IP = "192.168.2.249"
+DEFAULT_PI_IP = "192.168.69.100"
 TEST_PORT     = 5011          # Must match arm_test_onboard.py
 CENTER_US     = 1500
 MIN_US        = 500

@@ -94,14 +94,14 @@ _ctrl_keepalive_seq = 0
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    "pi_ip":               "192.168.2.249",
+    "pi_ip":               "192.168.69.100",
     "pi_user":             "uruc",
     "pi_password":         "yahboom",
     "pi_ssh_port":         22,
     "pi_rov_path":         "/home/uruc/URUCDreadYachet",
     "serial_port":         "COM3" if IS_WINDOWS else "/dev/ttyACM0",
-    "camera1_url":         "http://192.168.2.249:8160",
-    "camera2_url":         "http://192.168.2.249:8161",
+    "camera1_url":         "http://192.168.69.100:8160",
+    "camera2_url":         "http://192.168.69.100:8161",
     "camera0_device":      "/dev/video0",
     "camera1_device":      "/dev/video2",
     "thrust_udp_port":     5005,

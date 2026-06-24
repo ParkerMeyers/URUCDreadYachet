@@ -55,7 +55,7 @@ except Exception:
 # USER CONFIG
 # ============================================================
 
-PI_IP_DEFAULT = "192.168.2.249"
+PI_IP_DEFAULT = "192.168.69.100"
 UDP_PORT = 5005
 TELEMETRY_PORT = 5006
 SEND_HZ = 50
