@@ -13,7 +13,7 @@ Confirmed AUX wiring:
     AUX4 (RC ch 12) → J1
     AUX5 (RC ch 13) → J3
     AUX6 (RC ch 14) → J4
-    AUX7 (RC ch 15) → Claw (continuous rotation, center 1515 µs)
+    AUX7 (RC ch 15) → Claw (continuous rotation; stop PWM configurable, default 1515 µs)
     AUX8 (RC ch 16) → spare (always 1500)
 
 Incoming UDP packet (from arm_sender.py), comma-separated:
@@ -54,8 +54,8 @@ BNO_INIT_RETRY_SEC = 1.0
 # ── Config ────────────────────────────────────────────────────────────────────
 UDP_PORT    = 5006
 MAVLINK_URL = MAVLINK_ONBOARD_ARM
-# Set True to drive GPIO17 servo power rail again (hardware removed for now).
-MOSFET_ENABLED = False
+# Set False to disable GPIO17 servo power rail without removing MOSFET code paths.
+MOSFET_ENABLED = True
 MOSFET_GPIO = 17
 MOSFET_PORT = 5007
 CENTER_US   = 1500
@@ -95,8 +95,10 @@ J6_OUT_MAX      = 1650
 J6_KP           = -2.0
 J6_DEADBAND_DEG = 3.0
 
-# Claw continuous rotation (center 1515 µs)
-CLAW_CENTER_US  = 1515
+# Claw continuous rotation — stop PWM configurable (synced from topside rov_config.json)
+CLAW_STOP_US_DEFAULT = 1515
+CLAW_IN_DEADBAND = 10     # ±µs from 1500 that counts as "centered" stick input
+_claw_stop_pwm   = CLAW_STOP_US_DEFAULT
 _LEVEL_NORMAL_RAW = [0.0180, -0.9993, 0.0337]
 # Wrist J6 angle: atan2 of two gravity components (rotation about Y, not Y tilt).
 # Previous asin(dot) tracked alignment with -Y — wrong DOF for wrist roll.
@@ -116,6 +118,11 @@ def _clamp(x, lo, hi):
 
 def _clamp_us(x):
     return int(_clamp(float(x), MIN_US, MAX_US))
+
+
+def _claw_stop_us() -> int:
+    with _lock:
+        return int(_claw_stop_pwm)
 
 
 def _normalize(v):
@@ -379,29 +386,29 @@ def _j6_manual_mode(claw_hold_snap=None) -> bool:
 
 
 def _claw_output_pwm(claw_input_us):
-    """Claw continuous rotation — centered stick/input → 1515 µs stop."""
+    """Claw continuous rotation — centered stick/input → configured stop PWM."""
     us = _clamp_us(claw_input_us)
-    if abs(us - CENTER_US) <= J6_IN_DEADBAND:
-        return CLAW_CENTER_US
+    if abs(us - CENTER_US) <= CLAW_IN_DEADBAND:
+        return _claw_stop_us()
     return us
 
 
 def _default_joint_us():
     vals = [CENTER_US] * 7
-    vals[CLAW_JOINT_IDX] = CLAW_CENTER_US
+    vals[CLAW_JOINT_IDX] = _claw_stop_us()
     return vals
 
 
 def _default_manual_aux_pwm():
-    """Neutral PWM for AUX1–7 in manual mode (AUX7 claw = 1515)."""
-    return [CENTER_US, CENTER_US, J6_OUT_CENTER, CENTER_US, CENTER_US, CENTER_US, CLAW_CENTER_US]
+    """Neutral PWM for AUX1–7 in manual mode (AUX7 claw uses configured stop)."""
+    return [CENTER_US, CENTER_US, J6_OUT_CENTER, CENTER_US, CENTER_US, CENTER_US, _claw_stop_us()]
 
 
 def _neutral_pwm_for_rc_ch(rc_ch: int) -> int:
     if rc_ch == J6_RC_CH:
         return J6_OUT_CENTER
     if rc_ch == CLAW_RC_CH:
-        return CLAW_CENTER_US
+        return _claw_stop_us()
     return CENTER_US
 
 
@@ -508,6 +515,7 @@ def _send_arm_telemetry(j6_pwm_out: int) -> None:
         "arm_enabled": bool(armed),
         "arm_imu_zero_offset": round(imu_zero, 2),
         "arm_imu_sign": round(imu_sign, 3),
+        "arm_claw_stop_us": int(_claw_stop_us()),
         "arm_rx_count": int(rx_count),
         "arm_hold_neutral": bool(hold_neutral),
         "arm_mavlink_ok": bool(_mavlink_up),
@@ -575,6 +583,15 @@ def _apply_arm_imu_cal_cmd(cmd: dict) -> None:
         sign = _j6_imu_sign
         zero = _j6_imu_zero_offset
     print(f"[arm] IMU cal → sign={sign:+.0f} zero={zero:.1f}°", flush=True)
+
+
+def _apply_arm_claw_stop_cmd(cmd: dict) -> None:
+    """Apply persisted claw stop PWM from topside config."""
+    global _claw_stop_pwm
+    stop = _clamp_us(cmd.get("stop_us", CLAW_STOP_US_DEFAULT))
+    with _lock:
+        _claw_stop_pwm = stop
+    print(f"[arm] Claw stop PWM → {stop} µs", flush=True)
 
 
 def _apply_arm_imu_zero_cmd(cmd: dict) -> None:
@@ -654,15 +671,13 @@ def _apply_manual_pwm_cmd(cmd: dict) -> None:
         with _lock:
             _manual_mode = True
             _manual_aux_pwm = _default_manual_aux_pwm()
-        print("[arm] Manual AUX: all centered (AUX7 claw → 1515 µs)", flush=True)
+        print(f"[arm] Manual AUX: all centered (AUX7 claw → {_claw_stop_us()} µs)", flush=True)
         return
 
     if "enabled" in cmd and cmd.get("aux") is None and cmd.get("joint") is None:
         enabled = bool(cmd.get("enabled"))
         with _lock:
             _manual_mode = enabled
-            if enabled:
-                _manual_aux_pwm = _default_manual_aux_pwm()
         print(f"[arm] Manual AUX mode {'ON — ignoring arm_sender UDP' if enabled else 'OFF'}",
               flush=True)
         return
@@ -727,6 +742,9 @@ def _arm_control_listener():
                 _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
             elif cmd.get("cmd") == "arm_imu_cal":
                 _apply_arm_imu_cal_cmd(cmd)
+                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+            elif cmd.get("cmd") == "arm_claw_stop":
+                _apply_arm_claw_stop_cmd(cmd)
                 _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
             elif cmd.get("cmd") == "arm_imu_zero":
                 _apply_arm_imu_zero_cmd(cmd)

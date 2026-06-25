@@ -46,7 +46,6 @@
   "mavproxy_out3": "tcpin:127.0.0.1:5763",
   "mavproxy_serial": "/dev/ttyACM0",
   "mosfet_control_port": "5007",
-  "mosfet_enabled": false,
   "pi_ip": "192.168.69.100",
   "pi_password": "yahboom",
   "pi_rov_path": "/home/uruc/URUCDreadYachet",

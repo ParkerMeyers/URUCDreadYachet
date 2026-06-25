@@ -281,16 +281,31 @@ async function stopTopside() {
 // CONTROL ACTIONS
 // ─────────────────────────────────────────────────────────────
 let _mosfetOn = false;
-let _mosfetEnabled = false;
+let _mosfetEnabled = true;
 
 async function toggleMosfet() {
-  if (!_mosfetEnabled) return;
+  if (!_mosfetEnabled) {
+    toast('MOSFET control disabled in config', 'warn');
+    return;
+  }
   _mosfetOn = !_mosfetOn;
-  await fetch('/api/mosfet', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ state: _mosfetOn }),
-  });
+  try {
+    const r = await fetch('/api/mosfet', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ state: _mosfetOn }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      _mosfetOn = !_mosfetOn;
+      toast(d.msg || 'MOSFET command failed', 'err');
+      return;
+    }
+  } catch (e) {
+    _mosfetOn = !_mosfetOn;
+    toast('MOSFET command failed', 'err');
+    return;
+  }
   updateMosfetUI(_mosfetOn);
   toast('MOSFET ' + (_mosfetOn ? 'ON' : 'OFF'), _mosfetOn ? 'ok' : '');
 }
@@ -671,9 +686,14 @@ function hideArmPresetsOutside(e) {
 
 // ── Manual AUX PWM (direct Pix6 AUX override on Pi) ───────────
 const MANUAL_AUX_LABELS = ['J5', 'J2', 'J6', 'J1', 'J3', 'J4', 'Claw'];
-const MANUAL_AUX_DEFAULTS = [1500, 1500, 1500, 1500, 1500, 1500, 1515];
+let _configClawStopUs = 1515;
+
+function manualAuxDefaults() {
+  return [1500, 1500, 1500, 1500, 1500, 1500, _configClawStopUs];
+}
+
 let _manualPwmEnabled = false;
-let _manualAuxPwm = MANUAL_AUX_DEFAULTS.slice();
+let _manualAuxPwm = manualAuxDefaults();
 
 function buildManualPwmGrid() {
   const grid = document.getElementById('manual-pwm-grid');
@@ -785,7 +805,7 @@ async function sendManualPwmLine() {
     toast(`${who} → ${d.pwm} µs`, 'ok');
     if (inp) inp.value = '';
   } else {
-    toast(d.msg || 'Invalid command — use: 6 1500', 'err');
+    toast(d.msg || 'Invalid command — use: claw 1510 or 7 1510', 'err');
   }
 }
 
@@ -799,11 +819,31 @@ async function centerManualPwm() {
   const d = await r.json();
   if (d.ok) {
     _manualPwmEnabled = !!d.enabled;
-    _manualAuxPwm = MANUAL_AUX_DEFAULTS.slice();
+    if (Array.isArray(d.aux_pwm)) _manualAuxPwm = d.aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
     updateManualPwmUI();
-    toast('All joints centered (claw → 1515 µs)', 'ok');
+    toast('All joints centered (claw uses saved stop PWM)', 'ok');
   } else {
     toast(d.msg || 'Center failed', 'err');
+  }
+}
+
+async function saveClawStopFromManual() {
+  if (!isRobotArmed()) {
+    toast('Arm disabled while DISARMED', 'warn');
+    return;
+  }
+  const clawVal = _manualAuxPwm[6];
+  const r = await fetch('/api/arm_claw_stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from_manual: true }),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    if (d.stop_us != null) _configClawStopUs = parseInt(d.stop_us, 10) || clawVal;
+    toast(`Claw stop saved → ${d.stop_us} µs (centered stick uses this)`, 'ok');
+  } else {
+    toast(d.msg || 'Save claw stop failed', 'err');
   }
 }
 
@@ -1672,6 +1712,7 @@ function updateStatus() {
     updateMosfetUI(_mosfetOn);
   }
   if (typeof s.claw_hold === 'boolean') { _ctrlState.claw_hold = s.claw_hold; updateFlagUI(); }
+  if (typeof s.arm_claw_stop_us === 'number') { _configClawStopUs = s.arm_claw_stop_us; }
   if (typeof s.preset_running === 'boolean') {
     _presetRunning = s.preset_running;
   }

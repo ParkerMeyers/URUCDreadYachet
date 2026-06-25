@@ -252,7 +252,7 @@
   <!-- Control bar -->
   <div class="controlbar">
 
-    <div id="mosfet-section" class="hidden">
+    <div id="mosfet-section">
     <span class="control-label">Power</span>
     <div class="mosfet-toggle" id="mosfet-toggle" onclick="toggleMosfet()">
       <div class="mosfet-indicator"></div>
@@ -604,14 +604,16 @@
       </div>
       <div class="manual-pwm-cmd-row">
         <label for="manual-pwm-input">Command</label>
-        <input id="manual-pwm-input" type="text" placeholder="J1 1500  or  4 1500  or  claw 1600"
+        <input id="manual-pwm-input" type="text" placeholder="claw 1510  or  7 1510  or  J1 1500"
                onkeydown="if(event.key==='Enter')sendManualPwmLine()"/>
         <button class="btn btn-primary" onclick="sendManualPwmLine()">Send</button>
         <button class="btn btn-secondary" onclick="centerManualPwm()">Center all</button>
+        <button class="btn btn-secondary" onclick="saveClawStopFromManual()">Save claw stop</button>
       </div>
       <div class="manual-pwm-grid" id="manual-pwm-grid"></div>
       <p class="manual-pwm-hint">
-        By joint: J1→AUX4 · J2→AUX2 · J3→AUX5 · J4→AUX6 · J5→AUX1 · J6→AUX3 · Claw→AUX7 (1515 µs stop)
+        Claw (AUX7): use <strong>claw 1510</strong> or <strong>7 1510</strong>. Tune until no drift, then <strong>Save claw stop</strong>.
+        Centered stick/command maps to that stop PWM automatically.
       </p>
     </div>
   </div>

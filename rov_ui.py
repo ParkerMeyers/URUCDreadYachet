@@ -114,10 +114,17 @@ ARM_PRESET_DELAY_MAX_SEC = 4.0
 
 # Pix6 AUX1–7 joint labels (matches onboard/new_ar.py AUX_LABELS)
 MANUAL_AUX_LABELS = ["J5", "J2", "J6", "J1", "J3", "J4", "Claw"]
-MANUAL_AUX_DEFAULTS = [1500, 1500, 1500, 1500, 1500, 1500, 1515]  # AUX7 claw stop
+# AUX7 (Claw) stop PWM comes from arm_claw_stop_us in config — see _manual_aux_defaults()
+MANUAL_AUX_DEFAULTS = [1500, 1500, 1500, 1500, 1500, 1500, 1515]  # legacy fallback
 # Joint index 1–7 (J1..J6, Claw) → AUX port on Pix6
 JOINT_TO_AUX = {1: 4, 2: 2, 3: 5, 4: 6, 5: 1, 6: 3, 7: 7}
 AUX_TO_JOINT = {v: k for k, v in JOINT_TO_AUX.items()}
+
+
+def _manual_aux_defaults() -> list[int]:
+    """Default manual AUX PWM with configured claw stop."""
+    claw_stop = int(config.get("arm_claw_stop_us", 1515))
+    return [1500, 1500, 1500, 1500, 1500, 1500, claw_stop]
 
 DEFAULT_ARM_PRESETS = {
     "stow": {
@@ -152,10 +159,11 @@ DEFAULT_CONFIG = {
     "telemetry_port":      5006,
     "arm_udp_port":        5006,
     "mosfet_control_port": 5007,
-    "mosfet_enabled":      False,  # set True + new_ar.MOSFET_ENABLED to restore GPIO rail
+    "mosfet_enabled":      True,
     "arm_telemetry_port":  5008,
     "arm_imu_sign":        -1.0,
     "arm_imu_zero_offset": -154.0,
+    "arm_claw_stop_us":    1515,
     "colmap_command":      "python3 colmap_run.py",
     "crabs_command":       "python3 crabs.py",
     "mavproxy_bin":        "/home/uruc/mav_env/bin/mavproxy.py",
@@ -520,8 +528,10 @@ def _parse_manual_pwm_line(line: str) -> tuple[int, int, str] | None:
         return None
 
     token = parts[0].strip().lower()
-    if token == "claw":
+    if token in ("claw",):
         return 7, pwm, "Claw"
+    if token in ("j6", "wrist"):
+        return JOINT_TO_AUX[6], pwm, "J6"
     if token.startswith("j") and token[1:].isdigit():
         joint_i = int(token[1:])
         if joint_i not in JOINT_TO_AUX:
@@ -617,7 +627,7 @@ STATE = {
     "preset_running":        False,
     "preset_active_name":    "",
     "manual_pwm_enabled":    False,
-    "manual_aux_pwm":        list(MANUAL_AUX_DEFAULTS),
+    "manual_aux_pwm":        list(_manual_aux_defaults()),
     "claw_hold":             True,
     "telemetry": {
         "rx_state":                "NO_TELEMETRY",
@@ -1396,6 +1406,7 @@ def _on_onboard_stack_ready() -> None:
     _subscribe_arm_telemetry()
     _sync_arm_claw_hold()
     _sync_arm_imu_cal()
+    _sync_arm_claw_stop()
     _apply_disarmed_arm_lockout()
     socketio.emit("telemetry", _telemetry_emit_payload())
     emit_status()
@@ -1408,6 +1419,7 @@ def _on_onboard_stack_ready() -> None:
             _subscribe_arm_telemetry()
             _sync_arm_claw_hold()
             _sync_arm_imu_cal()
+            _sync_arm_claw_stop()
             _sync_arm_enable()
             _sync_arm_power()
 
@@ -1499,6 +1511,8 @@ def _update_arm_telemetry_from_json(pkt: dict):
         tel["arm_imu_zero_offset"] = float(pkt["arm_imu_zero_offset"])
     if pkt.get("arm_imu_sign") is not None:
         tel["arm_imu_sign"] = float(pkt["arm_imu_sign"])
+    if pkt.get("arm_claw_stop_us") is not None:
+        tel["arm_claw_stop_us"] = int(pkt["arm_claw_stop_us"])
     STATE["last_arm_telemetry_time"] = time.time()
     socketio.emit("telemetry", _telemetry_emit_payload())
 
@@ -1508,6 +1522,14 @@ def _sync_arm_claw_hold():
     _send_pi_arm_control({
         "cmd": "claw_hold",
         "enabled": bool(STATE.get("claw_hold", True)),
+    })
+
+
+def _sync_arm_claw_stop():
+    """Push persisted claw stop PWM to new_ar.py."""
+    _send_pi_arm_control({
+        "cmd": "arm_claw_stop",
+        "stop_us": int(config.get("arm_claw_stop_us", 1515)),
     })
 
 
@@ -1547,6 +1569,7 @@ def _start_arm_telemetry_subscribe_loop():
             _subscribe_arm_telemetry()
             _sync_arm_claw_hold()
             _sync_arm_imu_cal()
+            _sync_arm_claw_stop()
             _sync_arm_enable()
             _sync_arm_power()
             time.sleep(5.0)
@@ -1573,6 +1596,7 @@ def _start_arm_telemetry_listener():
         _subscribe_arm_telemetry()
         _sync_arm_claw_hold()
         _sync_arm_imu_cal()
+        _sync_arm_claw_stop()
         _sync_arm_enable()
         _sync_arm_power()
         while True:
@@ -1807,8 +1831,9 @@ def emit_status():
         "preset_running":        STATE.get("preset_running", False),
         "preset_active_name":    STATE.get("preset_active_name", ""),
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
-        "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS)),
+        "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(_manual_aux_defaults())),
         "claw_hold":             STATE.get("claw_hold", True),
+        "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", 1515)),
         "arm_motion_enabled":    _robot_armed(),
         "arm_pi_enabled":        STATE.get("telemetry", {}).get("arm_enabled"),
     })
@@ -2567,6 +2592,40 @@ def api_arm_imu_zero():
     })
 
 
+@app.route("/api/arm_claw_stop", methods=["GET", "POST"])
+def api_arm_claw_stop():
+    if request.method == "GET":
+        return jsonify({
+            "ok": True,
+            "stop_us": int(config.get("arm_claw_stop_us", 1515)),
+        })
+
+    if not _robot_armed():
+        return jsonify({"ok": False, "msg": "Arm disabled while DISARMED"}), 403
+
+    data = request.get_json(force=True) or {}
+    stop_us = data.get("stop_us")
+    if stop_us is None and data.get("from_manual"):
+        aux = list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults())))
+        if len(aux) < 7:
+            return jsonify({"ok": False, "msg": "No manual AUX7 (Claw) value"}), 400
+        stop_us = aux[6]
+    try:
+        stop_us = _clamp_arm_pwm(stop_us)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "stop_us must be 500–2500"}), 400
+
+    config["arm_claw_stop_us"] = int(stop_us)
+    save_config_file()
+    ok, msg = _send_pi_arm_control({"cmd": "arm_claw_stop", "stop_us": int(stop_us)})
+    emit_status()
+    return jsonify({
+        "ok": ok,
+        "msg": msg or f"Claw stop PWM set to {int(stop_us)} µs",
+        "stop_us": int(stop_us),
+    })
+
+
 @app.route("/api/claw_hold", methods=["GET", "POST"])
 def api_claw_hold():
     if request.method == "GET":
@@ -2611,7 +2670,7 @@ def api_manual_pwm_get():
     return jsonify({
         "ok": True,
         "enabled": bool(STATE.get("manual_pwm_enabled")),
-        "aux_pwm": list(STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS))),
+        "aux_pwm": list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults()))),
         "aux_labels": MANUAL_AUX_LABELS,
     })
 
@@ -2633,27 +2692,25 @@ def api_manual_pwm():
         ok, msg = _send_pi_arm_control({"cmd": "manual_pwm", "enabled": enabled})
         if ok:
             STATE["manual_pwm_enabled"] = enabled
-            if enabled:
-                STATE["manual_aux_pwm"] = list(MANUAL_AUX_DEFAULTS)
         emit_status()
         return jsonify({
             "ok": ok,
             "msg": msg,
             "enabled": STATE.get("manual_pwm_enabled", False),
-            "aux_pwm": list(STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS))),
+            "aux_pwm": list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults()))),
         })
 
     if action == "center":
         ok, msg = _send_pi_arm_control({"cmd": "manual_pwm", "center": True, "enabled": True})
         if ok:
             STATE["manual_pwm_enabled"] = True
-            STATE["manual_aux_pwm"] = list(MANUAL_AUX_DEFAULTS)
+            STATE["manual_aux_pwm"] = list(_manual_aux_defaults())
         emit_status()
         return jsonify({
             "ok": ok,
             "msg": msg,
             "enabled": STATE.get("manual_pwm_enabled", False),
-            "aux_pwm": list(STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS))),
+            "aux_pwm": list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults()))),
         })
 
     if action == "set":
@@ -2682,7 +2739,7 @@ def api_manual_pwm():
         })
         if ok:
             STATE["manual_pwm_enabled"] = True
-            aux_list = list(STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS)))
+            aux_list = list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults())))
             while len(aux_list) < 7:
                 aux_list.append(1500)
             aux_list[aux_i - 1] = pwm_i
@@ -2695,7 +2752,7 @@ def api_manual_pwm():
             "pwm": pwm_i,
             "label": label,
             "enabled": STATE.get("manual_pwm_enabled", False),
-            "aux_pwm": list(STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS))),
+            "aux_pwm": list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults()))),
         })
 
     return jsonify({"ok": False, "msg": "action must be toggle, set, or center"})
@@ -2959,8 +3016,9 @@ def api_status():
         "preset_running":        STATE.get("preset_running", False),
         "preset_active_name":    STATE.get("preset_active_name", ""),
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
-        "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS)),
+        "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(_manual_aux_defaults())),
         "claw_hold":             STATE.get("claw_hold", True),
+        "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", 1515)),
         "arm_motion_enabled":    _robot_armed(),
         "arm_pi_enabled":        STATE.get("telemetry", {}).get("arm_enabled"),
     })
