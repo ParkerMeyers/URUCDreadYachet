@@ -19,7 +19,6 @@ let _telemetryRecording = false;
 let _videoRecording = false;
 let _videoRecordSession = '';
 let _videoRecordMode = '';
-let _lastBatteryToast = '';
 let _missionPollTimer = null;
 let socket = null;
 
@@ -160,7 +159,6 @@ function getCfg() {
                  'camera0_device','camera1_device',
                  'thrust_udp_port','telemetry_port','arm_udp_port',
                  'mosfet_control_port','colmap_command','crabs_command',
-                 'battery_warn_v','battery_crit_v',
                  'mavproxy_bin','mavproxy_serial','mavproxy_baud',
                  'mavproxy_out1','mavproxy_out2'];
   const obj = {};
@@ -1042,11 +1040,6 @@ function drawForwardTelemetryPanel(ctx, W, H, t) {
   const stabOn = !!t.stabilize;
   drawTelemetryLine(ctx, x, y, 'STAB  ', stabOn ? 'ON' : 'OFF',
     stabOn ? 'rgba(0,224,138,0.95)' : 'rgba(220,230,255,0.85)', base, base);
-  y += lineH;
-  const battCls = _batteryClass(t.battery_voltage_v);
-  const battColor = battCls === 'val-warn' ? 'rgba(255,179,32,0.95)' : 'rgba(0,224,138,0.95)';
-  drawTelemetryLine(ctx, x, y, 'BATT  ', t.battery_voltage_v != null ? fmtNum(t.battery_voltage_v, 2, 'V') : '--',
-    battColor, base, base);
   ctx.restore();
 }
 
@@ -1366,7 +1359,6 @@ async function takeSnapshot(camNum) {
       `DreadYachet ROV — ${camNames[camNum] || camNum} cam`,
       `Depth: ${fmtNum(t.depth_m, 2, 'm')}  Yaw: ${fmtNum(t.yaw_deg, 1, '°')}`,
       `Roll: ${fmtNum(t.roll_deg, 1, '°')}  Pitch: ${fmtNum(t.pitch_deg, 1, '°')}`,
-      `Battery: ${fmtNum(t.battery_voltage_v, 2, 'V')}  ${fmtNum(t.battery_current_a, 1, 'A')}`,
       `State: ${t.rx_state || '--'}  ${stamp}`,
     ];
     ctx.fillStyle = 'rgba(0,0,0,0.55)';
@@ -1831,13 +1823,6 @@ function updateTelemetry() {
     stabEl.textContent = t.stabilize ? 'ON' : 'OFF';
     stabEl.className = t.stabilize ? 'val-hi' : '';
   }
-  const battCam = document.getElementById('cam-batt');
-  if (battCam) {
-    battCam.textContent = t.battery_voltage_v != null ? fmtNum(t.battery_voltage_v, 2) : '--';
-    battCam.className = _batteryClass(t.battery_voltage_v);
-  }
-
-  _checkBatteryAlerts(t.battery_voltage_v);
 
   // Arm camera IMU overlay readouts
   const armPktFresh = t.arm_telemetry_age_sec == null || t.arm_telemetry_age_sec <= 5.0;
@@ -1884,14 +1869,6 @@ function updateTelemetry() {
   setText('tel-press',  t.pressure_hpa ? fmtNum(t.pressure_hpa, 0, 'hPa') : '--');
   setText('tel-temp',   t.temperature_c ? fmtNum(t.temperature_c, 1, '°C') : '--');
 
-  const battV = document.getElementById('tel-batt-v');
-  if (battV) {
-    battV.textContent = t.battery_voltage_v != null ? fmtNum(t.battery_voltage_v, 2, 'V') : '--';
-    battV.className = 'tc-val ' + _batteryTcClass(t.battery_voltage_v);
-  }
-  setText('tel-batt-a',   t.battery_current_a != null ? fmtNum(t.battery_current_a, 1, 'A') : '--');
-  setText('tel-batt-pct', t.battery_remaining_pct != null ? fmtNum(t.battery_remaining_pct, 0, '%') : '--');
-
   const linkEl = document.getElementById('tel-link');
   const lh = t.link_health || _status.link_health;
   if (linkEl && lh) {
@@ -1921,38 +1898,6 @@ function updateCtrlCmdsFromTelemetry() {
 function setText(id, val) {
   const el = document.getElementById(id);
   if (el) el.textContent = val;
-}
-
-function _batteryClass(voltage) {
-  if (voltage == null) return '';
-  const warn = parseFloat(document.getElementById('cfg-battery_warn_v')?.value) || 12.0;
-  const crit = parseFloat(document.getElementById('cfg-battery_crit_v')?.value) || 11.0;
-  if (voltage <= crit) return 'val-warn';
-  if (voltage <= warn) return 'val-warn';
-  return 'val-hi';
-}
-
-function _batteryTcClass(voltage) {
-  if (voltage == null) return '';
-  const warn = parseFloat(document.getElementById('cfg-battery_warn_v')?.value) || 12.0;
-  const crit = parseFloat(document.getElementById('cfg-battery_crit_v')?.value) || 11.0;
-  if (voltage <= crit) return 'bad';
-  if (voltage <= warn) return 'warn';
-  return 'good';
-}
-
-function _checkBatteryAlerts(voltage) {
-  if (voltage == null) return;
-  const warn = parseFloat(document.getElementById('cfg-battery_warn_v')?.value) || 12.0;
-  const crit = parseFloat(document.getElementById('cfg-battery_crit_v')?.value) || 11.0;
-  let level = '';
-  if (voltage <= crit) level = 'crit';
-  else if (voltage <= warn) level = 'warn';
-  if (!level || level === _lastBatteryToast) return;
-  _lastBatteryToast = level;
-  if (level === 'crit') toast(`LOW BATTERY ${voltage.toFixed(2)}V — critical`, 'err');
-  else toast(`Battery low ${voltage.toFixed(2)}V`, 'warn');
-  if (voltage > warn) _lastBatteryToast = '';
 }
 
 // ─────────────────────────────────────────────────────────────

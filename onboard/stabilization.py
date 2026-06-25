@@ -506,12 +506,6 @@ class MavlinkReader:
         self.last_pressure_debug_print = 0.0
         self._connected_at = 0.0
 
-        self.battery_voltage_v = None
-        self.battery_current_a = None
-        self.battery_remaining_pct = None
-        self.battery_consumed_mah = None
-        self.last_battery_update = 0.0
-
         self._connect()
 
         print(
@@ -641,8 +635,6 @@ class MavlinkReader:
             (msg_id("MAVLINK_MSG_ID_SCALED_PRESSURE", 29), 50000),
             (msg_id("MAVLINK_MSG_ID_SCALED_PRESSURE2", 137), 50000),
             (msg_id("MAVLINK_MSG_ID_SCALED_PRESSURE3", 143), 50000),
-            (msg_id("MAVLINK_MSG_ID_SYS_STATUS", 1), 1000000),
-            (msg_id("MAVLINK_MSG_ID_BATTERY_STATUS", 147), 1000000),
         ]
 
         for message_id, interval_us in interval_requests:
@@ -837,37 +829,6 @@ class MavlinkReader:
                 float(msg.press_abs),
                 temperature_raw,
             )
-            return True
-
-        if msg_type == "SYS_STATUS":
-            voltage_mv = int(getattr(msg, "voltage_battery", -1))
-            current_ca = int(getattr(msg, "current_battery", -1))
-            remaining = int(getattr(msg, "battery_remaining", -1))
-            if voltage_mv > 0:
-                self.battery_voltage_v = voltage_mv / 1000.0
-            if current_ca != -1:
-                self.battery_current_a = current_ca / 100.0
-            if 0 <= remaining <= 100:
-                self.battery_remaining_pct = float(remaining)
-            self.last_battery_update = time.time()
-            return True
-
-        if msg_type == "BATTERY_STATUS":
-            voltages = getattr(msg, "voltages", None)
-            if voltages and len(voltages) > 0 and int(voltages[0]) != 65535:
-                total_mv = sum(int(v) for v in voltages if int(v) not in (-1, 65535))
-                if total_mv > 0:
-                    self.battery_voltage_v = total_mv / 1000.0
-            current_ca = int(getattr(msg, "current_battery", -1))
-            if current_ca != -1:
-                self.battery_current_a = current_ca / 100.0
-            consumed = int(getattr(msg, "current_consumed", -1))
-            if consumed != -1:
-                self.battery_consumed_mah = float(consumed)
-            remaining = int(getattr(msg, "battery_remaining", -1))
-            if 0 <= remaining <= 100:
-                self.battery_remaining_pct = float(remaining)
-            self.last_battery_update = time.time()
             return True
 
         return False
@@ -1709,11 +1670,6 @@ def main():
                     "pressure_hpa": mav.pressure_hpa,
                     "surface_pressure_hpa": mav.surface_pressure_hpa,
                     "pressure_temperature_c": mav.pressure_temperature_c,
-
-                    "battery_voltage_v": mav.battery_voltage_v,
-                    "battery_current_a": mav.battery_current_a,
-                    "battery_remaining_pct": mav.battery_remaining_pct,
-                    "battery_consumed_mah": mav.battery_consumed_mah,
 
                     "roll_deg": mav.filtered_roll_deg,
                     "pitch_deg": mav.filtered_pitch_deg,

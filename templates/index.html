@@ -86,10 +86,6 @@
         <input id="cfg-colmap_command" type="text" value="python3 colmap_run.py"/></div>
       <div class="field"><label>Crabs Command (on Pi)</label>
         <input id="cfg-crabs_command" type="text" value="python3 crabs.py"/></div>
-      <div class="field"><label>Battery Warn Voltage (V)</label>
-        <input id="cfg-battery_warn_v" type="text" value="12.0"/></div>
-      <div class="field"><label>Battery Critical Voltage (V)</label>
-        <input id="cfg-battery_crit_v" type="text" value="11.0"/></div>
     </div>
 
   </div>
@@ -233,7 +229,6 @@
         <div>ROLL  <span class="val-hi" id="cam-roll">--</span>°</div>
         <div>PITCH <span class="val-hi" id="cam-pitch">--</span>°</div>
         <div>STAB  <span id="cam-stab">--</span></div>
-        <div>BATT  <span class="val-hi" id="cam-batt">--</span>V</div>
       </div>
     </div>
 
@@ -376,18 +371,6 @@
     <div class="telem-cell">
       <span class="tc-label">Temp</span>
       <span class="tc-val" id="tel-temp">--</span>
-    </div>
-    <div class="telem-cell">
-      <span class="tc-label">Batt V</span>
-      <span class="tc-val" id="tel-batt-v">--</span>
-    </div>
-    <div class="telem-cell">
-      <span class="tc-label">Batt A</span>
-      <span class="tc-val" id="tel-batt-a">--</span>
-    </div>
-    <div class="telem-cell">
-      <span class="tc-label">Batt %</span>
-      <span class="tc-val" id="tel-batt-pct">--</span>
     </div>
     <div class="telem-cell">
       <span class="tc-label">Link</span>

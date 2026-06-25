@@ -157,8 +157,6 @@ DEFAULT_CONFIG = {
     "arm_imu_zero_offset": -154.0,
     "colmap_command":      "python3 colmap_run.py",
     "crabs_command":       "python3 crabs.py",
-    "battery_warn_v":      12.0,
-    "battery_crit_v":      11.0,
     "mavproxy_bin":        "/home/uruc/mav_env/bin/mavproxy.py",
     "mavproxy_serial":     "/dev/ttyACM0",
     "mavproxy_baud":       "115200",
@@ -540,7 +538,6 @@ CONFIG_PATH = ROV_ROOT / "rov_config.json"
 
 TELEMETRY_CSV_FIELDS = [
     "time", "state", "depth_m", "hold_depth_m", "yaw_deg", "roll_deg", "pitch_deg",
-    "battery_voltage_v", "battery_current_a", "battery_remaining_pct",
     "pressure_hpa", "pressure_temperature_c", "stabilize",
     "depth_hold_active", "yaw_hold_active", "gain_percent",
     "control_timeout", "mavlink_link_dead",
@@ -636,10 +633,6 @@ STATE = {
         "v_group":                 0.0,
         "pressure_hpa":            None,
         "temperature_c":           None,
-        "battery_voltage_v":       None,
-        "battery_current_a":       None,
-        "battery_remaining_pct":   None,
-        "battery_consumed_mah":    None,
         "control_timeout":         False,
         "attitude_stale":          False,
         "depth_stale":             False,
@@ -1442,10 +1435,6 @@ def _update_telemetry_from_json(pkt: dict):
     tel["v_group"]                 = float(pkt.get("vertical_group", 0.0))
     tel["pressure_hpa"]            = pkt.get("pressure_hpa")
     tel["temperature_c"]           = pkt.get("pressure_temperature_c")
-    tel["battery_voltage_v"]       = pkt.get("battery_voltage_v")
-    tel["battery_current_a"]       = pkt.get("battery_current_a")
-    tel["battery_remaining_pct"]   = pkt.get("battery_remaining_pct")
-    tel["battery_consumed_mah"]    = pkt.get("battery_consumed_mah")
     tel["control_timeout"]         = bool(pkt.get("control_timeout", False))
     tel["attitude_stale"]          = bool(pkt.get("attitude_stale", False))
     tel["depth_stale"]             = bool(pkt.get("depth_stale", False))
