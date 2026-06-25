@@ -468,11 +468,29 @@ class SSHManager:
             for ln in recent
         )
 
+    def _device_exists(self, path: str) -> bool:
+        out, _, _ = self.exec(f"test -e {shlex.quote(path)} && echo exists")
+        return "exists" in out
+
+    def mavproxy_serial_candidates(self):
+        """Ordered serial ports to try: configured first, then other ttyACM/ttyUSB."""
+        preferred = config.get("mavproxy_serial", "/dev/ttyACM0")
+        alts = sorted(self.list_serial_candidates())
+        ordered = []
+        if self._device_exists(preferred):
+            ordered.append(preferred)
+        for dev in alts:
+            if dev not in ordered:
+                ordered.append(dev)
+        return ordered
+
     def serial_port_exists(self):
         """True when the configured Pix6 serial device node is present."""
         ser = config.get("mavproxy_serial", "/dev/ttyACM0")
-        out, _, _ = self.exec(f"test -e {shlex.quote(ser)} && echo exists")
-        return "exists" in out
+        return self._device_exists(ser)
+
+    def any_serial_port_exists(self):
+        return bool(self.mavproxy_serial_candidates())
 
     def list_serial_candidates(self):
         """Return ttyACM/ttyUSB device paths visible on the Pi."""
@@ -480,6 +498,58 @@ class SSHManager:
             "ls -1 /dev/ttyACM* /dev/ttyUSB* 2>/dev/null || true"
         )
         return [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+
+    def wait_for_mavproxy_fc(self, on_wait=None) -> tuple[bool, str]:
+        """Wait until MAVProxy reports the FC online, or fail fast on no link."""
+        time.sleep(2.0)
+        fc_deadline = time.time() + 45.0
+        fc_wait_i = 0
+        miss_running = 0
+        ser = config.get("mavproxy_serial", "/dev/ttyACM0")
+
+        while time.time() < fc_deadline:
+            if self.is_mavproxy_running():
+                miss_running = 0
+            else:
+                miss_running += 1
+                if miss_running >= 3:
+                    return False, "MAVProxy exited — check /tmp/rov_mavproxy.log on Pi"
+
+            if self.is_mavproxy_fc_connected():
+                return True, f"MAVProxy running — Pix6 online on {ser}"
+
+            fc_wait_i += 1
+            diag = self.mavproxy_diagnosis() if fc_wait_i >= 2 else ""
+            wait_msg = f"Waiting for Pix6 on {ser}... ({fc_wait_i})"
+            if diag:
+                wait_msg += f" — {diag}"
+
+            if fc_wait_i >= 4 and not self._device_exists(ser):
+                return False, f"USB port {ser} disappeared — {self.mavproxy_diagnosis()}"
+            if fc_wait_i >= 6 and self.mavproxy_recent_no_link():
+                return False, f"No FC on {ser} — {self.mavproxy_diagnosis()}"
+
+            if on_wait:
+                on_wait(wait_msg)
+            time.sleep(2.0)
+
+        return False, (
+            "MAVProxy running but Pix6 not detected — "
+            + self.mavproxy_diagnosis()
+        )
+
+    def mavproxy_recent_no_link(self):
+        """True when the last few MAVProxy log lines are all 'no link'."""
+        out, _, _ = self.exec(
+            "tail -n 5 /tmp/rov_mavproxy.log 2>/dev/null || true"
+        )
+        lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+        if len(lines) < 3:
+            return False
+        return all(
+            "no link" in ln.lower() or "link down" in ln.lower()
+            for ln in lines[-3:]
+        )
 
     def mavproxy_diagnosis(self):
         """Human-readable summary when MAVProxy has no FC link."""
@@ -1018,7 +1088,11 @@ def api_start_onboard():
         return jsonify({"ok": False, "msg": "SSH not connected"})
 
     if STATE["onboard_starting"]:
-        return jsonify({"ok": False, "msg": "Onboard start already in progress"})
+        return jsonify({
+            "ok": True,
+            "in_progress": True,
+            "msg": "Onboard start already in progress — see progress log below",
+        })
 
     STATE["onboard_starting"] = True
     STATE["onboard_progress"] = []
@@ -1031,73 +1105,101 @@ def api_start_onboard():
             ok_sync, msg_sync = ssh.sync_onboard_files()
             _emit_onboard_progress("sync", "done" if ok_sync else "error", msg_sync)
 
-            # Step 1: MAVProxy (reuse if already healthy — prevents motor/arm glitch on retry)
+            # Step 1: MAVProxy (try configured port, then auto-detect ttyACM/ttyUSB)
             normalize_onboard_config()
-            _emit_onboard_progress("mavproxy", "starting", "Launching MAVProxy bridge...")
-            ok_m, msg_m = ssh.ensure_mavproxy()
-            fresh_mav = ok_m and "already running" not in msg_m
-            if ok_m and fresh_mav:
-                ok_m, msg_m = _wait_onboard_running(
-                    ssh.is_mavproxy_running, "MAVProxy", timeout_sec=30.0
+            preferred_serial = config.get("mavproxy_serial", "/dev/ttyACM0")
+            serial_candidates = ssh.mavproxy_serial_candidates()
+            if not serial_candidates:
+                diag = ssh.mavproxy_diagnosis()
+                _emit_onboard_progress("mavproxy", "error", diag)
+                _emit_onboard_progress(
+                    "complete", "error",
+                    f"✕ Pix6 USB missing — {diag}",
                 )
+                emit_status()
+                return
+
+            ok_m = False
+            msg_m = ""
+            for attempt, ser in enumerate(serial_candidates):
+                config["mavproxy_serial"] = ser
+                auto_note = ""
+                if ser != preferred_serial:
+                    auto_note = f" (auto-selected; {preferred_serial} not found)"
+
+                if attempt == 0:
+                    _emit_onboard_progress(
+                        "mavproxy", "starting",
+                        f"Launching MAVProxy on {ser}{auto_note}...",
+                    )
+                    ok_m, msg_m = ssh.ensure_mavproxy()
+                    fresh_mav = ok_m and "already running" not in msg_m
+                    if ok_m and fresh_mav:
+                        ok_m, msg_m = _wait_onboard_running(
+                            ssh.is_mavproxy_running, "MAVProxy", timeout_sec=30.0
+                        )
+                else:
+                    _emit_onboard_progress(
+                        "mavproxy", "wait",
+                        f"No FC on previous port — trying {ser}...",
+                    )
+                    ok_m, msg_m = ssh._start_mavproxy_fresh()
+                    if ok_m:
+                        ok_m, msg_m = _wait_onboard_running(
+                            ssh.is_mavproxy_running, "MAVProxy", timeout_sec=30.0
+                        )
+
+                if not ok_m:
+                    break
+
+                fc_ok, fc_msg = ssh.wait_for_mavproxy_fc(
+                    on_wait=lambda w: _emit_onboard_progress("mavproxy", "wait", w),
+                )
+                ok_m = fc_ok
+                msg_m = fc_msg
+                if ok_m:
+                    if ser != preferred_serial:
+                        msg_m += f" — saved {ser} for this session (update launch config to keep)"
+                    break
+
+                if attempt + 1 < len(serial_candidates):
+                    ssh.exec(
+                        "pkill -f mavproxy 2>/dev/null; "
+                        "pkill -f MAVProxy 2>/dev/null; sleep 0.5"
+                    )
+
             if not ok_m:
                 mav_log = ssh.get_mavproxy_log(lines=5)
                 if mav_log:
                     last_line = mav_log.strip().splitlines()[-1][:150]
                     msg_m = f"{msg_m} | Log: {last_line}"
                 STATE["onboard_mavproxy"] = ok_m
+                _emit_onboard_progress("mavproxy", "error", msg_m)
                 _emit_onboard_progress(
-                    "mavproxy", "done" if ok_m else "error", msg_m
+                    "complete", "error",
+                    "✕ Failed: MAVProxy / Pix6 — fix serial link then retry",
                 )
                 emit_status()
-            elif ok_m:
-                time.sleep(2.0)  # grace period — pgrep may lag right after launch
-                fc_deadline = time.time() + 45.0
-                fc_wait_i = 0
-                miss_running = 0
-                while time.time() < fc_deadline:
-                    if ssh.is_mavproxy_running():
-                        miss_running = 0
-                    else:
-                        miss_running += 1
-                        if miss_running >= 3:
-                            ok_m = False
-                            msg_m = "MAVProxy exited — check /tmp/rov_mavproxy.log on Pi"
-                            break
-                    if ssh.is_mavproxy_fc_connected():
-                        msg_m = "MAVProxy running — Pix6 online"
-                        break
-                    fc_wait_i += 1
-                    _emit_onboard_progress(
-                        "mavproxy", "wait",
-                        f"Waiting for Pix6 heartbeat... ({fc_wait_i})"
-                    )
-                    time.sleep(2.0)
-                else:
-                    if ok_m:
-                        msg_m = (
-                            "MAVProxy running but Pix6 not detected — "
-                            + ssh.mavproxy_diagnosis()
-                        )
-                        ok_m = False
-                if ok_m and not ssh.wait_mavproxy_tcp_ready(timeout_sec=20.0):
-                    ok_m = False
-                    msg_m = (
-                        f"MAVProxy TCP :{MAVPROXY_TCP_PORT} not listening — "
-                        f"onboard link must be {MAVPROXY_ONBOARD_OUT}"
-                    )
-                STATE["onboard_mavproxy"] = ok_m
+                return
+
+            if not ssh.wait_mavproxy_tcp_ready(timeout_sec=20.0):
+                ok_m = False
+                msg_m = (
+                    f"MAVProxy TCP :{MAVPROXY_TCP_PORT} not listening — "
+                    f"onboard link must be {MAVPROXY_ONBOARD_OUT}"
+                )
+            STATE["onboard_mavproxy"] = ok_m
+            _emit_onboard_progress(
+                "mavproxy", "done" if ok_m else "error", msg_m
+            )
+            emit_status()
+            if not ok_m:
                 _emit_onboard_progress(
-                    "mavproxy", "done" if ok_m else "error", msg_m
+                    "complete", "error",
+                    "✕ Failed: MAVProxy / Pix6 — fix serial link then retry",
                 )
                 emit_status()
-                if not ok_m:
-                    _emit_onboard_progress(
-                        "complete", "error",
-                        "✕ Failed: MAVProxy / Pix6 — fix serial link then retry",
-                    )
-                    emit_status()
-                    return
+                return
 
             # Step 2–4: stab, arm, cam in parallel (MAVProxy must be up first)
             cam0_dev = config.get("camera0_device", "/dev/video0")
@@ -1208,6 +1310,7 @@ def api_stop_onboard():
     STATE["onboard_arm"]      = False
     STATE["onboard_cam"]      = False
     STATE["onboard_mavproxy"] = False
+    STATE["onboard_starting"] = False
     emit_status()
     return jsonify({"ok": True})
 

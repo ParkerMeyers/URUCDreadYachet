@@ -215,6 +215,8 @@ async function startOnboard() {
     if (btn) btn.disabled = false;
     stopOnboardPoll();
     toast('Onboard start failed: ' + d.msg, 'err');
+  } else if (d.in_progress) {
+    toast(d.msg, 'warn');
   }
 }
 
@@ -894,6 +896,14 @@ function normYaw360(deg) {
   return ((deg % 360) + 360) % 360;
 }
 
+function drawLegibleText(ctx, text, x, y, color, align) {
+  if (align) ctx.textAlign = align;
+  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  ctx.fillText(text, x + 1, y + 1);
+  ctx.fillStyle = color;
+  ctx.fillText(text, x, y);
+}
+
 function drawAttitudeOverlay(ctx, W, H, rollDeg, pitchDeg, yawDeg, live) {
   const cx = W * 0.5;
   const cy = H * 0.5;
@@ -907,32 +917,32 @@ function drawAttitudeOverlay(ctx, W, H, rollDeg, pitchDeg, yawDeg, live) {
   ctx.rotate(rollRad);
   ctx.translate(0, pitchOff);
 
-  ctx.fillStyle = 'rgba(0, 95, 135, 0.14)';
+  ctx.fillStyle = 'rgba(0, 95, 135, 0.06)';
   ctx.fillRect(-span, -H * 2, span * 2, H * 2);
-  ctx.fillStyle = 'rgba(0, 12, 28, 0.28)';
+  ctx.fillStyle = 'rgba(0, 12, 28, 0.12)';
   ctx.fillRect(-span, 0, span * 2, H * 2);
 
   for (let p = -40; p <= 40; p += 10) {
     const y = -p * pitchScale;
     const major = p === 0;
-    const half = major ? span : (Math.abs(p) % 20 === 0 ? span * 0.55 : span * 0.28);
+    const half = major ? span * 0.8 : (Math.abs(p) % 20 === 0 ? span * 0.55 : span * 0.28);
 
     ctx.strokeStyle = major
-      ? (live ? 'rgba(0,212,255,0.95)' : 'rgba(255,179,32,0.55)')
-      : 'rgba(0,212,255,0.35)';
-    ctx.lineWidth = major ? 2.5 : 1;
+      ? (live ? 'rgba(0,212,255,0.30)' : 'rgba(255,179,32,0.28)')
+      : 'rgba(0,212,255,0.28)';
+    ctx.lineWidth = major ? 1 : 1;
     ctx.beginPath();
     ctx.moveTo(-half, y);
     ctx.lineTo(half, y);
     ctx.stroke();
 
     if (!major && Math.abs(p) <= 30) {
-      ctx.fillStyle = 'rgba(220,230,255,0.55)';
-      ctx.font = `${Math.max(8, H * 0.022)}px monospace`;
+      const lbl = String(Math.abs(p));
+      ctx.font = `bold ${Math.max(9, H * 0.026)}px monospace`;
       ctx.textAlign = 'left';
-      ctx.fillText(String(Math.abs(p)), half + 6, y + 3);
+      drawLegibleText(ctx, lbl, half + 6, y + 3, 'rgba(0,224,138,0.95)');
       ctx.textAlign = 'right';
-      ctx.fillText(String(Math.abs(p)), -half - 6, y + 3);
+      drawLegibleText(ctx, lbl, -half - 6, y + 3, 'rgba(0,224,138,0.95)');
     }
   }
 
@@ -991,22 +1001,22 @@ function drawAttitudeOverlay(ctx, W, H, rollDeg, pitchDeg, yawDeg, live) {
   drawYawTape(ctx, W, H, yawDeg, live);
 
   const pad = 10;
-  ctx.fillStyle = 'rgba(0,0,0,0.42)';
-  ctx.fillRect(pad, pad, 118, 52);
-  ctx.strokeStyle = 'rgba(0,212,255,0.25)';
+  ctx.fillStyle = 'rgba(0,0,0,0.68)';
+  ctx.fillRect(pad, pad, 126, 58);
+  ctx.strokeStyle = 'rgba(0,212,255,0.35)';
   ctx.lineWidth = 1;
-  ctx.strokeRect(pad, pad, 118, 52);
+  ctx.strokeRect(pad, pad, 126, 58);
 
-  const fs = Math.max(9, H * 0.024);
-  ctx.font = `${fs}px monospace`;
+  const fs = Math.max(11, H * 0.028);
+  ctx.font = `bold ${fs}px monospace`;
   ctx.textAlign = 'left';
-  ctx.fillStyle = live ? 'rgba(220,230,255,0.9)' : 'rgba(255,179,32,0.85)';
+  const valColor = live ? 'rgba(255,255,255,0.98)' : 'rgba(255,179,32,0.95)';
   const rTxt = live ? `${rollDeg >= 0 ? '+' : ''}${rollDeg.toFixed(1)}` : '--';
   const pTxt = live ? `${pitchDeg >= 0 ? '+' : ''}${pitchDeg.toFixed(1)}` : '--';
   const yTxt = live ? normYaw360(yawDeg).toFixed(0).padStart(3, '0') : '---';
-  ctx.fillText(`R ${rTxt}°`, pad + 8, pad + 18);
-  ctx.fillText(`P ${pTxt}°`, pad + 8, pad + 34);
-  ctx.fillText(`Y ${yTxt}°`, pad + 8, pad + 50);
+  drawLegibleText(ctx, `R ${rTxt}°`, pad + 8, pad + 20, valColor);
+  drawLegibleText(ctx, `P ${pTxt}°`, pad + 8, pad + 38, valColor);
+  drawLegibleText(ctx, `Y ${yTxt}°`, pad + 8, pad + 56, valColor);
 }
 
 function drawYawTape(ctx, W, H, yawDeg, live) {
@@ -1039,10 +1049,10 @@ function drawYawTape(ctx, W, H, yawDeg, live) {
     ctx.stroke();
 
     if (major) {
-      ctx.fillStyle = 'rgba(220,230,255,0.85)';
-      ctx.font = `${Math.max(8, H * 0.02)}px monospace`;
+      ctx.font = `bold ${Math.max(10, H * 0.024)}px monospace`;
       ctx.textAlign = 'center';
-      ctx.fillText(normD.toFixed(0).padStart(3, '0'), x, tapeY + tapeH + 2);
+      drawLegibleText(ctx, normD.toFixed(0).padStart(3, '0'), x, tapeY + tapeH + 2,
+                      'rgba(255,255,255,0.98)', 'center');
     }
   }
 
@@ -1054,15 +1064,12 @@ function drawYawTape(ctx, W, H, yawDeg, live) {
   ctx.closePath();
   ctx.fill();
 
-  ctx.fillStyle = 'rgba(0,212,255,0.55)';
-  ctx.font = `bold ${Math.max(8, H * 0.018)}px sans-serif`;
-  ctx.textAlign = 'center';
-  ctx.fillText('HDG', cx, tapeY - 8);
+  ctx.font = `bold ${Math.max(9, H * 0.02)}px sans-serif`;
+  drawLegibleText(ctx, 'HDG', cx, tapeY - 8, 'rgba(0,224,138,0.95)', 'center');
 
   if (!live) {
-    ctx.fillStyle = 'rgba(255,179,32,0.85)';
-    ctx.font = `${Math.max(8, H * 0.018)}px sans-serif`;
-    ctx.fillText('NO IMU', cx, H - 6);
+    ctx.font = `bold ${Math.max(9, H * 0.02)}px sans-serif`;
+    drawLegibleText(ctx, 'NO IMU', cx, H - 6, 'rgba(255,179,32,0.95)', 'center');
   }
 }
 
