@@ -305,8 +305,12 @@
         </button>
       </div>
     </div>
-    <button class="action-btn" onclick="startColmap()">▶ COLMAP</button>
-    <button class="action-btn" onclick="startCrabs()">🦀 CRABS</button>
+    <button class="action-btn" id="btn-colmap" onclick="toggleColmap()"
+            title="Record arm cam frames @10fps for COLMAP">⏺ COLMAP</button>
+    <button class="action-btn" id="btn-colmap-save" onclick="saveColmap()"
+            title="Save all recorded frames into one folder">💾 SAVE FRAMES</button>
+    <button class="action-btn" id="btn-crabs" onclick="toggleCrabs()"
+            title="Overlay green-crab detections on the arm camera">🦀 CRABS</button>
 
     <div class="ctrl-sep"></div>
 

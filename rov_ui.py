@@ -1877,6 +1877,203 @@ def camera_snapshot(cam_num):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TOPSIDE CV  —  crab detection overlay  +  COLMAP frame recorder
+# Both run topside on the proxied MJPEG feeds (cv2 reads MJPEG-over-HTTP via
+# FFMPEG).  We reuse the inference math in extra/crab_detector.py but NOT its
+# GStreamer/H.264 stream code — this UI's cameras are MJPEG, not RTP.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import shutil
+
+try:
+    import cv2 as _cv2
+    HAVE_CV2 = True
+except ImportError:
+    HAVE_CV2 = False
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_EXTRA_DIR = os.path.join(_HERE, "extra")
+
+_crab_lock = threading.Lock()
+_crab = {"sess": None, "input": None, "cd": None}
+
+
+def _crab_engine():
+    """Lazy-load crab_model.onnx once; reuse crab_detector.py pre/post/draw."""
+    with _crab_lock:
+        if _crab["sess"] is None:
+            import onnxruntime as ort
+            if _EXTRA_DIR not in sys.path:
+                sys.path.insert(0, _EXTRA_DIR)
+            import crab_detector as cd
+            model = os.path.join(_EXTRA_DIR, "crab_model.onnx")
+            sess = ort.InferenceSession(model, providers=["CPUExecutionProvider"])
+            _crab["sess"] = sess
+            _crab["input"] = sess.get_inputs()[0].name
+            _crab["cd"] = cd
+        return _crab["sess"], _crab["input"], _crab["cd"]
+
+
+def _crab_mjpeg(cam_url):
+    """Yield annotated JPEG bytes — green-crab boxes + count burned into frame.
+
+    ponytail: CPU inference of YOLO11m runs ~2-4 fps; switch the onnxruntime
+    provider to CUDA/DirectML if a faster overlay is needed.
+    """
+    sess, input_name, cd = _crab_engine()
+    cap = None
+    try:
+        while True:
+            if cap is None or not cap.isOpened():
+                if cap is not None:
+                    cap.release()
+                cap = _cv2.VideoCapture(cam_url)
+                cap.set(_cv2.CAP_PROP_BUFFERSIZE, 1)
+                if not cap.isOpened():
+                    time.sleep(1.0)
+                    continue
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                cap.release()
+                cap = None
+                time.sleep(0.3)
+                continue
+            h, w = frame.shape[:2]
+            outputs = sess.run(None, {input_name: cd.preprocess(frame)})
+            dets = cd.postprocess(outputs, w, h)
+            cd.draw_overlay(frame, dets)
+            ok, jpeg = _cv2.imencode(".jpg", frame, [_cv2.IMWRITE_JPEG_QUALITY, 75])
+            if ok:
+                yield jpeg.tobytes()
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+@app.route("/camera/<int:cam_num>/crab")
+def camera_crab(cam_num):
+    if cam_num not in (1, 2) or not HAVE_CV2:
+        return "", 404
+    cam_url = config.get(_CAMERA_UI_URL_KEY.get(cam_num, ""), "")
+    if not cam_url:
+        return "", 404
+
+    def _gen():
+        try:
+            for jpeg in _crab_mjpeg(cam_url):
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
+                       b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                       + jpeg + b"\r\n")
+        except (GeneratorExit, Exception):
+            return
+
+    return Response(stream_with_context(_gen()),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+# --- COLMAP frame recorder (arm camera, 10 fps, <=720p, aspect preserved) -----
+COLMAP_DIR = os.path.join(_HERE, "colmap_captures")
+COLMAP_STAGE = os.path.join(COLMAP_DIR, "_staging")
+COLMAP_FPS = 10
+COLMAP_MAX_H = 720
+
+_colmap_lock = threading.Lock()
+_colmap = {"running": False, "thread": None, "count": 0}
+
+
+def _colmap_fit(frame):
+    """Downscale to <=720p height keeping aspect ratio; never upscale, no distortion."""
+    h, w = frame.shape[:2]
+    if h <= COLMAP_MAX_H:
+        return frame
+    scale = COLMAP_MAX_H / float(h)
+    return _cv2.resize(frame, (int(round(w * scale)), COLMAP_MAX_H),
+                       interpolation=_cv2.INTER_AREA)
+
+
+def _colmap_loop(cam_url):
+    os.makedirs(COLMAP_STAGE, exist_ok=True)
+    cap = None
+    period = 1.0 / COLMAP_FPS
+    next_t = 0.0
+    try:
+        while _colmap["running"]:
+            if cap is None or not cap.isOpened():
+                if cap is not None:
+                    cap.release()
+                cap = _cv2.VideoCapture(cam_url)
+                cap.set(_cv2.CAP_PROP_BUFFERSIZE, 1)
+                if not cap.isOpened():
+                    time.sleep(1.0)
+                    continue
+            ok, frame = cap.read()              # blocks at stream fps — paces the loop
+            if not ok or frame is None:
+                cap.release()
+                cap = None
+                time.sleep(0.3)
+                continue
+            now = time.time()
+            if now < next_t:
+                time.sleep(0.005)               # drop frame to hit 10 fps (no busy-spin)
+                continue
+            next_t = now + period
+            idx = _colmap["count"] + 1
+            path = os.path.join(COLMAP_STAGE, f"frame_{idx:06d}.jpg")
+            if _cv2.imwrite(path, _colmap_fit(frame)):
+                _colmap["count"] = idx
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+@app.route("/api/colmap/toggle", methods=["POST"])
+def api_colmap_toggle():
+    if not HAVE_CV2:
+        return jsonify({"ok": False, "msg": "opencv not installed topside"}), 503
+    cam_url = config.get("arm_camera_url", "")
+    with _colmap_lock:
+        if _colmap["running"]:
+            _colmap["running"] = False
+            return jsonify({"ok": True, "recording": False, "staged": _colmap["count"]})
+        if not cam_url:
+            return jsonify({"ok": False, "msg": "arm camera URL not set"}), 400
+        os.makedirs(COLMAP_STAGE, exist_ok=True)
+        # Continue numbering from frames already staged — toggle on/off accumulates.
+        existing = [f for f in os.listdir(COLMAP_STAGE) if f.endswith(".jpg")]
+        _colmap["count"] = len(existing)
+        _colmap["running"] = True
+        t = threading.Thread(target=_colmap_loop, args=(cam_url,),
+                             daemon=True, name="colmap-rec")
+        _colmap["thread"] = t
+        t.start()
+        return jsonify({"ok": True, "recording": True, "staged": _colmap["count"]})
+
+
+@app.route("/api/colmap/save", methods=["POST"])
+def api_colmap_save():
+    with _colmap_lock:
+        _colmap["running"] = False              # stop recording before sealing
+    t = _colmap["thread"]
+    if t is not None:
+        t.join(timeout=2.0)
+    frames = (sorted(f for f in os.listdir(COLMAP_STAGE) if f.endswith(".jpg"))
+              if os.path.isdir(COLMAP_STAGE) else [])
+    if not frames:
+        return jsonify({"ok": False, "msg": "no frames recorded"}), 400
+    dest = os.path.join(COLMAP_DIR, "colmap_" + time.strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(dest, exist_ok=True)
+    for f in frames:
+        shutil.move(os.path.join(COLMAP_STAGE, f), os.path.join(dest, f))
+    _colmap["count"] = 0
+    return jsonify({"ok": True, "folder": dest, "count": len(frames)})
+
+
+@app.route("/api/colmap/status")
+def api_colmap_status():
+    return jsonify({"recording": _colmap["running"], "staged": _colmap["count"]})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FLASK API ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -1,0 +1,5 @@
+# COLMAP frame recorder output (topside)
+colmap_captures/
+
+__pycache__/
+*.pyc
