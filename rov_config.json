@@ -28,6 +28,7 @@
       ]
     }
   },
+  "arm_telemetry_port": 5008,
   "arm_udp_port": "5006",
   "battery_crit_v": "11.0",
   "battery_warn_v": "12.0",

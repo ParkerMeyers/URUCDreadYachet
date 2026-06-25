@@ -33,7 +33,7 @@ SERVICES: dict[str, dict] = {
         "script": "onboard/new_ar.py",
         "log": "/tmp/rov_arm.log",
         "pidfile": "/tmp/rov_arm.pid",
-        "ready_re": r"\[arm\] Listening on UDP|\[arm\] rx=",
+        "ready_re": r"\[arm\] Listening on UDP|\[arm\] rx=|\[arm\] MAVLink link up",
     },
     "cam": {
         "script": "onboard/camera_stream.py",

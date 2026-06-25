@@ -60,7 +60,10 @@ MAX_US      = 2500
 IGNORE      = 65535
 OVERRIDE_HZ = 20
 PRINT_HZ    = 2
+ARM_TELEM_HZ = 5
+ARM_TELEM_PORT = 5008   # topside rov_ui listener (must match arm_telemetry_port)
 TIMEOUT_SEC = 0.75    # center all joints if no UDP packet received for this long
+IMU_READ_STALE_SEC = 2.0
 
 # Maps incoming CSV joint index → RC channel number (AUX1=ch9, AUX2=ch10 …)
 # Incoming order: J1(0), J2(1), J3(2), J4(3), J5(4), J6_PWM(5), Claw(6)
@@ -141,6 +144,7 @@ def _init_optional_hardware() -> None:
 
 def _read_j6_angle_deg():
     """Read BNO055 gravity vector and return tilt angle (degrees). None on error."""
+    global _last_imu_angle_deg, _last_imu_read_time
     if not HAVE_BNO:
         return None
     try:
@@ -151,17 +155,33 @@ def _read_j6_angle_deg():
         if gravity is None:
             return None
         dot = _clamp(sum(gravity[i] * _LEVEL_NORMAL[i] for i in range(3)), -1.0, 1.0)
-        return math.degrees(math.asin(dot))
+        angle = math.degrees(math.asin(dot))
+        _last_imu_angle_deg = angle
+        _last_imu_read_time = time.time()
+        return angle
     except Exception:
         return None
+
+
+def _cached_j6_angle_deg():
+    """Return fresh IMU angle, or last good reading if BNO glitched briefly."""
+    angle = _read_j6_angle_deg()
+    if angle is not None:
+        return angle, False
+    if (
+        _last_imu_angle_deg is not None
+        and (time.time() - _last_imu_read_time) <= IMU_READ_STALE_SEC
+    ):
+        return _last_imu_angle_deg, True
+    return None, False
 
 
 def _compute_j6_pwm(j6_input_us, j6_target_angle_deg):
     """
     Compute J6 continuous-rotation servo PWM.
     Stick outside deadband → direct manual mapping.
-    Stick centered + BNO055 available → auto-level to target angle.
-    Stick centered + no BNO055 → hold 1500 (stopped).
+    Stick centered + claw hold ON + BNO055 available → auto-level to target angle.
+    Stick centered + manual mode (hold OFF or IMU unavailable) → hold stop PWM.
     """
     if j6_input_us > CENTER_US + J6_IN_DEADBAND:
         scale = (j6_input_us - (CENTER_US + J6_IN_DEADBAND)) / \
@@ -179,8 +199,8 @@ def _compute_j6_pwm(j6_input_us, j6_target_angle_deg):
             J6_OUT_MIN, J6_OUT_CENTER
         )))
 
-    # Stick centered — auto-level if BNO055 is available
-    if HAVE_BNO:
+    # Stick centered — IMU auto-level only when claw hold is ON and BNO is healthy
+    if not _j6_manual_mode():
         angle = _read_j6_angle_deg()
         if angle is not None:
             err = angle + j6_target_angle_deg
@@ -189,6 +209,24 @@ def _compute_j6_pwm(j6_input_us, j6_target_angle_deg):
             return int(round(_clamp(J6_OUT_CENTER + J6_KP * err, J6_OUT_MIN, J6_OUT_MAX)))
 
     return J6_OUT_CENTER
+
+
+def _imu_available_for_autolevel() -> bool:
+    """True when BNO055 is present and returning a usable angle."""
+    if not HAVE_BNO:
+        return False
+    angle, _stale = _cached_j6_angle_deg()
+    return angle is not None
+
+
+def _j6_manual_mode(claw_hold_snap=None) -> bool:
+    """Manual J6 when claw hold is OFF or the arm IMU is unavailable."""
+    if claw_hold_snap is None:
+        with _lock:
+            claw_hold_snap = _claw_hold_enabled
+    if not claw_hold_snap:
+        return True
+    return not _imu_available_for_autolevel()
 
 
 def _claw_output_pwm(claw_input_us):
@@ -254,6 +292,13 @@ _rx_count      = 0
 _mosfet_on     = False
 _manual_mode   = False
 _manual_aux_pwm = _default_manual_aux_pwm()
+_claw_hold_enabled = True
+_telem_sock    = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_telem_subscribers: set = set()
+_telem_sub_lock = threading.Lock()
+_telem_send_failures: dict = {}
+_last_imu_angle_deg = None
+_last_imu_read_time = 0.0
 
 
 # ── MOSFET control ────────────────────────────────────────────────────────────
@@ -262,6 +307,63 @@ def _set_mosfet(on: bool):
     _mosfet_on = on
     if HAVE_GPIO:
         _lgpio.gpio_write(_gpio_h, MOSFET_GPIO, 1 if on else 0)
+
+
+def _note_telemetry_subscriber(host: str, port: int) -> None:
+    with _telem_sub_lock:
+        _telem_subscribers.add((host, int(port)))
+
+
+def _send_arm_telemetry(j6_pwm_out: int) -> None:
+    """Push arm BNO055 gripper angle to subscribed topside UI clients."""
+    imu_angle, imu_stale = _cached_j6_angle_deg()
+    with _lock:
+        j6_target = _j6_target_deg
+        claw_hold = _claw_hold_enabled
+    imu_ok = _imu_available_for_autolevel()
+    manual = _j6_manual_mode(claw_hold)
+
+    payload = json.dumps({
+        "type": "arm",
+        "arm_bno_ready": HAVE_BNO,
+        "arm_imu_ok": bool(HAVE_BNO and imu_angle is not None),
+        "arm_imu_stale": bool(imu_stale),
+        "arm_imu_angle_deg": round(imu_angle, 2) if imu_angle is not None else None,
+        "arm_j6_target_deg": round(j6_target, 2),
+        "arm_j6_pwm_out": int(j6_pwm_out),
+        "arm_claw_hold_request": bool(claw_hold),
+        "arm_claw_hold_active": bool(claw_hold and imu_ok),
+        "arm_j6_manual": bool(manual),
+    }).encode("utf-8")
+
+    with _telem_sub_lock:
+        subscribers = list(_telem_subscribers)
+    if not subscribers:
+        return
+
+    for dest in subscribers:
+        try:
+            _telem_sock.sendto(payload, dest)
+            _telem_send_failures.pop(dest, None)
+        except OSError:
+            fails = _telem_send_failures.get(dest, 0) + 1
+            _telem_send_failures[dest] = fails
+            if fails >= 30:
+                with _telem_sub_lock:
+                    _telem_subscribers.discard(dest)
+                _telem_send_failures.pop(dest, None)
+                print(f"[arm] Dropped arm telemetry subscriber {dest} after repeated send failures",
+                      flush=True)
+
+
+def _apply_claw_hold_cmd(cmd: dict) -> None:
+    """Enable/disable J6 IMU auto-level (claw hold)."""
+    global _claw_hold_enabled
+    enabled = bool(cmd.get("enabled", True))
+    with _lock:
+        _claw_hold_enabled = enabled
+    mode = "MANUAL" if _j6_manual_mode(enabled) else "IMU HOLD"
+    print(f"[arm] Claw hold {'ON' if enabled else 'OFF'} → J6 {mode}", flush=True)
 
 
 def _apply_manual_pwm_cmd(cmd: dict) -> None:
@@ -320,13 +422,22 @@ def _arm_control_listener():
         return
     while True:
         try:
-            data, _ = s.recvfrom(256)
+            data, addr = s.recvfrom(256)
             cmd = json.loads(data.decode())
             if cmd.get("cmd") == "mosfet":
                 _set_mosfet(bool(cmd.get("state", False)))
+                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
                 print(f"[arm] MOSFET {'ON' if _mosfet_on else 'OFF'} (web UI)")
             elif cmd.get("cmd") == "manual_pwm":
                 _apply_manual_pwm_cmd(cmd)
+                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+            elif cmd.get("cmd") == "arm_telemetry" and cmd.get("subscribe"):
+                port = int(cmd.get("port", ARM_TELEM_PORT))
+                _note_telemetry_subscriber(addr[0], port)
+                print(f"[arm] Arm telemetry → {addr[0]}:{port}", flush=True)
+            elif cmd.get("cmd") == "claw_hold":
+                _apply_claw_hold_cmd(cmd)
+                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
         except socket.timeout:
             pass
         except json.JSONDecodeError as e:
@@ -402,6 +513,27 @@ def _send_heartbeat(master):
     )
 
 
+def _try_connect_mavlink():
+    """Connect to MAVProxy; return master or None (never blocks startup indefinitely)."""
+    try:
+        print(f"[arm] Connecting to MAVProxy at {MAVLINK_URL} ...", flush=True)
+        master = connect_mavlink(MAVLINK_URL, timeout=12.0)
+        print("[arm] Waiting for heartbeat from Pix6 ...", flush=True)
+        hb = wait_for_heartbeat(master, timeout=8.0)
+        if hb:
+            print(
+                f"[arm] Heartbeat OK "
+                f"(system={master.target_system} component={master.target_component})",
+                flush=True,
+            )
+        else:
+            print("[arm] *** No heartbeat in 8 s — continuing anyway ***", flush=True)
+        return master
+    except Exception as e:
+        print(f"[arm] MAVLink unavailable ({e}) — will retry", flush=True)
+        return None
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     global _joint_us, _j6_target_deg, _last_pkt_time, _rx_count
@@ -411,21 +543,14 @@ def main():
         target=_init_optional_hardware, daemon=True, name="arm-hw-init",
     ).start()
 
-    print(f"[arm] Connecting to MAVProxy at {MAVLINK_URL} ...", flush=True)
-    # MAVProxy is verified ready before the supervisor launches us — short retry.
-    master = connect_mavlink(MAVLINK_URL, timeout=20.0)
-
-    print("[arm] Waiting for heartbeat from Pix6 ...", flush=True)
-    hb = wait_for_heartbeat(master, timeout=15)
-    if hb:
-        print(f"[arm] Heartbeat OK "
-              f"(system={master.target_system} component={master.target_component})",
-              flush=True)
-    else:
-        print("[arm] *** No heartbeat in 15 s — continuing anyway ***", flush=True)
-
+    # Bind UDP first so arm_sender / UI can reach us while MAVLink connects.
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", UDP_PORT))
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("0.0.0.0", UDP_PORT))
+    except OSError as e:
+        print(f"[arm] FATAL: cannot bind UDP {UDP_PORT}: {e}", flush=True)
+        raise
     sock.settimeout(0.001)
 
     threading.Thread(target=_arm_control_listener, daemon=True).start()
@@ -433,19 +558,32 @@ def main():
     print(f"[arm] Listening on UDP {UDP_PORT}", flush=True)
     print(f"[arm] Manual AUX PWM on UDP {MOSFET_PORT} (cmd=manual_pwm)", flush=True)
     print(f"[arm] AUX1=J5  AUX2=J2  AUX3=J6  AUX4=J1  AUX5=J3  AUX6=J4  AUX7=Claw", flush=True)
-    print(f"[arm] BNO055={'yes' if HAVE_BNO else 'no'}  MOSFET={'yes' if HAVE_GPIO else 'no'}", flush=True)
+
+    master = _try_connect_mavlink()
+    print(f"[arm] BNO055={'yes' if HAVE_BNO else 'no'}  MOSFET={'yes' if HAVE_GPIO else 'no'}  "
+          f"MAVLink={'yes' if master else 'retrying'}", flush=True)
 
     last_send      = 0.0
     last_heartbeat = 0.0
     last_print     = 0.0
+    last_telem     = 0.0
+    last_j6_pwm    = J6_OUT_CENTER
+    last_mav_try   = time.time()
+    MAV_RETRY_SEC  = 5.0
 
     try:
         while True:
             now = time.time()
 
+            if master is None and (now - last_mav_try) >= MAV_RETRY_SEC:
+                last_mav_try = now
+                master = _try_connect_mavlink()
+                if master:
+                    print("[arm] MAVLink link up — RC override active", flush=True)
+
             # ── Receive UDP arm commands ──────────────────────────────────────
             try:
-                data, _ = sock.recvfrom(1024)
+                data, addr = sock.recvfrom(1024)
                 line = data.decode(errors="ignore").strip()
                 if line.startswith("PWM:"):
                     line = line[4:]
@@ -460,18 +598,26 @@ def main():
                             _j6_target_deg = float(vals[7]) if len(vals) >= 8 else 0.0
                             _last_pkt_time = now
                             _rx_count     += 1
+                    _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
             except socket.timeout:
                 pass
             except (ValueError, IndexError):
                 pass
 
             # ── Send RC_CHANNELS_OVERRIDE at OVERRIDE_HZ ─────────────────────
-            if now - last_send >= 1.0 / OVERRIDE_HZ:
+            if master is not None and now - last_send >= 1.0 / OVERRIDE_HZ:
                 last_send = now
-                _send_override(master)
+                rc = _build_rc_array()
+                _send_rc_override(master, rc)
+                if rc[J6_RC_CH - 1] != IGNORE:
+                    last_j6_pwm = int(rc[J6_RC_CH - 1])
+
+            if now - last_telem >= 1.0 / ARM_TELEM_HZ:
+                last_telem = now
+                _send_arm_telemetry(last_j6_pwm)
 
             # ── GCS heartbeat every second ────────────────────────────────────
-            if now - last_heartbeat >= 1.0:
+            if master is not None and now - last_heartbeat >= 1.0:
                 last_heartbeat = now
                 _send_heartbeat(master)
 
@@ -495,9 +641,13 @@ def main():
                     )
                 else:
                     hold_neutral = _should_hold_neutral(lpt)
+                    with _lock:
+                        claw_hold = _claw_hold_enabled
+                    j6_manual = _j6_manual_mode(claw_hold) if not hold_neutral else True
                     j6_pwm = J6_OUT_CENTER if hold_neutral else _compute_j6_pwm(_clamp_us(jus[5]), j6t)
                     print(
-                        f"[arm] rx={rx} hold={hold_neutral} mosfet={_mosfet_on} | "
+                        f"[arm] rx={rx} hold={hold_neutral} claw={claw_hold} j6={'MAN' if j6_manual else 'IMU'} "
+                        f"mosfet={_mosfet_on} | "
                         f"J1={jus[0]} J2={jus[1]} J3={jus[2]} J4={jus[3]} "
                         f"J5={jus[4]} J6={j6_pwm}(in={jus[5]},tgt={j6t:.1f}) "
                         f"Claw={jus[6]}"
@@ -510,10 +660,11 @@ def main():
 
     finally:
         # Send neutral on all AUX channels before exiting
-        rc = [IGNORE] * 18
-        _fill_rc_neutral(rc)
-        _send_rc_override(master, rc)
-        time.sleep(0.2)
+        if master is not None:
+            rc = [IGNORE] * 18
+            _fill_rc_neutral(rc)
+            _send_rc_override(master, rc)
+            time.sleep(0.2)
 
         if HAVE_GPIO and _gpio_h is not None:
             _lgpio.gpio_write(_gpio_h, MOSFET_GPIO, 0)

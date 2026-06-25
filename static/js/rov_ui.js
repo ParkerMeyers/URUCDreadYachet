@@ -792,6 +792,40 @@ function stopMissionPoll() {
 // ─────────────────────────────────────────────────────────────
 // CONTROL FLAG TOGGLES (clickable from control bar + S/D/Y keys)
 // ─────────────────────────────────────────────────────────────
+function armImuAvailable(t) {
+  if (!t) return false;
+  if (t.arm_imu_ok && t.arm_imu_angle_deg != null) {
+    if (t.arm_telemetry_age_sec == null || t.arm_telemetry_age_sec <= ARM_IMU_STALE_SEC) {
+      return true;
+    }
+  }
+  return !!t.arm_bno_ready;
+}
+
+function toggleClawHold() {
+  if (!armImuAvailable(_tel)) {
+    toast('Arm IMU not available — J6 is in manual mode', 'warn');
+    return;
+  }
+  _ctrlState.claw_hold = !_ctrlState.claw_hold;
+  updateFlagUI();
+  syncClawHoldToPi();
+  toast(
+    `Claw hold: ${_ctrlState.claw_hold ? 'ON' : 'OFF'} (J6 ${_ctrlState.claw_hold ? 'IMU' : 'manual'})`,
+    _ctrlState.claw_hold ? 'ok' : ''
+  );
+}
+
+async function syncClawHoldToPi() {
+  try {
+    await fetch('/api/claw_hold', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !!_ctrlState.claw_hold }),
+    });
+  } catch (_) {}
+}
+
 function toggleStabilize() {
   if (_currentMode === 'disarmed') { toast('Switch to ARMED or STABILIZE mode first', 'warn'); return; }
   _ctrlState.stabilize = !_ctrlState.stabilize;
@@ -836,6 +870,9 @@ function updateFlagUI() {
   const stabBtn  = document.getElementById('flag-stab');
   const depthBtn = document.getElementById('flag-depth');
   const yawBtn   = document.getElementById('flag-yaw');
+  const clawBtn  = document.getElementById('flag-claw');
+  const imuOk    = armImuAvailable(_tel);
+  const j6Manual = _tel.arm_j6_manual !== false && (!_ctrlState.claw_hold || !imuOk);
 
   if (stabBtn) {
     stabBtn.textContent = `STAB: ${_ctrlState.stabilize ? 'ON' : 'OFF'}`;
@@ -848,6 +885,19 @@ function updateFlagUI() {
   if (yawBtn) {
     yawBtn.textContent = `YAW: ${_ctrlState.yaw_hold ? 'ON' : 'OFF'}`;
     yawBtn.className   = 'ctrl-flag' + (_ctrlState.yaw_hold ? ' active-yaw' : '');
+  }
+  if (clawBtn) {
+    if (!imuOk) {
+      clawBtn.textContent = 'CLAW: MAN';
+      clawBtn.className = 'ctrl-flag disabled';
+      clawBtn.title = 'Arm IMU offline — wrist (J6) manual control';
+    } else {
+      clawBtn.textContent = `CLAW: ${_ctrlState.claw_hold ? 'ON' : 'OFF'}`;
+      clawBtn.className = 'ctrl-flag' + (_ctrlState.claw_hold ? ' active-claw' : '');
+      clawBtn.title = j6Manual
+        ? 'J6 manual — centered stick stops rotation'
+        : 'J6 IMU hold — auto-levels gripper to target angle';
+    }
   }
 }
 
@@ -905,6 +955,7 @@ function updateStatus() {
 
   if (s.mode) { _currentMode = s.mode; updateModeUI(s.mode); }
   if (typeof s.mosfet_on !== 'undefined') { _mosfetOn = s.mosfet_on; updateMosfetUI(s.mosfet_on); }
+  if (typeof s.claw_hold === 'boolean') { _ctrlState.claw_hold = s.claw_hold; updateFlagUI(); }
 
   const ap = document.getElementById('tel-arm-proc');
   if (ap) {
@@ -1037,6 +1088,30 @@ function updateTelemetry() {
 
   _checkBatteryAlerts(t.battery_voltage_v);
 
+  // Arm camera IMU overlay readouts
+  const armPktFresh = t.arm_telemetry_age_sec == null || t.arm_telemetry_age_sec <= 5.0;
+  const armHasAngle = t.arm_imu_ok && t.arm_imu_angle_deg != null && armPktFresh;
+  setText('cam-arm-angle', armHasAngle ? fmtNum(t.arm_imu_angle_deg, 1) : '--');
+  setText('cam-arm-target', t.arm_j6_target_deg != null ? fmtNum(t.arm_j6_target_deg, 1) : '--');
+  const imuEl = document.getElementById('cam-arm-imu');
+  if (imuEl) {
+    if (armHasAngle && t.arm_imu_stale) {
+      imuEl.textContent = 'STALE';
+      imuEl.className = 'val-warn';
+    } else if (armHasAngle) {
+      imuEl.textContent = t.arm_j6_manual ? 'MAN' : 'HOLD';
+      imuEl.className = t.arm_j6_manual ? 'val-warn' : 'val-hi';
+    } else if (t.arm_bno_ready && !armPktFresh) {
+      imuEl.textContent = 'LINK';
+      imuEl.className = 'val-warn';
+    } else {
+      imuEl.textContent = 'NO DATA';
+      imuEl.className = 'val-warn';
+    }
+  }
+
+  updateFlagUI();
+
   // Telemetry bar
   const state = t.rx_state || '--';
   const stateEl = document.getElementById('tel-state');
@@ -1158,6 +1233,7 @@ let _ctrlState = {
   stabilize:    false,
   depth_hold:   false,
   yaw_hold:     false,
+  claw_hold:    true,
   gain_percent: CTRL_CFG.GAIN_DEFAULT,
   seq:          0,
 };
@@ -1740,6 +1816,159 @@ function drawHUD(canvasId, t) {
   ctx.fillText(modeLabels[mode] || mode.toUpperCase(), W * 0.5, H - 42);
 }
 
+const ARM_IMU_STALE_SEC = 5.0;
+
+function armImuLive(t) {
+  if (!t || !t.arm_imu_ok || t.arm_imu_angle_deg == null) return false;
+  if (t.arm_telemetry_age_sec != null && t.arm_telemetry_age_sec > ARM_IMU_STALE_SEC) {
+    return false;
+  }
+  return true;
+}
+
+function armImuStale(t) {
+  return armImuLive(t) && !!t.arm_imu_stale;
+}
+
+function drawArmGripperHUD(ctx, W, H, t) {
+  const live = armImuLive(t);
+  const stale = armImuStale(t);
+  const angleDeg = live ? Number(t.arm_imu_angle_deg) : 0;
+  const targetDeg = (t && t.arm_j6_target_deg != null) ? Number(t.arm_j6_target_deg) : 0;
+  const cx = W * 0.5;
+  const cy = H * 0.5;
+
+  // ── Center rotation arrow (gripper heading in camera frame) ──
+  const shaftLen = Math.min(W, H) * 0.22;
+  const headLen  = Math.max(12, shaftLen * 0.28);
+  const rotRad   = angleDeg * Math.PI / 180;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+
+  // faint crosshair
+  ctx.strokeStyle = 'rgba(0,212,255,0.12)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(-shaftLen * 1.15, 0);
+  ctx.lineTo(shaftLen * 1.15, 0);
+  ctx.moveTo(0, -shaftLen * 1.15);
+  ctx.lineTo(0, shaftLen * 1.15);
+  ctx.stroke();
+
+  // target ghost arrow
+  if (live && Number.isFinite(targetDeg)) {
+    ctx.save();
+    ctx.rotate(targetDeg * Math.PI / 180);
+    ctx.strokeStyle = 'rgba(255,179,32,0.55)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 5]);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(0, -shaftLen * 0.92);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+
+  // gripper arrow
+  ctx.rotate(rotRad);
+  const color = live
+    ? (stale ? 'rgba(255,179,32,0.95)' : 'rgba(0,224,138,0.95)')
+    : 'rgba(255,179,32,0.85)';
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(0, shaftLen * 0.12);
+  ctx.lineTo(0, -shaftLen);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(0, -shaftLen);
+  ctx.lineTo(-headLen * 0.55, -shaftLen + headLen);
+  ctx.lineTo(headLen * 0.55, -shaftLen + headLen);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.arc(0, 0, 4, 0, Math.PI * 2);
+  ctx.fillStyle = live ? 'rgba(0,212,255,0.95)' : 'rgba(255,179,32,0.85)';
+  ctx.fill();
+  ctx.restore();
+
+  // ── Bottom compass dial ──
+  const dialR = Math.min(W, H) * 0.11;
+  const dcx = W * 0.5;
+  const dcy = H - dialR - 18;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.beginPath();
+  ctx.arc(dcx, dcy, dialR + 10, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0,212,255,0.35)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  for (let deg = 0; deg < 360; deg += 30) {
+    const a = -Math.PI / 2 + deg * Math.PI / 180;
+    const major = deg % 90 === 0;
+    const tick = major ? 8 : 4;
+    ctx.strokeStyle = deg === 0
+      ? 'rgba(0,224,138,0.85)'
+      : (major ? 'rgba(0,212,255,0.55)' : 'rgba(0,212,255,0.25)');
+    ctx.lineWidth = major ? 2 : 1;
+    ctx.beginPath();
+    ctx.moveTo(dcx + (dialR - tick) * Math.cos(a), dcy + (dialR - tick) * Math.sin(a));
+    ctx.lineTo(dcx + dialR * Math.cos(a), dcy + dialR * Math.sin(a));
+    ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.translate(dcx, dcy);
+  ctx.rotate(rotRad);
+  ctx.fillStyle = live ? 'rgba(0,224,138,0.95)' : 'rgba(255,179,32,0.85)';
+  ctx.beginPath();
+  ctx.moveTo(0, -dialR + 4);
+  ctx.lineTo(-7, -dialR + 18);
+  ctx.lineTo(7, -dialR + 18);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  ctx.font = `bold ${Math.max(9, H * 0.022)}px sans-serif`;
+  drawLegibleText(ctx, 'GRIP', dcx, dcy - dialR - 14, 'rgba(0,212,255,0.85)', 'center');
+
+  const label = live
+    ? `${angleDeg.toFixed(1)}°${stale ? ' ~' : ''}`
+    : 'NO IMU';
+  ctx.font = `bold ${Math.max(10, H * 0.024)}px monospace`;
+  drawLegibleText(
+    ctx, label, dcx, dcy + dialR + 16,
+    live ? (stale ? 'rgba(255,179,32,0.95)' : 'rgba(0,224,138,0.95)') : 'rgba(255,179,32,0.95)', 'center'
+  );
+
+  if (live && Number.isFinite(targetDeg)) {
+    ctx.font = `bold ${Math.max(8, H * 0.02)}px monospace`;
+    drawLegibleText(
+      ctx, `TGT ${targetDeg.toFixed(1)}°`, dcx, dcy + dialR + 32,
+      'rgba(255,179,32,0.9)', 'center'
+    );
+  }
+}
+
+function drawArmHUD(canvasId, t) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const wrap = canvas.parentElement;
+  canvas.width  = wrap.clientWidth;
+  canvas.height = wrap.clientHeight;
+
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawArmGripperHUD(ctx, canvas.width, canvas.height, t);
+}
+
 function drawArrow(ctx, x1, y1, x2, y2, color, opacity) {
   const dx = x2 - x1, dy = y2 - y1;
   const len = Math.sqrt(dx * dx + dy * dy);
@@ -2018,6 +2247,8 @@ async function _doOpenControl() {
   bindCameraResize();
   setCameraView(_cameraView);
   startHUDLoop();
+  updateFlagUI();
+  syncClawHoldToPi();
   _updateGamepadPill();
   loadArmPresets();
   startMissionPoll();
@@ -2038,11 +2269,14 @@ function showLaunch() {
 }
 
 function resizeHUDs() {
-  const c = document.getElementById('hud1');
-  if (!c) return;
-  c.width  = c.parentElement.clientWidth;
-  c.height = c.parentElement.clientHeight;
+  ['hud1', 'hud2'].forEach(id => {
+    const c = document.getElementById(id);
+    if (!c || !c.parentElement) return;
+    c.width  = c.parentElement.clientWidth;
+    c.height = c.parentElement.clientHeight;
+  });
   drawHUD('hud1', _tel);
+  drawArmHUD('hud2', _tel);
 }
 
 let _hudLoop = null;
@@ -2050,6 +2284,7 @@ function startHUDLoop() {
   if (_hudLoop) return;
   _hudLoop = setInterval(() => {
     drawHUD('hud1', _tel);
+    drawArmHUD('hud2', _tel);
   }, 100);
 }
 

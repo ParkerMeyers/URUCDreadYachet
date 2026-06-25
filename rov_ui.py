@@ -144,6 +144,7 @@ DEFAULT_CONFIG = {
     "telemetry_port":      5006,
     "arm_udp_port":        5006,
     "mosfet_control_port": 5007,
+    "arm_telemetry_port":  5008,
     "colmap_command":      "python3 colmap_run.py",
     "crabs_command":       "python3 crabs.py",
     "battery_warn_v":      12.0,
@@ -405,6 +406,7 @@ STATE = {
     "mode":                "disarmed",
     "mosfet_on":           False,
     "last_telemetry_time": 0.0,
+    "last_arm_telemetry_time": 0.0,
     "telemetry_packets":   0,
     "telemetry_rate_hz":   0.0,
     "last_ctrl_time":      0.0,
@@ -416,6 +418,7 @@ STATE = {
     "arm_last_pwm":          None,
     "manual_pwm_enabled":    False,
     "manual_aux_pwm":        list(MANUAL_AUX_DEFAULTS),
+    "claw_hold":             True,
     "telemetry": {
         "rx_state":                "NO_TELEMETRY",
         "gain_percent":            100,
@@ -450,6 +453,15 @@ STATE = {
         "attitude_age_sec":        None,
         "depth_recapture_pending": False,
         "yaw_recapture_pending":   False,
+        "arm_imu_ok":              False,
+        "arm_bno_ready":           False,
+        "arm_imu_stale":           False,
+        "arm_imu_angle_deg":       None,
+        "arm_j6_target_deg":       None,
+        "arm_j6_pwm_out":          None,
+        "arm_claw_hold_request":   True,
+        "arm_claw_hold_active":    False,
+        "arm_j6_manual":           True,
     },
     "logs": {
         "thrust":       [],
@@ -1129,8 +1141,26 @@ def _wait_onboard_running(check_fn, label: str, timeout_sec: float = 12.0) -> tu
     return False, f"{label} did not start within {int(timeout_sec)}s — check onboard logs"
 
 
+def _arm_telemetry_age_sec() -> float | None:
+    last = STATE.get("last_arm_telemetry_time", 0.0)
+    if last <= 0:
+        return None
+    return round(time.time() - last, 2)
+
+
+def _telemetry_emit_payload() -> dict:
+    payload = dict(STATE["telemetry"])
+    payload["link_health"] = _compute_link_health()
+    payload["arm_telemetry_age_sec"] = _arm_telemetry_age_sec()
+    return payload
+
+
 def _update_telemetry_from_json(pkt: dict):
     """Map stabilization.py JSON telemetry → UI state and emit to browser."""
+    if pkt.get("type") == "arm":
+        _update_arm_telemetry_from_json(pkt)
+        return
+
     tel = STATE["telemetry"]
     tel["rx_state"]                = pkt.get("state", "OK")
     tel["gain_percent"]            = pkt.get("gain_percent", tel["gain_percent"])
@@ -1174,9 +1204,97 @@ def _update_telemetry_from_json(pkt: dict):
         _telemetry_rate_counter["window_start"] = now
 
     _append_telemetry_record(pkt)
-    payload = dict(tel)
-    payload["link_health"] = _compute_link_health()
-    socketio.emit("telemetry", payload)
+    socketio.emit("telemetry", _telemetry_emit_payload())
+
+
+def _update_arm_telemetry_from_json(pkt: dict):
+    """Merge arm BNO055 gripper telemetry into UI state."""
+    tel = STATE["telemetry"]
+    tel["arm_bno_ready"]     = bool(pkt.get("arm_bno_ready", pkt.get("arm_imu_ok")))
+    tel["arm_imu_ok"]        = bool(pkt.get("arm_imu_ok"))
+    tel["arm_imu_stale"]     = bool(pkt.get("arm_imu_stale"))
+    tel["arm_imu_angle_deg"] = pkt.get("arm_imu_angle_deg")
+    tel["arm_j6_target_deg"] = pkt.get("arm_j6_target_deg")
+    tel["arm_j6_pwm_out"]    = pkt.get("arm_j6_pwm_out")
+    tel["arm_claw_hold_request"] = bool(pkt.get("arm_claw_hold_request", tel.get("arm_claw_hold_request", True)))
+    tel["arm_claw_hold_active"]  = bool(pkt.get("arm_claw_hold_active", False))
+    tel["arm_j6_manual"]         = bool(pkt.get("arm_j6_manual", True))
+    STATE["last_arm_telemetry_time"] = time.time()
+    socketio.emit("telemetry", _telemetry_emit_payload())
+
+
+def _sync_arm_claw_hold():
+    """Push claw-hold flag to new_ar.py (J6 IMU auto-level)."""
+    _send_pi_arm_control({
+        "cmd": "claw_hold",
+        "enabled": bool(STATE.get("claw_hold", True)),
+    })
+
+
+def _subscribe_arm_telemetry():
+    """Ask new_ar.py on the Pi to push arm IMU data to our UDP listener."""
+    try:
+        payload = json.dumps({
+            "cmd": "arm_telemetry",
+            "subscribe": True,
+            "port": int(config.get("arm_telemetry_port", 5008)),
+        }).encode("utf-8")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.sendto(
+                payload,
+                (config["pi_ip"], int(config["mosfet_control_port"])),
+            )
+        finally:
+            s.close()
+    except Exception as e:
+        print(f"[WARN] Arm telemetry subscribe failed: {e}")
+
+
+def _start_arm_telemetry_subscribe_loop():
+    """Re-subscribe periodically so new_ar picks us up after restarts."""
+    def _loop():
+        while True:
+            _subscribe_arm_telemetry()
+            _sync_arm_claw_hold()
+            time.sleep(5.0)
+
+    threading.Thread(target=_loop, daemon=True, name="arm-tel-sub").start()
+
+
+def _start_arm_telemetry_listener():
+    """Listen for JSON arm IMU telemetry from new_ar.py on arm_telemetry_port."""
+    def _listen():
+        port = int(config.get("arm_telemetry_port", 5008))
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", port))
+            s.settimeout(1.0)
+        except Exception as e:
+            print(
+                f"[ERROR] Arm telemetry listener bind failed on port {port}: {e}"
+            )
+            return
+
+        print(f"[INFO] Arm telemetry listener active on UDP port {port}")
+        _subscribe_arm_telemetry()
+        _sync_arm_claw_hold()
+        while True:
+            try:
+                data, _ = s.recvfrom(4096)
+                try:
+                    pkt = json.loads(data.decode("utf-8"))
+                    if pkt.get("type") == "arm":
+                        _update_arm_telemetry_from_json(pkt)
+                except Exception:
+                    pass
+            except socket.timeout:
+                pass
+            except Exception:
+                pass
+
+    threading.Thread(target=_listen, daemon=True, name="arm-tel-listen").start()
 
 
 def _append_telemetry_record(pkt: dict):
@@ -1357,6 +1475,10 @@ def _monitor_loop():
         if tel_age > 2.0:
             STATE["telemetry"]["rx_state"] = "NO_TELEMETRY"
 
+        arm_age = _arm_telemetry_age_sec()
+        if arm_age is not None and arm_age > 3.0:
+            _subscribe_arm_telemetry()
+
         emit_status()
 
 
@@ -1384,6 +1506,7 @@ def emit_status():
         "arm_last_pwm":          STATE.get("arm_last_pwm"),
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
         "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS)),
+        "claw_hold":             STATE.get("claw_hold", True),
     })
 
 
@@ -1802,6 +1925,22 @@ def api_stop_topside():
     return jsonify({"ok": True})
 
 
+@app.route("/api/claw_hold", methods=["GET", "POST"])
+def api_claw_hold():
+    if request.method == "GET":
+        return jsonify({
+            "ok": True,
+            "enabled": bool(STATE.get("claw_hold", True)),
+        })
+
+    data = request.get_json(force=True) or {}
+    enabled = bool(data.get("enabled", True))
+    STATE["claw_hold"] = enabled
+    ok, msg = _send_pi_arm_control({"cmd": "claw_hold", "enabled": enabled})
+    emit_status()
+    return jsonify({"ok": ok, "msg": msg, "enabled": enabled})
+
+
 @app.route("/api/mosfet", methods=["POST"])
 def api_mosfet():
     data = request.get_json(force=True) or {}
@@ -2072,6 +2211,7 @@ def api_status():
         "arm_last_pwm":          STATE.get("arm_last_pwm"),
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
         "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS)),
+        "claw_hold":             STATE.get("claw_hold", True),
     })
 
 
@@ -2119,7 +2259,7 @@ def api_onboard_log(name):
 @socketio.on("connect")
 def on_connect():
     emit_status()
-    socketio.emit("telemetry", dict(STATE["telemetry"]))
+    socketio.emit("telemetry", _telemetry_emit_payload())
     with _state_lock:
         for entry in STATE["onboard_progress"]:
             socketio.emit("onboard_progress", entry)
@@ -2164,6 +2304,8 @@ def main():
     # Start background threads
     stop_local_process("thrust")  # free UDP telemetry port if old thrust_sender was running
     _start_telemetry_listener()
+    _start_arm_telemetry_listener()
+    _start_arm_telemetry_subscribe_loop()
     _start_control_keepalive()
     threading.Thread(target=_monitor_loop, daemon=True).start()
 
@@ -2172,6 +2314,7 @@ def main():
     print(f"  DreadYachet ROV Control UI")
     print(f"  Open: {url}")
     print(f"  Telemetry listening on UDP port {config['telemetry_port']}")
+    print(f"  Arm IMU telemetry on UDP port {config.get('arm_telemetry_port', 5008)}")
     print(f"  Control packets → Pi UDP port {config['thrust_udp_port']}")
     print(f"{'='*55}\n")
 

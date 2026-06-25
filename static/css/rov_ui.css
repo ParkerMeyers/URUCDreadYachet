@@ -296,6 +296,7 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 .cam-telemetry-unified { font-size:0.78rem; line-height:1.85; }
 .cam-telemetry-unified .tel-depth-line { font-size:0.92rem; line-height:1.7; }
 .cam-telemetry-unified .tel-depth-line .val-hi { font-size:1.08rem; font-weight:700; }
+.cam-telemetry-arm { font-size:0.72rem; line-height:1.75; }
 
 /* ── control bar ── */
 .controlbar {
@@ -329,7 +330,12 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 .ctrl-flag.active-stab  { border-color:var(--green); color:var(--green); background:rgba(0,224,138,.12); }
 .ctrl-flag.active-depth { border-color:var(--accent); color:var(--accent); background:rgba(0,212,255,.12); }
 .ctrl-flag.active-yaw   { border-color:var(--accent2); color:var(--accent2); background:rgba(123,94,167,.12); }
+.ctrl-flag.active-claw  { border-color:var(--green); color:var(--green); background:rgba(0,224,138,.12); }
+.ctrl-flag.disabled,
+.ctrl-flag:disabled     { opacity:0.38; cursor:not-allowed; pointer-events:none; }
 .ctrl-flag:hover { border-color:var(--text); }
+.ctrl-flag.disabled:hover,
+.ctrl-flag:disabled:hover { border-color:var(--border); }
 
 .mosfet-toggle {
   display:flex; align-items:center; gap:8px;
