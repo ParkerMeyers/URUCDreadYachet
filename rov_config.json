@@ -43,6 +43,7 @@
   "mavproxy_bin": "/home/uruc/mav_env/bin/mavproxy.py",
   "mavproxy_out1": "udp:192.168.69.2:14550",
   "mavproxy_out2": "tcpin:127.0.0.1:5762",
+  "mavproxy_out3": "tcpin:127.0.0.1:5763",
   "mavproxy_serial": "/dev/ttyACM0",
   "mosfet_control_port": "5007",
   "pi_ip": "192.168.69.100",
@@ -50,7 +51,7 @@
   "pi_rov_path": "/home/uruc/URUCDreadYachet",
   "pi_ssh_port": "22",
   "pi_user": "uruc",
-  "serial_port": "COM3",
+  "serial_port": "auto",
   "telemetry_port": "5006",
   "thrust_udp_port": "5005"
 }

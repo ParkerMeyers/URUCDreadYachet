@@ -13,9 +13,12 @@ from pymavlink.dialects.v20 import ardupilotmega as mav_v20
 
 RC_IGNORE = 65535
 
-# Both stabilization.py and new_ar.py connect here.  MAVProxy must expose
-# --out=tcpin:127.0.0.1:5762 so multiple onboard clients can share one link.
+# MAVProxy tcpin accepts ONE TCP client per port — use separate ports:
+#   stabilization.py → 5762   new_ar.py → 5763
+# MAVProxy must expose both:
+#   --out=tcpin:127.0.0.1:5762 --out=tcpin:127.0.0.1:5763
 MAVLINK_ONBOARD = "tcp:127.0.0.1:5762"
+MAVLINK_ONBOARD_ARM = "tcp:127.0.0.1:5763"
 
 _ENCODER = mav_v20.MAVLink(None, srcSystem=255, srcComponent=190)
 

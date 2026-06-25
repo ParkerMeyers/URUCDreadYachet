@@ -161,7 +161,8 @@ DEFAULT_CONFIG = {
     "mavproxy_serial":     "/dev/ttyACM0",
     "mavproxy_baud":       "115200",
     "mavproxy_out1":       "udp:192.168.69.2:14550",
-    "mavproxy_out2":       "tcpin:127.0.0.1:5762",  # onboard: stab + arm (TCP)
+    "mavproxy_out2":       "tcpin:127.0.0.1:5762",  # onboard: stabilization.py
+    "mavproxy_out3":       "tcpin:127.0.0.1:5763",  # onboard: new_ar.py (arm)
     "arm_presets": {
         k: {
             "label": v["label"],
@@ -172,9 +173,11 @@ DEFAULT_CONFIG = {
     },
 }
 
-# Must match onboard/mavlink_rc.py MAVLINK_ONBOARD tcp port.
+# Must match onboard/mavlink_rc.py TCP ports (one MAVProxy tcpin client per port).
 MAVPROXY_TCP_PORT = 5762
+MAVPROXY_ARM_TCP_PORT = 5763
 MAVPROXY_ONBOARD_OUT = f"tcpin:127.0.0.1:{MAVPROXY_TCP_PORT}"
+MAVPROXY_ARM_ONBOARD_OUT = f"tcpin:127.0.0.1:{MAVPROXY_ARM_TCP_PORT}"
 
 
 def normalize_camera_config():
@@ -196,13 +199,16 @@ def normalize_camera_config():
 
 
 def normalize_onboard_config():
-    """Force the onboard MAVProxy output to TCP — scripts connect to tcp:127.0.0.1:5762."""
+    """Force onboard MAVProxy TCP outputs (one tcpin client per port)."""
     global config
     normalize_camera_config()
     normalize_arm_presets()
     out2 = str(config.get("mavproxy_out2", "")).strip()
     if "tcpin" not in out2.lower() or str(MAVPROXY_TCP_PORT) not in out2:
         config["mavproxy_out2"] = MAVPROXY_ONBOARD_OUT
+    out3 = str(config.get("mavproxy_out3", "")).strip()
+    if "tcpin" not in out3.lower() or str(MAVPROXY_ARM_TCP_PORT) not in out3:
+        config["mavproxy_out3"] = MAVPROXY_ARM_ONBOARD_OUT
 
 
 def _slug_preset_name(name: str) -> str:
@@ -431,7 +437,10 @@ def _robot_armed() -> bool:
 
 def _sync_arm_enable():
     """Tell new_ar.py whether arm motion is allowed (disabled when DISARMED)."""
-    _send_pi_arm_control({"cmd": "arm_enable", "enabled": _robot_armed()})
+    if _robot_armed():
+        _sync_arm_unlock()
+    else:
+        _send_pi_arm_control({"cmd": "arm_enable", "enabled": False})
 
 
 def _sync_arm_power():
@@ -443,11 +452,21 @@ def _sync_arm_power():
 def _apply_disarmed_arm_lockout():
     """Stop arm motion and overrides when the ROV is disarmed (servo power stays on)."""
     if _robot_armed():
-        _sync_arm_enable()
+        _sync_arm_unlock()
         return
     STATE["manual_pwm_enabled"] = False
+    STATE["preset_running"] = False
+    STATE["preset_active_name"] = ""
     _send_pi_arm_control({"cmd": "arm_enable", "enabled": False})
     _send_pi_arm_control({"cmd": "manual_pwm", "enabled": False})
+    _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
+
+
+def _sync_arm_unlock():
+    """Allow arm motion on the Pi (clears stale preset lock)."""
+    _send_pi_arm_control({"cmd": "arm_enable", "enabled": True})
+    if not STATE.get("preset_running"):
+        _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
 
 
 def _send_arm_csv(csv_line: str):
@@ -579,6 +598,10 @@ STATE = {
     "telemetry_listener_ok": False,
     "telemetry_recording":   False,
     "telemetry_record_file": "",
+    "video_recording":       False,
+    "video_record_session":  "",
+    "video_record_mode":     "",
+    "video_record_files":    [],
     "onboard_starting":      False,
     "onboard_progress":      [],
     "arm_last_pwm":          None,
@@ -647,6 +670,7 @@ _telemetry_record_lock = threading.Lock()
 _telemetry_rate_counter = {"count": 0, "window_start": time.time()}
 MAX_LOG_LINES = 200
 LOGS_DIR = ROV_ROOT / "logs"
+VIDEO_DIR = LOGS_DIR / "videos"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SSH MANAGER
@@ -854,6 +878,7 @@ class SSHManager:
         baud  = config["mavproxy_baud"]
         out1  = config["mavproxy_out1"]
         out2  = config["mavproxy_out2"]
+        out3  = config.get("mavproxy_out3", MAVPROXY_ARM_ONBOARD_OUT)
         cmd = (
             f"setsid nohup {bin_} "
             f"--master={ser} "
@@ -861,6 +886,7 @@ class SSHManager:
             f"--non-interactive "
             f"--out={out1} "
             f"--out={out2} "
+            f"--out={out3} "
             f"< /dev/null > /tmp/rov_mavproxy.log 2>&1 & echo $!"
         )
         out, _, error = self.exec(cmd, timeout=10)
@@ -884,14 +910,19 @@ class SSHManager:
         """Legacy name — always forces a fresh MAVProxy."""
         return self._start_mavproxy_fresh()
 
-    def is_mavproxy_tcp_ready(self):
-        """True when MAVProxy is listening for onboard script TCP connections."""
-        port = MAVPROXY_TCP_PORT
+    def is_mavproxy_tcp_port_ready(self, port: int) -> bool:
         out, _, _ = self.exec(
             f"(ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -q ':{port} ' "
             f"&& echo ok"
         )
         return "ok" in out
+
+    def is_mavproxy_tcp_ready(self):
+        """True when MAVProxy is listening for onboard script TCP connections."""
+        return (
+            self.is_mavproxy_tcp_port_ready(MAVPROXY_TCP_PORT)
+            and self.is_mavproxy_tcp_port_ready(MAVPROXY_ARM_TCP_PORT)
+        )
 
     def wait_mavproxy_tcp_ready(self, timeout_sec: float = 20.0) -> bool:
         deadline = time.time() + timeout_sec
@@ -1331,6 +1362,13 @@ def _reset_onboard_telemetry_state() -> None:
     tel["arm_j6_target_deg"] = None
     tel["arm_j6_pwm_out"] = None
     tel["arm_claw_hold_active"] = False
+    tel["arm_hold_neutral"] = None
+    tel["arm_rx_count"] = None
+    tel["arm_enabled"] = None
+    tel["arm_mavlink_ok"] = None
+    tel["arm_joint_us"] = None
+    tel["arm_manual_mode"] = None
+    tel["arm_preset_motion"] = None
     STATE["last_telemetry_time"] = 0.0
     STATE["last_arm_telemetry_time"] = 0.0
     STATE["telemetry_packets"] = 0
@@ -1342,8 +1380,23 @@ def _on_onboard_stack_ready() -> None:
     _reset_onboard_telemetry_state()
     _subscribe_arm_telemetry()
     _sync_arm_claw_hold()
+    _sync_arm_imu_cal()
+    _apply_disarmed_arm_lockout()
     socketio.emit("telemetry", _telemetry_emit_payload())
     emit_status()
+
+    def _resync_arm_after_restart():
+        for delay in (0.75, 2.0, 5.0):
+            time.sleep(delay)
+            if not STATE.get("onboard_arm"):
+                return
+            _subscribe_arm_telemetry()
+            _sync_arm_claw_hold()
+            _sync_arm_imu_cal()
+            _sync_arm_enable()
+            _sync_arm_power()
+
+    socketio.start_background_task(_resync_arm_after_restart)
 
 
 def _telemetry_emit_payload() -> dict:
@@ -1417,6 +1470,20 @@ def _update_arm_telemetry_from_json(pkt: dict):
     tel["arm_claw_hold_request"] = bool(pkt.get("arm_claw_hold_request", tel.get("arm_claw_hold_request", True)))
     tel["arm_claw_hold_active"]  = bool(pkt.get("arm_claw_hold_active", False))
     tel["arm_j6_manual"]         = bool(pkt.get("arm_j6_manual", True))
+    if pkt.get("arm_enabled") is not None:
+        tel["arm_enabled"] = bool(pkt.get("arm_enabled"))
+    if pkt.get("arm_rx_count") is not None:
+        tel["arm_rx_count"] = int(pkt.get("arm_rx_count"))
+    if pkt.get("arm_hold_neutral") is not None:
+        tel["arm_hold_neutral"] = bool(pkt.get("arm_hold_neutral"))
+    if pkt.get("arm_mavlink_ok") is not None:
+        tel["arm_mavlink_ok"] = bool(pkt.get("arm_mavlink_ok"))
+    if isinstance(pkt.get("arm_joint_us"), list):
+        tel["arm_joint_us"] = pkt["arm_joint_us"]
+    if pkt.get("arm_manual_mode") is not None:
+        tel["arm_manual_mode"] = bool(pkt.get("arm_manual_mode"))
+    if pkt.get("arm_preset_motion") is not None:
+        tel["arm_preset_motion"] = bool(pkt.get("arm_preset_motion"))
     if pkt.get("arm_imu_zero_offset") is not None:
         tel["arm_imu_zero_offset"] = float(pkt["arm_imu_zero_offset"])
     if pkt.get("arm_imu_sign") is not None:
@@ -1719,6 +1786,10 @@ def emit_status():
         "onboard_progress":      progress,
         "telemetry_recording":   STATE["telemetry_recording"],
         "telemetry_record_file": STATE.get("telemetry_record_file", ""),
+        "video_recording":       STATE["video_recording"],
+        "video_record_session":  STATE.get("video_record_session", ""),
+        "video_record_mode":     STATE.get("video_record_mode", ""),
+        "video_record_files":    list(STATE.get("video_record_files", [])),
         "link_health":           link,
         "arm_last_pwm":          STATE.get("arm_last_pwm"),
         "preset_running":        STATE.get("preset_running", False),
@@ -1726,6 +1797,8 @@ def emit_status():
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
         "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS)),
         "claw_hold":             STATE.get("claw_hold", True),
+        "arm_motion_enabled":    _robot_armed(),
+        "arm_pi_enabled":        STATE.get("telemetry", {}).get("arm_enabled"),
     })
 
 
@@ -1954,8 +2027,8 @@ def api_start_onboard():
             if not ssh.wait_mavproxy_tcp_ready(timeout_sec=20.0):
                 ok_m = False
                 msg_m = (
-                    f"MAVProxy TCP :{MAVPROXY_TCP_PORT} not listening — "
-                    f"onboard link must be {MAVPROXY_ONBOARD_OUT}"
+                    f"MAVProxy TCP :{MAVPROXY_TCP_PORT} / :{MAVPROXY_ARM_TCP_PORT} not listening — "
+                    f"need {MAVPROXY_ONBOARD_OUT} and {MAVPROXY_ARM_ONBOARD_OUT}"
                 )
             STATE["onboard_mavproxy"] = ok_m
             _emit_onboard_progress(
@@ -1970,67 +2043,42 @@ def api_start_onboard():
                 emit_status()
                 return
 
-            # Step 2–4: stab, arm, cam in parallel (MAVProxy must be up first)
+            # Step 2–4: stab → arm → cam sequentially (SSH lock + MAVProxy tcpin = 1 client/port)
             cam0_dev = config.get("camera0_device", "/dev/video0")
             cam1_dev = config.get("camera1_device", "/dev/video2")
             cam_args = f"--cam0 {cam0_dev} --cam1 {cam1_dev}"
 
-            parallel_specs = [
+            service_specs = [
                 ("stabilization", "stab", "onboard_stab", 75.0, ""),
-                ("arm_ctrl", "arm", "onboard_arm", 75.0, ""),
-                ("camera", "cam", "onboard_cam", 45.0, cam_args),
+                ("arm_ctrl", "arm", "onboard_arm", 45.0, ""),
+                ("camera", "cam", "onboard_cam", 30.0, cam_args),
             ]
-            parallel_labels = {
+            service_labels = {
                 "stabilization": "stabilization.py",
                 "arm_ctrl": "new_ar.py (arm controller)",
                 "camera": "camera_stream.py (MJPEG feeds)",
             }
-            parallel_results: dict[str, tuple[bool, str]] = {}
-            results_lock = threading.Lock()
+            service_results: dict[str, tuple[bool, str]] = {}
 
-            for step, _, _, _, _ in parallel_specs:
+            for step, svc, state_key, timeout, extra_args in service_specs:
                 _emit_onboard_progress(
                     step, "starting",
-                    f"Launching {parallel_labels[step]}...",
+                    f"Launching {service_labels[step]}...",
                 )
-
-            def _launch_onboard_service(
-                step: str,
-                svc: str,
-                state_key: str,
-                timeout: float,
-                extra_args: str,
-            ):
-                # Let stabilization connect and bootstrap ATTITUDE before arm hammers MAVLink.
                 if step == "arm_ctrl":
-                    time.sleep(2.5)
+                    time.sleep(2.0)
                 ok, msg = ssh.supervisor_start_and_wait(
                     svc, timeout_sec=timeout, extra_args=extra_args,
                 )
-                with results_lock:
-                    parallel_results[step] = (ok, msg)
+                service_results[step] = (ok, msg)
                 with _state_lock:
                     STATE[state_key] = ok
                 _emit_onboard_progress(step, "done" if ok else "error", msg)
                 emit_status()
 
-            threads = [
-                threading.Thread(
-                    target=_launch_onboard_service,
-                    args=(step, svc, state_key, timeout, extra_args),
-                    name=f"onboard-{svc}",
-                    daemon=True,
-                )
-                for step, svc, state_key, timeout, extra_args in parallel_specs
-            ]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-
-            ok_s, msg_s = parallel_results.get("stabilization", (False, "missing result"))
-            ok_a, msg_a = parallel_results.get("arm_ctrl", (False, "missing result"))
-            ok_c, msg_c = parallel_results.get("camera", (False, "missing result"))
+            ok_s, msg_s = service_results.get("stabilization", (False, "missing result"))
+            ok_a, msg_a = service_results.get("arm_ctrl", (False, "missing result"))
+            ok_c, msg_c = service_results.get("camera", (False, "missing result"))
 
             core_ok = ok_m and ok_s
             if core_ok and ok_a and ok_c:
@@ -2121,6 +2169,7 @@ def api_start_topside():
             PYTHON, str(ROV_ROOT / "topside" / "arm_sender.py"),
             "--ip",   config["pi_ip"],
             "--port", config["serial_port"],
+            "--udp-port", str(int(config.get("arm_udp_port", 5006))),
         ]
         ok, msg = start_local_process("arm", cmd, cwd=ROV_ROOT)
         results["arm_sender"] = {"ok": ok, "msg": msg}
@@ -2150,6 +2199,112 @@ def api_stop_topside():
     STATE["arm_running"]    = False
     emit_status()
     return jsonify({"ok": True})
+
+
+@app.route("/api/arm_diagnostic", methods=["GET"])
+def api_arm_diagnostic():
+    tel = STATE.get("telemetry", {})
+    rx = tel.get("arm_rx_count")
+    arm_age = _arm_telemetry_age_sec()
+    arm_tel_stale = arm_age is None or arm_age > 5.0
+    hold_neutral = tel.get("arm_hold_neutral")
+    checks = [
+        {
+            "name": "ROV mode (DRIVE/ARMED or STABILIZE)",
+            "ok": _robot_armed(),
+            "detail": STATE.get("mode", "disarmed"),
+        },
+        {
+            "name": "arm_sender running (topside)",
+            "ok": bool(STATE.get("arm_running")),
+            "detail": "Start via Open Control" if not STATE.get("arm_running") else "OK",
+        },
+        {
+            "name": "Onboard arm (new_ar.py on Pi)",
+            "ok": bool(STATE.get("onboard_arm")),
+            "detail": "Start Onboard" if not STATE.get("onboard_arm") else "OK",
+        },
+        {
+            "name": "Pi MAVLink to Pix6",
+            "ok": bool(tel.get("arm_mavlink_ok")),
+            "detail": "Check MAVProxy + onboard arm log" if not tel.get("arm_mavlink_ok") else "OK",
+        },
+        {
+            "name": "Pi arm motion enabled",
+            "ok": bool(tel.get("arm_enabled")),
+            "detail": "Switch to DRIVE/ARMED" if not tel.get("arm_enabled") else "OK",
+        },
+        {
+            "name": "UDP from arm_sender (Pi rx count)",
+            "ok": not arm_tel_stale and rx is not None and int(rx) > 0,
+            "detail": (
+                "Waiting for arm telemetry from Pi"
+                if arm_tel_stale
+                else f"rx={rx if rx is not None else '?'} — plug in arm USB if 0"
+            ),
+        },
+        {
+            "name": "Not stuck in hold-neutral",
+            "ok": not arm_tel_stale and hold_neutral is False,
+            "detail": (
+                f"Arm telemetry stale ({arm_age}s) — restart onboard or check UDP 5008"
+                if arm_tel_stale
+                else (
+                    "Waiting for arm_sender packets"
+                    if hold_neutral
+                    else "OK"
+                )
+            ),
+        },
+    ]
+    return jsonify({
+        "ok": True,
+        "checks": checks,
+        "all_ok": all(c["ok"] for c in checks),
+        "hint": "Mission Planner: SERVO9–16_FUNCTION=1 (RCPassThru), BRD_SAFETYENABLE=0",
+        "arm_joint_us": tel.get("arm_joint_us"),
+        "mode": STATE.get("mode"),
+    })
+
+
+@app.route("/api/arm_jog", methods=["POST"])
+def api_arm_jog():
+    """Pulse one joint via Pi manual PWM (connectivity test). Requires DRIVE/ARMED."""
+    if not _robot_armed():
+        return jsonify({"ok": False, "msg": "Switch to DRIVE/ARMED first"}), 403
+    data = request.get_json(force=True) or {}
+    try:
+        joint_i = int(data.get("joint", 5))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "Invalid joint"}), 400
+    if joint_i not in JOINT_TO_AUX:
+        return jsonify({"ok": False, "msg": "Joint must be 1–7"}), 400
+    aux = JOINT_TO_AUX[joint_i]
+    pwm = _clamp_arm_pwm(data.get("pwm", 1600))
+    center = _clamp_arm_pwm(data.get("center_pwm", 1500))
+    label = ARM_JOINT_NAMES[joint_i - 1]
+    hold_sec = float(data.get("hold_sec", 1.0))
+
+    ok1, msg1 = _send_pi_arm_control({
+        "cmd": "manual_pwm", "enabled": True, "aux": aux, "pwm": pwm,
+    })
+    if not ok1:
+        return jsonify({"ok": False, "msg": msg1}), 500
+
+    def _restore():
+        time.sleep(hold_sec)
+        _send_pi_arm_control({
+            "cmd": "manual_pwm", "enabled": True, "aux": aux, "pwm": center,
+        })
+
+    threading.Thread(target=_restore, daemon=True, name=f"arm-jog-{label}").start()
+    return jsonify({
+        "ok": True,
+        "msg": f"Jog {label} → {pwm} µs for {hold_sec:.1f}s",
+        "joint": joint_i,
+        "aux": aux,
+        "pwm": pwm,
+    })
 
 
 @app.route("/api/arm_imu_zero", methods=["POST"])
@@ -2444,12 +2599,84 @@ def api_telemetry_record():
         STATE["telemetry_recording"] = True
         STATE["telemetry_record_file"] = str(path)
         emit_status()
-        return jsonify({"ok": True, "recording": True, "file": str(path)})
+        return jsonify({"ok": True, "recording": True, "file": str(path), "session": stamp})
 
     STATE["telemetry_recording"] = False
     prev = STATE.get("telemetry_record_file", "")
     emit_status()
     return jsonify({"ok": True, "recording": False, "file": prev})
+
+
+@app.route("/api/video_record", methods=["POST"])
+def api_video_record():
+    data = request.get_json(force=True) or {}
+    action = data.get("action", "toggle")
+    mode = str(data.get("mode", "overlay")).strip().lower()
+    if mode not in ("overlay", "raw", "both"):
+        return jsonify({"ok": False, "msg": f"Unknown video mode: {mode}"}), 400
+
+    if action == "start" or (action == "toggle" and not STATE["video_recording"]):
+        VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        STATE["video_recording"] = True
+        STATE["video_record_session"] = stamp
+        STATE["video_record_mode"] = mode
+        STATE["video_record_files"] = []
+        emit_status()
+        return jsonify({
+            "ok": True,
+            "recording": True,
+            "session": stamp,
+            "mode": mode,
+        })
+
+    session = STATE.get("video_record_session", "")
+    video_files = list(STATE.get("video_record_files", []))
+    prev_mode = STATE.get("video_record_mode", "")
+    STATE["video_recording"] = False
+    STATE["video_record_mode"] = ""
+    emit_status()
+    return jsonify({
+        "ok": True,
+        "recording": False,
+        "session": session,
+        "mode": prev_mode,
+        "video_files": video_files,
+    })
+
+
+@app.route("/api/video_record/upload", methods=["POST"])
+def api_video_record_upload():
+    session = (request.form.get("session") or "").strip()
+    camera = (request.form.get("camera") or "unknown").strip().lower()
+    variant = (request.form.get("variant") or "overlay").strip().lower()
+    upload = request.files.get("video")
+    if not session or not upload:
+        return jsonify({"ok": False, "msg": "Missing session or video payload"}), 400
+    if camera not in ("forward", "arm"):
+        return jsonify({"ok": False, "msg": f"Unknown camera: {camera}"}), 400
+    if variant not in ("overlay", "raw"):
+        return jsonify({"ok": False, "msg": f"Unknown variant: {variant}"}), 400
+
+    ext = Path(upload.filename or "").suffix.lower()
+    if ext not in (".webm", ".mp4", ".mkv"):
+        ext = ".webm"
+
+    try:
+        VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+        path = VIDEO_DIR / f"dive_{session}_{camera}_{variant}{ext}"
+        upload.save(str(path))
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+    saved = str(path)
+    with _state_lock:
+        files = list(STATE.get("video_record_files", []))
+        if saved not in files:
+            files.append(saved)
+        STATE["video_record_files"] = files
+    emit_status()
+    return jsonify({"ok": True, "file": saved, "camera": camera, "variant": variant, "session": session})
 
 
 @app.route("/api/status")
@@ -2472,6 +2699,10 @@ def api_status():
         "telemetry":             STATE["telemetry"],
         "telemetry_recording":   STATE["telemetry_recording"],
         "telemetry_record_file": STATE.get("telemetry_record_file", ""),
+        "video_recording":       STATE["video_recording"],
+        "video_record_session":  STATE.get("video_record_session", ""),
+        "video_record_mode":     STATE.get("video_record_mode", ""),
+        "video_record_files":    list(STATE.get("video_record_files", [])),
         "link_health":           _compute_link_health(),
         "arm_last_pwm":          STATE.get("arm_last_pwm"),
         "preset_running":        STATE.get("preset_running", False),
@@ -2479,6 +2710,8 @@ def api_status():
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
         "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS)),
         "claw_hold":             STATE.get("claw_hold", True),
+        "arm_motion_enabled":    _robot_armed(),
+        "arm_pi_enabled":        STATE.get("telemetry", {}).get("arm_enabled"),
     })
 
 
@@ -2575,6 +2808,7 @@ def main():
     _start_arm_telemetry_subscribe_loop()
     _start_control_keepalive()
     _sync_arm_power()
+    _apply_disarmed_arm_lockout()
     threading.Thread(target=_monitor_loop, daemon=True).start()
 
     url = f"http://localhost:{args.port}"

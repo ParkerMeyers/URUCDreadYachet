@@ -16,6 +16,9 @@ const ONBOARD_DOT_BY_STEP = {
 };
 const ONBOARD_DOTS = Object.values(ONBOARD_DOT_BY_STEP);
 let _telemetryRecording = false;
+let _videoRecording = false;
+let _videoRecordSession = '';
+let _videoRecordMode = '';
 let _lastBatteryToast = '';
 let _missionPollTimer = null;
 let socket = null;
@@ -323,6 +326,12 @@ function updateArmControlsUI() {
     armImuZeroBtn.disabled = !imuOk;
     armImuZeroBtn.classList.toggle('disabled', !imuOk);
   }
+  const armJogBtn = document.getElementById('btn-arm-jog');
+  if (armJogBtn) {
+    const jogOk = isRobotArmed() && !!_status.onboard_arm;
+    armJogBtn.disabled = !jogOk;
+    armJogBtn.classList.toggle('disabled', !jogOk);
+  }
 }
 
 function handlePresetProgress(data) {
@@ -375,7 +384,7 @@ async function setMode(mode) {
   const modeNames = { disarmed:'DISARMED', armed:'DRIVE/ARMED', stabilize:'STABILIZE' };
   toast('Mode: ' + (modeNames[mode] || mode.toUpperCase()), mode === 'disarmed' ? '' : 'ok');
   if (mode === 'disarmed') {
-    toast('Arm motion locked — switch to ARMED to move joints', 'warn');
+    toast('Arm motion locked — switch to DRIVE/ARMED to move joints', 'warn');
   }
 }
 
@@ -777,21 +786,540 @@ async function toggleTelemetryRecord() {
     body: JSON.stringify({ action }),
   });
   const d = await r.json();
-  if (d.ok) {
-    _telemetryRecording = !!d.recording;
-    updateRecordButton();
-    toast(
-      d.recording ? `Recording → ${d.file}` : `Recording stopped (${d.file || 'none'})`,
-      d.recording ? 'ok' : ''
-    );
+  if (!d.ok) {
+    toast(d.msg || 'Log record failed', 'err');
+    return;
+  }
+  _telemetryRecording = !!d.recording;
+  updateLogRecordButton();
+  toast(
+    d.recording ? `Telemetry log → ${d.file}` : `Log saved (${d.file || 'none'})`,
+    d.recording ? 'ok' : ''
+  );
+}
+
+function updateLogRecordButton() {
+  const btn = document.getElementById('btn-log-record');
+  if (!btn) return;
+  btn.textContent = _telemetryRecording ? '⏹ LOG' : '📊 LOG';
+  btn.classList.toggle('recording', _telemetryRecording);
+  btn.title = _telemetryRecording
+    ? 'Stop telemetry CSV log'
+    : 'Start telemetry CSV log';
+}
+
+function sessionFromRecordFile(filePath) {
+  const m = String(filePath || '').match(/dive_(\d{8}_\d{6})/);
+  return m ? m[1] : '';
+}
+
+function updateVideoRecordButton() {
+  const btn = document.getElementById('btn-video-record');
+  if (!btn) return;
+  if (_videoRecording && _videoRecordStartMs) {
+    const modeLabel = { overlay: 'OVL', raw: 'RAW', both: 'BOTH' }[_videoRecordMode] || 'VID';
+    btn.textContent = `⏹ ${modeLabel} ${formatRecordDuration(Date.now() - _videoRecordStartMs)}`;
+  } else {
+    btn.textContent = '🎬 VID ▾';
+  }
+  btn.classList.toggle('recording', _videoRecording);
+  btn.title = _videoRecording
+    ? `Stop video recording (${_videoRecordMode || 'active'})`
+    : 'Record camera video';
+}
+
+function toggleVideoRecordDropdown(event) {
+  if (event) event.stopPropagation();
+  if (_videoRecording) {
+    stopVideoRecord();
+    return;
+  }
+  const dd = document.getElementById('video-record-dropdown');
+  if (!dd) return;
+  dd.classList.toggle('open');
+}
+
+function closeVideoRecordDropdown() {
+  const dd = document.getElementById('video-record-dropdown');
+  if (dd) dd.classList.remove('open');
+}
+
+async function startVideoRecord(mode) {
+  closeVideoRecordDropdown();
+  if (_videoRecording) {
+    await stopVideoRecord();
+    return;
+  }
+  if (typeof MediaRecorder === 'undefined') {
+    toast('Video recording not supported in this browser', 'err');
+    return;
+  }
+
+  const r = await fetch('/api/video_record', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'start', mode }),
+  });
+  const d = await r.json();
+  if (!d.ok) {
+    toast(d.msg || 'Video record failed', 'err');
+    return;
+  }
+
+  _videoRecordSession = d.session || '';
+  _videoRecordMode = mode;
+  const variants = mode === 'both' ? ['overlay', 'raw'] : [mode];
+  let started = 0;
+  destroyVideoRecorders();
+  for (const variant of variants) {
+    for (const camNum of [1, 2]) {
+      const rec = createCanvasVideoRecorder(camNum, variant);
+      _videoRecorders[`${camNum}-${variant}`] = rec;
+      if (await rec.start(_videoRecordSession)) started++;
+    }
+  }
+  if (!started) {
+    destroyVideoRecorders();
+    await fetch('/api/video_record', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'stop' }),
+    });
+    toast('Video record failed — no camera frames', 'err');
+    return;
+  }
+
+  _videoRecording = true;
+  setVideoRecordUI(true);
+  startVideoRecordTimer();
+  updateVideoRecordButton();
+  const labels = { overlay: 'overlay', raw: 'raw', both: 'overlay + raw' };
+  toast(`Video recording (${labels[mode] || mode}) → logs/videos/`, 'ok');
+}
+
+async function stopVideoRecord() {
+  closeVideoRecordDropdown();
+  if (!_videoRecording) return [];
+
+  stopVideoRecordTimer();
+  setVideoRecordUI(false);
+  const saved = [];
+  const tasks = Object.values(_videoRecorders).map(async (rec) => {
+    const blob = await rec.stop();
+    if (!blob || blob.size < 128) return null;
+    const up = await rec.upload(blob);
+    if (up.ok) {
+      saved.push(up.file);
+      return up.file;
+    }
+    rec.downloadFallback(blob);
+    saved.push(`download:${rec.variant}-${_CAM_RECORD_META[rec.camNum].name}`);
+    return null;
+  });
+  await Promise.all(tasks);
+  destroyVideoRecorders();
+
+  const r = await fetch('/api/video_record', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'stop' }),
+  });
+  const d = await r.json();
+  _videoRecording = false;
+  _videoRecordMode = '';
+  _videoRecordSession = '';
+  updateVideoRecordButton();
+  const count = saved.length || (d.video_files || []).length;
+  toast(count ? `Video saved (${count} file${count === 1 ? '' : 's'}) → logs/videos/` : 'Video stopped', count ? 'ok' : '');
+  return saved;
+}
+
+// ─────────────────────────────────────────────────────────────
+// VIDEO RECORDING (overlay + raw canvas composite + MediaRecorder)
+// ─────────────────────────────────────────────────────────────
+const VIDEO_RECORD_FPS = 15;
+const _videoRecorders = {};
+let _videoRecordTimer = null;
+let _videoRecordStartMs = 0;
+
+const _CAM_RECORD_META = {
+  1: {
+    imgId: 'cam1', hudId: 'hud1', wrapId: 'cam-wrap-1', name: 'forward', label: 'CAM 1 / FORWARD',
+    drawTel: drawForwardTelemetryPanel,
+  },
+  2: {
+    imgId: 'cam2', hudId: 'hud2', wrapId: 'cam-wrap-2', name: 'arm', label: 'CAM 2 / ARM',
+    drawTel: drawArmTelemetryPanel,
+  },
+};
+
+function pickVideoMimeType() {
+  if (typeof MediaRecorder === 'undefined') return '';
+  const types = [
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm',
+  ];
+  for (const t of types) {
+    if (MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';
+}
+
+function drawContainedImage(ctx, img, W, H) {
+  const iw = img.naturalWidth;
+  const ih = img.naturalHeight;
+  if (!iw || !ih) return false;
+  const scale = Math.min(W / iw, H / ih);
+  const dw = iw * scale;
+  const dh = ih * scale;
+  const dx = (W - dw) / 2;
+  const dy = (H - dh) / 2;
+  ctx.drawImage(img, dx, dy, dw, dh);
+  return true;
+}
+
+function drawTelemetryLine(ctx, x, y, label, value, valueColor, labelSize, valueSize) {
+  ctx.font = `${labelSize}px monospace`;
+  ctx.textAlign = 'right';
+  ctx.fillStyle = 'rgba(220,230,255,0.85)';
+  ctx.fillText(label, x, y);
+  const lw = ctx.measureText(label).width;
+  ctx.font = `bold ${valueSize}px monospace`;
+  ctx.fillStyle = valueColor;
+  ctx.fillText(value, x + lw + 6, y);
+}
+
+function drawForwardTelemetryPanel(ctx, W, H, t) {
+  const scale = Math.max(0.65, H / 520);
+  const base = 12 * scale;
+  const depthVal = 14 * scale;
+  const x = W - 10 * scale;
+  let y = 18 * scale;
+  const lineH = 18 * scale;
+
+  ctx.save();
+  ctx.textBaseline = 'alphabetic';
+  drawTelemetryLine(ctx, x, y, 'DEPTH ', fmtNum(t.depth_m, 2, 'm'),
+    'rgba(0,224,138,0.95)', base * 1.05, depthVal);
+  y += lineH * 1.15;
+  drawTelemetryLine(ctx, x, y, 'HOLD  ', fmtNum(t.hold_depth_m, 2, 'm'),
+    'rgba(220,230,255,0.85)', base, base);
+  y += lineH;
+  drawTelemetryLine(ctx, x, y, 'YAW   ', fmtNum(t.yaw_deg, 1, '°'),
+    'rgba(0,224,138,0.95)', base, base);
+  y += lineH;
+  drawTelemetryLine(ctx, x, y, 'ROLL  ', fmtNum(t.roll_deg, 1, '°'),
+    'rgba(0,224,138,0.95)', base, base);
+  y += lineH;
+  drawTelemetryLine(ctx, x, y, 'PITCH ', fmtNum(t.pitch_deg, 1, '°'),
+    'rgba(0,224,138,0.95)', base, base);
+  y += lineH;
+  const stabOn = !!t.stabilize;
+  drawTelemetryLine(ctx, x, y, 'STAB  ', stabOn ? 'ON' : 'OFF',
+    stabOn ? 'rgba(0,224,138,0.95)' : 'rgba(220,230,255,0.85)', base, base);
+  y += lineH;
+  const battCls = _batteryClass(t.battery_voltage_v);
+  const battColor = battCls === 'val-warn' ? 'rgba(255,179,32,0.95)' : 'rgba(0,224,138,0.95)';
+  drawTelemetryLine(ctx, x, y, 'BATT  ', t.battery_voltage_v != null ? fmtNum(t.battery_voltage_v, 2, 'V') : '--',
+    battColor, base, base);
+  ctx.restore();
+}
+
+function drawArmTelemetryPanel(ctx, W, H, t) {
+  const scale = Math.max(0.65, H / 520);
+  const base = 11 * scale;
+  const x = W - 10 * scale;
+  let y = 18 * scale;
+  const lineH = 17 * scale;
+  const armPktFresh = t.arm_telemetry_age_sec == null || t.arm_telemetry_age_sec <= 5.0;
+  const armHasAngle = t.arm_imu_ok && t.arm_imu_angle_deg != null && armPktFresh;
+
+  ctx.save();
+  ctx.textBaseline = 'alphabetic';
+  drawTelemetryLine(ctx, x, y, 'GRIP  ', armHasAngle ? fmtNum(t.arm_imu_angle_deg, 1, '°') : '--',
+    armHasAngle ? 'rgba(0,224,138,0.95)' : 'rgba(255,179,32,0.95)', base, base);
+  y += lineH;
+  drawTelemetryLine(ctx, x, y, 'TGT   ', t.arm_j6_target_deg != null ? fmtNum(t.arm_j6_target_deg, 1, '°') : '--',
+    'rgba(220,230,255,0.85)', base, base);
+  y += lineH;
+  let imuText = 'NO DATA';
+  let imuColor = 'rgba(255,179,32,0.95)';
+  if (armHasAngle && t.arm_imu_stale) {
+    imuText = 'STALE';
+  } else if (armHasAngle) {
+    imuText = t.arm_j6_manual ? 'MAN' : 'HOLD';
+    imuColor = t.arm_j6_manual ? 'rgba(255,179,32,0.95)' : 'rgba(0,224,138,0.95)';
+  } else if (t.arm_bno_ready && !armPktFresh) {
+    imuText = 'LINK';
+  }
+  drawTelemetryLine(ctx, x, y, 'IMU   ', imuText, imuColor, base, base);
+  ctx.restore();
+}
+
+function drawRecordBadge(ctx, W, scale) {
+  const r = 5 * scale;
+  ctx.fillStyle = 'rgba(255,61,90,0.95)';
+  ctx.beginPath();
+  ctx.arc(18 * scale, 18 * scale, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.font = `bold ${Math.max(9, 10 * scale)}px monospace`;
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(255,61,90,0.95)';
+  ctx.fillText('REC', 28 * scale, 22 * scale);
+}
+
+function compositeOverlayFrame(recCanvas, camNum, t, lockedW, lockedH) {
+  const meta = _CAM_RECORD_META[camNum];
+  if (!meta || !recCanvas) return false;
+  const wrap = document.getElementById(meta.wrapId);
+  const img = document.getElementById(meta.imgId);
+  const hud = document.getElementById(meta.hudId);
+  if (!wrap) return false;
+
+  const W = lockedW || wrap.clientWidth;
+  const H = lockedH || wrap.clientHeight;
+  if (W < 32 || H < 32) return false;
+
+  recCanvas.width = W;
+  recCanvas.height = H;
+  const ctx = recCanvas.getContext('2d');
+  ctx.fillStyle = '#05080c';
+  ctx.fillRect(0, 0, W, H);
+
+  if (img && img.style.display === 'block' && img.naturalWidth > 0) {
+    drawContainedImage(ctx, img, W, H);
+  }
+
+  if (hud && hud.width > 0 && hud.height > 0) {
+    ctx.drawImage(hud, 0, 0, hud.width, hud.height, 0, 0, W, H);
+  }
+
+  meta.drawTel(ctx, W, H, t);
+
+  const scale = Math.max(0.65, H / 520);
+  ctx.font = `bold ${Math.max(8, 9 * scale)}px sans-serif`;
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(0,212,255,0.75)';
+  ctx.fillText(meta.label, 10 * scale, 18 * scale);
+  drawRecordBadge(ctx, W, scale);
+
+  const banner = document.getElementById('disarmed-banner');
+  if (camNum === 1 && banner && !banner.classList.contains('hidden')) {
+    const text = banner.textContent || 'DISARMED';
+    ctx.font = `bold ${Math.max(11, 13 * scale)}px sans-serif`;
+    ctx.textAlign = 'center';
+    const bw = Math.min(W * 0.85, ctx.measureText(text).width + 36 * scale);
+    const bh = 28 * scale;
+    const bx = (W - bw) / 2;
+    const by = H - bh - 12 * scale;
+    ctx.fillStyle = 'rgba(255,61,90,0.92)';
+    ctx.beginPath();
+    ctx.roundRect(bx, by, bw, bh, 8 * scale);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.fillText(text, W / 2, by + bh * 0.68);
+  }
+
+  return true;
+}
+
+function compositeRawFrame(recCanvas, camNum) {
+  const meta = _CAM_RECORD_META[camNum];
+  if (!meta || !recCanvas) return false;
+  const img = document.getElementById(meta.imgId);
+  if (!img || img.style.display !== 'block' || img.naturalWidth <= 0) return false;
+
+  const W = img.naturalWidth;
+  const H = img.naturalHeight;
+  recCanvas.width = W;
+  recCanvas.height = H;
+  const ctx = recCanvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, W, H);
+  return true;
+}
+
+function getRecordCanvasSize(camNum, variant, wrap) {
+  if (variant === 'raw') {
+    const img = document.getElementById(_CAM_RECORD_META[camNum].imgId);
+    if (img && img.naturalWidth > 0 && img.naturalHeight > 0) {
+      return { w: img.naturalWidth, h: img.naturalHeight };
+    }
+  }
+  return { w: wrap.clientWidth, h: wrap.clientHeight };
+}
+
+function createCanvasVideoRecorder(camNum, variant) {
+  const meta = _CAM_RECORD_META[camNum];
+  const recordCanvas = document.createElement('canvas');
+  recordCanvas.style.display = 'none';
+  document.body.appendChild(recordCanvas);
+
+  let mediaRecorder = null;
+  let stream = null;
+  let chunks = [];
+  let rafId = null;
+  let lastFrameTime = 0;
+  let session = '';
+  let active = false;
+  let lockedW = 0;
+  let lockedH = 0;
+
+  function paintFrame() {
+    if (variant === 'raw') {
+      return compositeRawFrame(recordCanvas, camNum);
+    }
+    return compositeOverlayFrame(recordCanvas, camNum, _tel, lockedW, lockedH);
+  }
+
+  function frameLoop(now) {
+    if (!active) return;
+    rafId = requestAnimationFrame(frameLoop);
+    const interval = 1000 / VIDEO_RECORD_FPS;
+    if (now - lastFrameTime < interval) return;
+    lastFrameTime = now;
+    paintFrame();
+  }
+
+  async function start(sess) {
+    if (active) return true;
+    if (typeof MediaRecorder === 'undefined') return false;
+
+    const wrap = document.getElementById(meta.wrapId);
+    if (!wrap) return false;
+
+    session = sess;
+    chunks = [];
+    const size = getRecordCanvasSize(camNum, variant, wrap);
+    lockedW = size.w;
+    lockedH = size.h;
+    if (lockedW < 32 || lockedH < 32) return false;
+    if (!paintFrame()) return false;
+
+    const mime = pickVideoMimeType();
+    stream = recordCanvas.captureStream(VIDEO_RECORD_FPS);
+    try {
+      mediaRecorder = mime
+        ? new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 4_000_000 })
+        : new MediaRecorder(stream, { videoBitsPerSecond: 4_000_000 });
+    } catch (e) {
+      console.warn('MediaRecorder init failed', e);
+      stream.getTracks().forEach(tr => tr.stop());
+      return false;
+    }
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+    mediaRecorder.onerror = (e) => console.error('MediaRecorder error', e);
+    mediaRecorder.start(2000);
+    active = true;
+    lastFrameTime = 0;
+    rafId = requestAnimationFrame(frameLoop);
+    return true;
+  }
+
+  function stop() {
+    return new Promise((resolve) => {
+      if (!active) {
+        resolve(null);
+        return;
+      }
+      active = false;
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+
+      const finalize = () => {
+        if (stream) stream.getTracks().forEach(tr => tr.stop());
+        if (!chunks.length) {
+          resolve(null);
+          return;
+        }
+        const mime = mediaRecorder?.mimeType || 'video/webm';
+        resolve(new Blob(chunks, { type: mime }));
+      };
+
+      if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+        finalize();
+        return;
+      }
+      mediaRecorder.onstop = finalize;
+      try {
+        mediaRecorder.stop();
+      } catch (_) {
+        finalize();
+      }
+    });
+  }
+
+  async function upload(blob) {
+    if (!blob || !session) return { ok: false, msg: 'empty blob' };
+    const fd = new FormData();
+    fd.append('session', session);
+    fd.append('camera', meta.name);
+    fd.append('variant', variant);
+    fd.append('video', blob, `dive_${session}_${meta.name}_${variant}.webm`);
+    try {
+      const r = await fetch('/api/video_record/upload', { method: 'POST', body: fd });
+      return r.json();
+    } catch (e) {
+      return { ok: false, msg: e.message };
+    }
+  }
+
+  function downloadFallback(blob) {
+    if (!blob) return;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `dive_${session}_${meta.name}_${variant}.webm`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  function destroy() {
+    active = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    if (stream) stream.getTracks().forEach(tr => tr.stop());
+    recordCanvas.remove();
+  }
+
+  return { camNum, variant, start, stop, upload, downloadFallback, destroy };
+}
+
+function setVideoRecordUI(active) {
+  document.querySelectorAll('.cam-wrap').forEach(el => {
+    el.classList.toggle('video-recording', active);
+  });
+}
+
+function startVideoRecordTimer() {
+  stopVideoRecordTimer();
+  _videoRecordStartMs = Date.now();
+  _videoRecordTimer = setInterval(() => {
+    if (!_videoRecording) return;
+    updateVideoRecordButton();
+  }, 1000);
+}
+
+function stopVideoRecordTimer() {
+  if (_videoRecordTimer) {
+    clearInterval(_videoRecordTimer);
+    _videoRecordTimer = null;
   }
 }
 
-function updateRecordButton() {
-  const btn = document.getElementById('btn-record');
-  if (!btn) return;
-  btn.textContent = _telemetryRecording ? '⏹ REC' : '⏺ REC';
-  btn.classList.toggle('recording', _telemetryRecording);
+function formatRecordDuration(ms) {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function destroyVideoRecorders() {
+  Object.values(_videoRecorders).forEach(rec => rec.destroy());
+  for (const k of Object.keys(_videoRecorders)) delete _videoRecorders[k];
 }
 
 async function takeSnapshot(camNum) {
@@ -963,6 +1491,37 @@ async function zeroArmIMU() {
   toast(d.ok ? `Arm IMU zeroed${detail}` : (d.msg || 'Arm IMU zero failed'), d.ok ? 'ok' : 'err');
 }
 
+async function armJogTest() {
+  if (!isRobotArmed()) {
+    toast('Switch to DRIVE/ARMED first', 'warn');
+    return;
+  }
+  const r = await fetch('/api/arm_jog', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ joint: 5, pwm: 1650, hold_sec: 1.2 }),
+  });
+  const d = await r.json();
+  toast(d.ok ? d.msg : (d.msg || 'Arm jog failed'), d.ok ? 'ok' : 'err');
+}
+
+async function armDiagnostic() {
+  const r = await fetch('/api/arm_diagnostic');
+  const d = await r.json();
+  if (!d.ok) {
+    toast('Arm diagnostic failed', 'err');
+    return;
+  }
+  const failed = (d.checks || []).filter(c => !c.ok);
+  if (!failed.length) {
+    toast('Arm pipeline OK — all checks passed', 'ok');
+    return;
+  }
+  const lines = failed.map(c => `${c.name}: ${c.detail}`).join('\n');
+  toast(`Arm issues (${failed.length}):\n${lines}`, 'warn');
+  if (d.hint) toast(d.hint, '');
+}
+
 function updateFlagUI() {
   const stabBtn  = document.getElementById('flag-stab');
   const depthBtn = document.getElementById('flag-depth');
@@ -1005,6 +1564,31 @@ function updateFlagUI() {
 // ─────────────────────────────────────────────────────────────
 // STATUS UPDATES
 // ─────────────────────────────────────────────────────────────
+function updateArmPipelineTelemetry(t) {
+  t = t || _tel || {};
+  const armRx = document.getElementById('tel-arm-rx');
+  if (armRx) {
+    const rx = t.arm_rx_count;
+    armRx.textContent = rx != null ? String(rx) : '--';
+    armRx.className = 'tc-val ' + (rx != null && rx > 0 ? 'good' : 'warn');
+    armRx.title = rx > 0 ? 'Pi receiving arm_sender UDP' : 'No UDP on Pi — check arm USB controller';
+  }
+  const armMav = document.getElementById('tel-arm-mav');
+  if (armMav) {
+    if (t.arm_mavlink_ok === true) {
+      armMav.textContent = 'OK';
+      armMav.className = 'tc-val good';
+    } else if (t.arm_mavlink_ok === false) {
+      armMav.textContent = 'DOWN';
+      armMav.className = 'tc-val bad';
+      armMav.title = 'new_ar.py has no MAVLink — check MAVProxy on Pi';
+    } else {
+      armMav.textContent = '--';
+      armMav.className = 'tc-val';
+    }
+  }
+}
+
 function updateStatus() {
   const s = _status;
 
@@ -1067,13 +1651,35 @@ function updateStatus() {
 
   const ap = document.getElementById('tel-arm-proc');
   if (ap) {
-    ap.textContent = s.arm_running ? 'RUN' : 'STOP';
-    ap.className   = 'tc-val ' + (s.arm_running ? 'good' : 'bad');
+    if (!s.arm_running) {
+      ap.textContent = 'STOP';
+      ap.className = 'tc-val bad';
+    } else if (!s.arm_motion_enabled) {
+      ap.textContent = 'LOCK';
+      ap.className = 'tc-val warn';
+      ap.title = 'Arm locked — switch to DRIVE/ARMED';
+    } else if (s.arm_pi_enabled === false) {
+      ap.textContent = 'WAIT';
+      ap.className = 'tc-val warn';
+      ap.title = 'Waiting for Pi arm controller enable';
+    } else {
+      ap.textContent = 'RUN';
+      ap.className = 'tc-val good';
+      ap.title = 'Arm sender running, motion enabled';
+    }
   }
+  updateArmPipelineTelemetry(_tel);
 
   if (typeof s.telemetry_recording !== 'undefined') {
     _telemetryRecording = s.telemetry_recording;
-    updateRecordButton();
+    updateLogRecordButton();
+  }
+  if (typeof s.video_recording !== 'undefined') {
+    _videoRecording = !!s.video_recording;
+    if (s.video_record_session) _videoRecordSession = s.video_record_session;
+    if (s.video_record_mode) _videoRecordMode = s.video_record_mode;
+    setVideoRecordUI(_videoRecording);
+    updateVideoRecordButton();
   }
 
   if (s.arm_last_pwm) {
@@ -1233,6 +1839,7 @@ function updateTelemetry() {
 
   updateFlagUI();
   updateArmControlsUI();
+  updateArmPipelineTelemetry(t);
 
   // Telemetry bar
   const state = t.rx_state || '--';
@@ -2383,6 +2990,9 @@ async function _doOpenControl() {
 }
 
 function showLaunch() {
+  if (_telemetryRecording) toggleTelemetryRecord();
+  if (_videoRecording) stopVideoRecord();
+  closeVideoRecordDropdown();
   stopAllCameras();
   stopMissionPoll();
   document.getElementById('control').classList.remove('active');
@@ -2552,6 +3162,10 @@ window.addEventListener('load', async () => {
 
   // Poll status every 2s as WebSocket fallback
   setInterval(() => socketEmit('request_status'), 2000);
+  document.addEventListener('click', (e) => {
+    const dd = document.getElementById('video-record-dropdown');
+    if (dd && !dd.contains(e.target)) closeVideoRecordDropdown();
+  });
   // HTTP fallback when Socket.IO is down
   setInterval(async () => {
     if (socket && socket.connected) return;

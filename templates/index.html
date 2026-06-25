@@ -224,7 +224,7 @@
       </div>
       <img id="cam1" class="cam-img" style="display:none" alt="Forward Camera"/>
       <canvas id="hud1" class="cam-hud"></canvas>
-      <div id="disarmed-banner" class="disarmed-banner hidden">⚠ DISARMED — select DRIVE/ARMED to move thrusters</div>
+      <div id="disarmed-banner" class="disarmed-banner hidden">⚠ DISARMED — select DRIVE/ARMED to move thrusters and arm</div>
       <div class="cam-label">CAM 1 / FORWARD</div>
       <div class="cam-telemetry cam-telemetry-unified" id="cam-tel">
         <div class="tel-depth-line">DEPTH <span class="val-hi" id="cam-depth">--</span>m</div>
@@ -287,7 +287,24 @@
     <button class="action-btn" onclick="calibrateIMU()">⊕ ZERO IMU</button>
     <button class="action-btn" onclick="takeSnapshot(1)">📷 FWD</button>
     <button class="action-btn" onclick="takeSnapshot(2)">📷 ARM</button>
-    <button class="action-btn" id="btn-record" onclick="toggleTelemetryRecord()">⏺ REC</button>
+    <button class="action-btn" id="btn-log-record" onclick="toggleTelemetryRecord()"
+            title="Start/stop telemetry CSV log">📊 LOG</button>
+    <div class="record-dropdown" id="video-record-dropdown">
+      <button class="action-btn record-dropdown-toggle" id="btn-video-record"
+              onclick="toggleVideoRecordDropdown(event)"
+              title="Record camera video">🎬 VID ▾</button>
+      <div class="record-dropdown-menu" id="video-record-menu">
+        <button type="button" class="record-dropdown-item" onclick="startVideoRecord('overlay')">
+          Overlay — HUD + telemetry
+        </button>
+        <button type="button" class="record-dropdown-item" onclick="startVideoRecord('raw')">
+          Raw — camera only
+        </button>
+        <button type="button" class="record-dropdown-item" onclick="startVideoRecord('both')">
+          Both — overlay + raw
+        </button>
+      </div>
+    </div>
     <button class="action-btn" onclick="startColmap()">▶ COLMAP</button>
     <button class="action-btn" onclick="startCrabs()">🦀 CRABS</button>
 
@@ -296,6 +313,8 @@
     <span class="control-label">Arm</span>
     <span id="arm-preset-btns" class="arm-preset-btns"></span>
     <button class="action-btn" id="btn-arm-imu-zero" onclick="zeroArmIMU()">⊕ ZERO ARM IMU</button>
+    <button class="action-btn" id="btn-arm-jog" onclick="armJogTest()">↔ Test J5</button>
+    <button class="action-btn" id="btn-arm-diag" onclick="armDiagnostic()">🔍 Arm Diag</button>
     <button class="action-btn" id="btn-manual-pwm" onclick="showManualPwm()">⌨ Manual AUX</button>
     <button class="action-btn" onclick="showArmPresets()">⚙ Presets</button>
 
@@ -401,6 +420,14 @@
     <div class="telem-cell">
       <span class="tc-label">Arm →Pi</span>
       <span class="tc-val" id="tel-arm-proc">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Arm Rx</span>
+      <span class="tc-val" id="tel-arm-rx">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Arm MAV</span>
+      <span class="tc-val" id="tel-arm-mav">--</span>
     </div>
   </div>
 

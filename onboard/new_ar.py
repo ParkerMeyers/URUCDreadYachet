@@ -40,7 +40,7 @@ import time
 
 from pymavlink import mavutil
 
-from mavlink_rc import MAVLINK_ONBOARD, connect_mavlink, send_rc_channels_override, wait_for_heartbeat
+from mavlink_rc import MAVLINK_ONBOARD_ARM, connect_mavlink, send_rc_channels_override, wait_for_heartbeat
 
 # ── Optional hardware (initialized lazily — I2C/GPIO can block at import) ─────
 _bno = None
@@ -53,7 +53,7 @@ BNO_INIT_RETRY_SEC = 1.0
 
 # ── Config ────────────────────────────────────────────────────────────────────
 UDP_PORT    = 5006
-MAVLINK_URL = MAVLINK_ONBOARD
+MAVLINK_URL = MAVLINK_ONBOARD_ARM
 MOSFET_GPIO = 17
 MOSFET_PORT = 5007
 CENTER_US   = 1500
@@ -236,9 +236,13 @@ def _init_optional_hardware() -> None:
         import lgpio as _lgpio_mod
         _lgpio = _lgpio_mod
         _gpio_h = _lgpio.gpiochip_open(0)
-        _lgpio.gpio_claim_output(_gpio_h, MOSFET_GPIO, 0)
+        _lgpio.gpio_claim_output(_gpio_h, MOSFET_GPIO, 1 if _mosfet_on else 0)
         HAVE_GPIO = True
-        print(f"[arm] lgpio ready — MOSFET on GPIO{MOSFET_GPIO}", flush=True)
+        print(
+            f"[arm] lgpio ready — MOSFET on GPIO{MOSFET_GPIO} "
+            f"({'ON' if _mosfet_on else 'OFF'})",
+            flush=True,
+        )
     except Exception as _e:
         HAVE_GPIO = False
         _lgpio = None
@@ -429,8 +433,14 @@ _mosfet_on     = True
 _manual_mode   = False
 _manual_aux_pwm = _default_manual_aux_pwm()
 _claw_hold_enabled = True
-_arm_enabled       = False
+_arm_enabled       = True   # topside sends arm_enable=false when DISARMED
+_mavlink_up        = False
+_mav_master        = None
+_mav_lock          = threading.Lock()
+_mav_connecting    = False
 _preset_motion     = False
+_preset_motion_since = 0.0
+PRESET_MOTION_TIMEOUT_SEC = 45.0
 _telem_sock    = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 _telem_subscribers: set = set()
 _telem_sub_lock = threading.Lock()
@@ -463,8 +473,15 @@ def _send_arm_telemetry(j6_pwm_out: int) -> None:
         claw_hold = _claw_hold_enabled
         imu_zero = _j6_imu_zero_offset
         imu_sign = _j6_imu_sign
+        rx_count = _rx_count
+        last_pkt = _last_pkt_time
+        joint_us = list(_joint_us)
+        armed = _arm_enabled
+        manual = _manual_mode
+        preset = _preset_motion
+    hold_neutral = _should_hold_neutral(last_pkt)
     imu_ok = _imu_available_for_autolevel()
-    manual = _j6_manual_mode(claw_hold)
+    j6_manual = _j6_manual_mode(claw_hold)
 
     payload = json.dumps({
         "type": "arm",
@@ -476,10 +493,16 @@ def _send_arm_telemetry(j6_pwm_out: int) -> None:
         "arm_j6_pwm_out": int(j6_pwm_out),
         "arm_claw_hold_request": bool(claw_hold),
         "arm_claw_hold_active": bool(claw_hold and imu_ok),
-        "arm_j6_manual": bool(manual),
-        "arm_enabled": bool(_arm_enabled),
+        "arm_j6_manual": bool(j6_manual),
+        "arm_enabled": bool(armed),
         "arm_imu_zero_offset": round(imu_zero, 2),
         "arm_imu_sign": round(imu_sign, 3),
+        "arm_rx_count": int(rx_count),
+        "arm_hold_neutral": bool(hold_neutral),
+        "arm_mavlink_ok": bool(_mavlink_up),
+        "arm_manual_mode": bool(manual),
+        "arm_preset_motion": bool(preset),
+        "arm_joint_us": joint_us,
     }).encode("utf-8")
 
     with _telem_sub_lock:
@@ -504,17 +527,19 @@ def _send_arm_telemetry(j6_pwm_out: int) -> None:
 
 def _apply_arm_enable_cmd(cmd: dict) -> None:
     """Enable/disable all arm motion (tied to ROV disarmed mode on topside)."""
-    global _arm_enabled, _manual_mode, _joint_us, _j6_target_deg, _last_pkt_time, _rx_count, _preset_motion
+    global _arm_enabled, _manual_mode, _preset_motion, _last_pkt_time
     enabled = bool(cmd.get("enabled", False))
     with _lock:
+        was_enabled = _arm_enabled
         _arm_enabled = enabled
         if not enabled:
             _manual_mode = False
             _preset_motion = False
-            _joint_us = _default_joint_us()
-            _j6_target_deg = 0.0
-            _last_pkt_time = 0.0
-            _rx_count = 0
+        else:
+            _preset_motion = False
+            # Avoid hold-neutral stall after disarm or Pi restart handshake.
+            if not was_enabled and (_rx_count > 0 or _last_pkt_time > 0):
+                _last_pkt_time = time.time()
     print(f"[arm] Arm {'ENABLED' if enabled else 'DISABLED (disarmed)'}", flush=True)
 
 
@@ -561,12 +586,13 @@ def _apply_arm_imu_zero_cmd(cmd: dict) -> None:
 
 def _apply_preset_motion_cmd(cmd: dict) -> None:
     """While enabled, ignore arm_sender UDP so preset steps are not overwritten."""
-    global _preset_motion, _manual_mode
+    global _preset_motion, _manual_mode, _preset_motion_since
     enabled = bool(cmd.get("enabled", False))
     with _lock:
         if not _arm_enabled and enabled:
             return
         _preset_motion = enabled
+        _preset_motion_since = time.time() if enabled else 0.0
         if enabled:
             _manual_mode = False
     print(
@@ -575,9 +601,24 @@ def _apply_preset_motion_cmd(cmd: dict) -> None:
     )
 
 
+def _maybe_clear_stale_preset_motion(now: float) -> None:
+    """Drop preset lock if topside never finished the sequence."""
+    global _preset_motion, _preset_motion_since
+    with _lock:
+        if not _preset_motion:
+            return
+        if _preset_motion_since <= 0:
+            return
+        if (now - _preset_motion_since) < PRESET_MOTION_TIMEOUT_SEC:
+            return
+        _preset_motion = False
+        _preset_motion_since = 0.0
+    print("[arm] Preset motion timeout — resuming arm_sender", flush=True)
+
+
 def _apply_preset_step_cmd(cmd: dict) -> None:
     """Apply one preset step (single joint moved in working pose)."""
-    global _joint_us, _j6_target_deg, _last_pkt_time
+    global _joint_us, _j6_target_deg, _last_pkt_time, _preset_motion_since
     pwms = cmd.get("pwm")
     if not isinstance(pwms, list) or len(pwms) < 7:
         return
@@ -588,6 +629,7 @@ def _apply_preset_step_cmd(cmd: dict) -> None:
         if "j6_angle" in cmd:
             _j6_target_deg = float(cmd["j6_angle"])
         _last_pkt_time = time.time()
+        _preset_motion_since = time.time()
 
 def _apply_manual_pwm_cmd(cmd: dict) -> None:
     """Handle manual AUX PWM commands from the web UI (overrides arm_sender UDP)."""
@@ -774,15 +816,126 @@ def _try_connect_mavlink():
             )
         else:
             print("[arm] *** No heartbeat in 8 s — continuing anyway ***", flush=True)
+        _request_aux_servo_stream(master)
         return master
     except Exception as e:
         print(f"[arm] MAVLink unavailable ({e}) — will retry", flush=True)
         return None
 
 
+def _request_aux_servo_stream(master) -> None:
+    """Ask FC for AUX RC + PWM output so we can detect override pipeline stalls."""
+    try:
+        ts = master.target_system or 1
+        tc = master.target_component or 1
+        for msg_id, interval_us in ((36, 500_000), (65, 500_000)):
+            master.mav.command_long_send(
+                ts, tc,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0, msg_id, interval_us, 0, 0, 0, 0, 0,
+            )
+    except Exception:
+        pass
+
+
+def _mavlink_connect_loop() -> None:
+    """Background MAVLink connect/reconnect — keeps the main loop responsive."""
+    global _mav_master, _mavlink_up, _mav_connecting
+    while True:
+        with _mav_lock:
+            connected = _mav_master is not None
+        if connected:
+            time.sleep(2.0)
+            continue
+        if _mav_connecting:
+            time.sleep(0.5)
+            continue
+        _mav_connecting = True
+        try:
+            master = _try_connect_mavlink()
+            if master is not None:
+                with _mav_lock:
+                    _mav_master = master
+                print("[arm] MAVLink link up — RC override active", flush=True)
+            else:
+                time.sleep(5.0)
+        finally:
+            _mav_connecting = False
+
+
+def _get_mavlink_master():
+    with _mav_lock:
+        return _mav_master
+
+
+def _drop_mavlink_master(reason: str = "") -> None:
+    global _mav_master, _mavlink_up
+    with _mav_lock:
+        master = _mav_master
+        _mav_master = None
+    _mavlink_up = False
+    if master is not None:
+        try:
+            master.close()
+        except Exception:
+            pass
+    if reason:
+        print(f"[arm] MAVLink dropped ({reason}) — will retry", flush=True)
+
+
+def _drain_mavlink(master) -> dict:
+    """Drain inbound MAVLink (required so TCP writes do not stall)."""
+    fc_rc: dict = {}
+    fc_srv: dict = {}
+    if master is None:
+        return {"fc_rc": fc_rc, "fc_srv": fc_srv}
+    for _ in range(80):
+        msg = master.recv_match(blocking=False)
+        if msg is None:
+            break
+        t = msg.get_type()
+        if t == "RC_CHANNELS":
+            for rc_ch in range(9, 17):
+                fc_rc[rc_ch] = getattr(msg, f"chan{rc_ch}_raw", 0)
+        elif t == "SERVO_OUTPUT_RAW":
+            for rc_ch in range(9, 17):
+                fc_srv[rc_ch] = getattr(msg, f"servo{rc_ch}_raw", 0)
+    return {"fc_rc": fc_rc, "fc_srv": fc_srv}
+
+
+def _maybe_warn_servo_mismatch(rc: list, fc_rc: dict, fc_srv: dict, hold_neutral: bool) -> None:
+    """Log when FC is not applying our AUX RC override (Mission Planner / MAVLink)."""
+    if hold_neutral:
+        return
+    targets = []
+    for joint_idx, rc_ch in JOINT_TO_RC_CH.items():
+        val = rc[rc_ch - 1]
+        if val == IGNORE or abs(val - _neutral_pwm_for_rc_ch(rc_ch)) <= J6_IN_DEADBAND:
+            continue
+        targets.append((rc_ch, int(val)))
+    if not targets or not fc_rc:
+        return
+    rc_ok = all(abs(fc_rc.get(ch, 0) - us) < 25 for ch, us in targets)
+    if not rc_ok:
+        print(
+            "[arm] *** AUX RC override not reaching FC — check MAVProxy tcp:5763 ***",
+            flush=True,
+        )
+        return
+    if not fc_srv:
+        return
+    srv_ok = all(abs(fc_srv.get(ch, 0) - us) < 25 for ch, us in targets)
+    if not srv_ok:
+        print(
+            "[arm] *** FC RC changed but AUX servo output did not — "
+            "set SERVO9-16_FUNCTION=1 (RCPassThru), BRD_SAFETYENABLE=0 ***",
+            flush=True,
+        )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    global _joint_us, _j6_target_deg, _last_pkt_time, _rx_count
+    global _joint_us, _j6_target_deg, _last_pkt_time, _rx_count, _mavlink_up
 
     print("[arm] Arm controller starting...", flush=True)
     threading.Thread(
@@ -800,33 +953,40 @@ def main():
     sock.settimeout(0.001)
 
     threading.Thread(target=_arm_control_listener, daemon=True).start()
+    threading.Thread(
+        target=_mavlink_connect_loop, daemon=True, name="arm-mavlink",
+    ).start()
 
     print(f"[arm] Listening on UDP {UDP_PORT}", flush=True)
     print(f"[arm] Manual AUX PWM on UDP {MOSFET_PORT} (cmd=manual_pwm)", flush=True)
     print(f"[arm] AUX1=J5  AUX2=J2  AUX3=J6  AUX4=J1  AUX5=J3  AUX6=J4  AUX7=Claw", flush=True)
-
-    master = _try_connect_mavlink()
-    print(f"[arm] BNO055={'yes' if HAVE_BNO else 'no'}  MOSFET={'yes' if HAVE_GPIO else 'no'}  "
-          f"MAVLink={'yes' if master else 'retrying'}", flush=True)
+    print(f"[arm] BNO055={'yes' if HAVE_BNO else 'pending'}  "
+          f"MOSFET={'yes' if HAVE_GPIO else 'pending'}  MAVLink=connecting", flush=True)
 
     last_send      = 0.0
     last_heartbeat = 0.0
     last_print     = 0.0
     last_telem     = 0.0
     last_j6_pwm    = J6_OUT_CENTER
-    last_mav_try   = time.time()
-    MAV_RETRY_SEC  = 5.0
+    last_servo_diag = 0.0
+    SERVO_DIAG_SEC = 3.0
+    last_fc_rc: dict = {}
+    last_fc_srv: dict = {}
 
     try:
         while True:
             now = time.time()
             _poll_imu_cache()
+            _maybe_clear_stale_preset_motion(now)
 
-            if master is None and (now - last_mav_try) >= MAV_RETRY_SEC:
-                last_mav_try = now
-                master = _try_connect_mavlink()
-                if master:
-                    print("[arm] MAVLink link up — RC override active", flush=True)
+            master = _get_mavlink_master()
+            _mavlink_up = master is not None
+            if master is not None:
+                drained = _drain_mavlink(master)
+                if drained["fc_rc"]:
+                    last_fc_rc = drained["fc_rc"]
+                if drained["fc_srv"]:
+                    last_fc_srv = drained["fc_srv"]
 
             # ── Receive UDP arm commands ──────────────────────────────────────
             try:
@@ -837,9 +997,7 @@ def main():
                 parts = line.split(",")
                 if len(parts) >= 7:
                     with _lock:
-                        if not _arm_enabled:
-                            pass
-                        elif _manual_mode:
+                        if _manual_mode:
                             pass  # web manual override active — ignore arm_sender
                         elif _preset_motion:
                             pass  # preset sequence active — ignore arm_sender
@@ -855,22 +1013,44 @@ def main():
             except (ValueError, IndexError):
                 pass
 
+            rc = None
+
             # ── Send RC_CHANNELS_OVERRIDE at OVERRIDE_HZ ─────────────────────
             if master is not None and now - last_send >= 1.0 / OVERRIDE_HZ:
                 last_send = now
                 rc = _build_rc_array()
-                _send_rc_override(master, rc)
-                if rc[J6_RC_CH - 1] != IGNORE:
-                    last_j6_pwm = int(rc[J6_RC_CH - 1])
+                try:
+                    _send_rc_override(master, rc)
+                except OSError as e:
+                    _drop_mavlink_master(str(e))
+                    master = None
+                else:
+                    if rc[J6_RC_CH - 1] != IGNORE:
+                        last_j6_pwm = int(rc[J6_RC_CH - 1])
+
+            if master is not None and now - last_heartbeat >= 1.0:
+                last_heartbeat = now
+                try:
+                    _send_heartbeat(master)
+                except OSError as e:
+                    _drop_mavlink_master(str(e))
+                    master = None
+
+            if (
+                master is not None
+                and rc is not None
+                and now - last_servo_diag >= SERVO_DIAG_SEC
+            ):
+                last_servo_diag = now
+                with _lock:
+                    lpt = _last_pkt_time
+                _maybe_warn_servo_mismatch(
+                    rc, last_fc_rc, last_fc_srv, _should_hold_neutral(lpt)
+                )
 
             if now - last_telem >= 1.0 / ARM_TELEM_HZ:
                 last_telem = now
                 _send_arm_telemetry(last_j6_pwm)
-
-            # ── GCS heartbeat every second ────────────────────────────────────
-            if master is not None and now - last_heartbeat >= 1.0:
-                last_heartbeat = now
-                _send_heartbeat(master)
 
             # ── Status print at PRINT_HZ ──────────────────────────────────────
             if now - last_print >= 1.0 / PRINT_HZ:
@@ -898,32 +1078,39 @@ def main():
                     j6_manual = _j6_manual_mode(claw_hold) if not hold_neutral else True
                     j6_pwm = J6_OUT_CENTER if hold_neutral else _compute_j6_pwm(_clamp_us(jus[5]), j6t)
                     print(
-                        f"[arm] rx={rx} armed={armed} hold={hold_neutral} claw={claw_hold} "
+                        f"[arm] rx={rx} armed={armed} mav={'OK' if _mavlink_up else 'DOWN'} "
+                        f"hold={hold_neutral} claw={claw_hold} "
                         f"j6={'MAN' if j6_manual else 'IMU'} mosfet={_mosfet_on} | "
                         f"J1={jus[0]} J2={jus[1]} J3={jus[2]} J4={jus[3]} "
                         f"J5={jus[4]} J6={j6_pwm}(in={jus[5]},tgt={j6t:.1f}) "
-                        f"Claw={jus[6]}"
+                        f"Claw={jus[6]}",
+                        flush=True,
                     )
 
             time.sleep(0.002)
 
     except KeyboardInterrupt:
-        print("\n[arm] Stopping — centering all AUX channels.")
+        print("\n[arm] Stopping — centering all AUX channels.", flush=True)
 
     finally:
-        # Send neutral on all AUX channels before exiting
+        master = _get_mavlink_master()
         if master is not None:
             rc = [IGNORE] * 18
             _fill_rc_neutral(rc)
-            _send_rc_override(master, rc)
+            try:
+                _send_rc_override(master, rc)
+            except Exception:
+                pass
             time.sleep(0.2)
+
+        _drop_mavlink_master()
 
         if HAVE_GPIO and _gpio_h is not None:
             _lgpio.gpio_write(_gpio_h, MOSFET_GPIO, 0)
             _lgpio.gpiochip_close(_gpio_h)
 
         _release_bno()
-        print("[arm] Done.")
+        print("[arm] Done.", flush=True)
 
 
 if __name__ == "__main__":
