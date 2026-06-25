@@ -228,8 +228,8 @@ def _try_init_bno_once() -> bool:
         return False
 
 
-def _init_optional_hardware() -> None:
-    """Probe BNO055 and MOSFET GPIO without blocking process startup."""
+def _init_mosfet_gpio() -> None:
+    """Drive MOSFET GPIO immediately — must run before AUX servos need power."""
     global _gpio_h, HAVE_GPIO, _lgpio
 
     try:
@@ -249,6 +249,9 @@ def _init_optional_hardware() -> None:
         _gpio_h = None
         print(f"[arm] lgpio not available ({_e}) — MOSFET control disabled", flush=True)
 
+
+def _init_optional_hardware() -> None:
+    """Probe BNO055 without blocking process startup (MOSFET init is synchronous)."""
     attempt = 0
     while not HAVE_BNO:
         if _try_init_bno_once():
@@ -429,7 +432,7 @@ _joint_us      = _default_joint_us()
 _j6_target_deg = 0.0
 _last_pkt_time = 0.0
 _rx_count      = 0
-_mosfet_on     = False
+_mosfet_on     = True
 _manual_mode   = False
 _manual_aux_pwm = _default_manual_aux_pwm()
 _claw_hold_enabled = True
@@ -801,6 +804,29 @@ def _send_heartbeat(master):
     )
 
 
+def _eager_neutral_override(timeout: float = 8.0) -> None:
+    """Send neutral AUX override as soon as MAVProxy is up (covers boot-guard handoff)."""
+    try:
+        master = connect_mavlink(MAVLINK_URL, timeout=timeout)
+    except Exception as exc:
+        print(f"[arm] Eager neutral skipped — MAVLink not ready ({exc})", flush=True)
+        return
+    rc = [IGNORE] * 18
+    _fill_rc_neutral(rc)
+    try:
+        for _ in range(30):
+            _send_rc_override(master, rc)
+            time.sleep(0.05)
+        print("[arm] Eager neutral AUX override sent", flush=True)
+    except Exception as exc:
+        print(f"[arm] Eager neutral send failed ({exc})", flush=True)
+    finally:
+        try:
+            master.close()
+        except Exception:
+            pass
+
+
 def _try_connect_mavlink():
     """Connect to MAVProxy; return master or None (never blocks startup indefinitely)."""
     try:
@@ -938,8 +964,12 @@ def main():
     global _joint_us, _j6_target_deg, _last_pkt_time, _rx_count, _mavlink_up
 
     print("[arm] Arm controller starting...", flush=True)
+    _init_mosfet_gpio()
     threading.Thread(
         target=_init_optional_hardware, daemon=True, name="arm-hw-init",
+    ).start()
+    threading.Thread(
+        target=_eager_neutral_override, daemon=True, name="arm-eager-neutral",
     ).start()
 
     # Bind UDP first so arm_sender / UI can reach us while MAVLink connects.

@@ -280,7 +280,7 @@ async function stopTopside() {
 // ─────────────────────────────────────────────────────────────
 // CONTROL ACTIONS
 // ─────────────────────────────────────────────────────────────
-let _mosfetOn = false;
+let _mosfetOn = true;
 
 async function toggleMosfet() {
   _mosfetOn = !_mosfetOn;

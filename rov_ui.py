@@ -587,7 +587,7 @@ STATE = {
     "ssh_connected":       False,
     "ssh_error":           "",
     "mode":                "disarmed",
-    "mosfet_on":           False,
+    "mosfet_on":           True,
     "last_telemetry_time": 0.0,
     "last_arm_telemetry_time": 0.0,
     "telemetry_packets":   0,
@@ -1072,6 +1072,14 @@ class SSHManager:
 
     def stop_mavproxy(self):
         self.exec("pkill -f mavproxy 2>/dev/null; pkill -f MAVProxy 2>/dev/null || true")
+
+    def stop_arm_boot_guard(self):
+        """Release Pix6 serial held by arm_boot_guard before starting MAVProxy."""
+        self.exec(
+            "systemctl stop rov-arm-boot 2>/dev/null; "
+            "pkill -f 'arm_boot_guard' 2>/dev/null; "
+            "sleep 0.4"
+        )
 
     def is_mavproxy_running(self):
         # pgrep -a shows full command line; -f matches against it.
@@ -2178,7 +2186,8 @@ def api_start_onboard():
             ok_sync, msg_sync = ssh.sync_onboard_files()
             _emit_onboard_progress("sync", "done" if ok_sync else "error", msg_sync)
 
-            # Step 1: MAVProxy (try configured port, then auto-detect ttyACM/ttyUSB)
+            # Step 1: stop boot guard (holds /dev/ttyACM0) then MAVProxy
+            ssh.stop_arm_boot_guard()
             normalize_onboard_config()
             preferred_serial = config.get("mavproxy_serial", "/dev/ttyACM0")
             serial_candidates = ssh.mavproxy_serial_candidates()
@@ -2278,14 +2287,15 @@ def api_start_onboard():
             cam1_dev = config.get("camera1_device", "/dev/video2")
             cam_args = f"--cam0 {cam0_dev} --cam1 {cam1_dev}"
 
+            # Arm before stabilization so AUX neutral override is live ASAP.
             service_specs = [
-                ("stabilization", "stab", "onboard_stab", 75.0, ""),
                 ("arm_ctrl", "arm", "onboard_arm", 45.0, ""),
+                ("stabilization", "stab", "onboard_stab", 75.0, ""),
                 ("camera", "cam", "onboard_cam", 30.0, cam_args),
             ]
             service_labels = {
-                "stabilization": "stabilization.py",
                 "arm_ctrl": "new_ar.py (arm controller)",
+                "stabilization": "stabilization.py",
                 "camera": "camera_stream.py (MJPEG feeds)",
             }
             service_results: dict[str, tuple[bool, str]] = {}
@@ -2295,8 +2305,6 @@ def api_start_onboard():
                     step, "starting",
                     f"Launching {service_labels[step]}...",
                 )
-                if step == "arm_ctrl":
-                    time.sleep(2.0)
                 ok, msg = ssh.supervisor_start_and_wait(
                     svc, timeout_sec=timeout, extra_args=extra_args,
                 )
