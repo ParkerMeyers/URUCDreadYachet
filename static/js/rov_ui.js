@@ -406,18 +406,42 @@ function updateModeUI(mode) {
   updateArmControlsUI();
 }
 
-async function startColmap() {
-  const r = await fetch('/api/colmap', { method: 'POST' });
-  const d = await r.json();
-  toast(d.ok ? '▶ COLMAP started' : 'COLMAP failed: ' + d.msg, d.ok ? 'ok' : 'err');
-  refreshMissionStatus();
+// Crab detection runs topside: toggle swaps the arm cam to the annotated stream.
+const CRAB_CAM = 2;            // arm camera (/camera/2)
+window._crabActive = false;
+
+function toggleCrabs() {
+  window._crabActive = !window._crabActive;
+  const btn = document.getElementById('btn-crabs');
+  if (btn) btn.classList.toggle('active', window._crabActive);
+  // Reconnect the arm camera so loadStream picks the /crab sub-stream (or plain).
+  setupCamera('cam2', 'no-sig-2', CRAB_CAM);
+  toast(window._crabActive ? '🦀 Crab detection ON (arm cam)' : 'Crab detection OFF',
+        'ok');
 }
 
-async function startCrabs() {
-  const r = await fetch('/api/crabs', { method: 'POST' });
+// COLMAP frame recorder (topside): toggle records arm cam at 10fps; save seals
+// every staged frame into a single folder.
+async function toggleColmap() {
+  const r = await fetch('/api/colmap/toggle', { method: 'POST' });
   const d = await r.json();
-  toast(d.ok ? '🦀 Crabs started' : 'Crabs failed: ' + d.msg, d.ok ? 'ok' : 'err');
-  refreshMissionStatus();
+  if (!d.ok) { toast('COLMAP failed: ' + (d.msg || ''), 'err'); return; }
+  const btn = document.getElementById('btn-colmap');
+  if (btn) {
+    btn.classList.toggle('active', d.recording);
+    btn.textContent = d.recording ? '⏺ COLMAP REC' : '⏺ COLMAP';
+  }
+  toast(d.recording ? '⏺ Recording arm cam @10fps' : `⏹ Stopped (${d.staged} frames staged)`,
+        'ok');
+}
+
+async function saveColmap() {
+  const r = await fetch('/api/colmap/save', { method: 'POST' });
+  const d = await r.json();
+  if (!d.ok) { toast('Save failed: ' + (d.msg || ''), 'err'); return; }
+  const btn = document.getElementById('btn-colmap');
+  if (btn) { btn.classList.remove('active'); btn.textContent = '⏺ COLMAP'; }
+  toast(`💾 Saved ${d.count} frames → ${d.folder}`, 'ok');
 }
 
 async function sendArmPreset(name) {
@@ -2869,7 +2893,8 @@ function setupCamera(imgId, noSigId, camNum) {
       if (!st.active) return;
       img.onload = onSuccess;
       img.onerror = onFail;
-      img.src = `/camera/${camNum}?t=${Date.now()}`;
+      const sub = (window._crabActive && camNum === 2) ? '/crab' : '';
+      img.src = `/camera/${camNum}${sub}?t=${Date.now()}`;
       if (st.watchdogT) clearTimeout(st.watchdogT);
       st.watchdogT = setTimeout(() => {
         st.watchdogT = null;
