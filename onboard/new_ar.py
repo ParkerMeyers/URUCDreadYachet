@@ -44,10 +44,12 @@ from mavlink_rc import MAVLINK_ONBOARD, connect_mavlink, send_rc_channels_overri
 
 # ── Optional hardware (initialized lazily — I2C/GPIO can block at import) ─────
 _bno = None
+_i2c = None
 HAVE_BNO = False
 _gpio_h = None
 HAVE_GPIO = False
 _lgpio = None
+BNO_INIT_RETRY_SEC = 1.0
 
 # ── Config ────────────────────────────────────────────────────────────────────
 UDP_PORT    = 5006
@@ -63,7 +65,9 @@ PRINT_HZ    = 2
 ARM_TELEM_HZ = 5
 ARM_TELEM_PORT = 5008   # topside rov_ui listener (must match arm_telemetry_port)
 TIMEOUT_SEC = 0.75    # center all joints if no UDP packet received for this long
-IMU_READ_STALE_SEC = 2.0
+IMU_READ_STALE_SEC = 5.0       # drop cached angle after this long without a good read
+IMU_STALE_WARN_SEC = 1.0       # UI/control "stale" only after this long without a good read
+IMU_MIN_READ_INTERVAL_SEC = 0.05  # cap BNO055 I2C reads (~20 Hz)
 
 # Maps incoming CSV joint index → RC channel number (AUX1=ch9, AUX2=ch10 …)
 # Incoming order: J1(0), J2(1), J3(2), J4(3), J5(4), J6_PWM(5), Claw(6)
@@ -92,6 +96,15 @@ J6_DEADBAND_DEG = 3.0
 # Claw continuous rotation (center 1515 µs)
 CLAW_CENTER_US  = 1515
 _LEVEL_NORMAL_RAW = [0.0180, -0.9993, 0.0337]
+# Wrist J6 angle: atan2 of two gravity components (rotation about Y, not Y tilt).
+# Previous asin(dot) tracked alignment with -Y — wrong DOF for wrist roll.
+# Swap NUM/DEN to (2, 1) for rotation about X if needed on your mount.
+J6_IMU_GRAV_NUM = 2   # Z
+J6_IMU_GRAV_DEN = 0   # X
+J6_IMU_SIGN = -1.0      # flip: physical CW matches UI CW
+J6_IMU_ZERO_OFFSET_DEG = -154.0  # raw gravity angle at flat/stow (0° after cal)
+_j6_imu_sign = J6_IMU_SIGN
+_j6_imu_zero_offset = J6_IMU_ZERO_OFFSET_DEG
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -109,24 +122,115 @@ def _normalize(v):
 
 
 _LEVEL_NORMAL = _normalize(_LEVEL_NORMAL_RAW)
+_J6_IMU_REF_DEG = (
+    math.degrees(math.atan2(_LEVEL_NORMAL[J6_IMU_GRAV_NUM], _LEVEL_NORMAL[J6_IMU_GRAV_DEN]))
+    if _LEVEL_NORMAL is not None else 0.0
+)
 
 
-def _init_optional_hardware() -> None:
-    """Probe BNO055 and MOSFET GPIO without blocking process startup."""
-    global _bno, HAVE_BNO, _gpio_h, HAVE_GPIO, _lgpio
+def _wrap_deg180(angle: float) -> float:
+    return (float(angle) + 180.0) % 360.0 - 180.0
+
+
+def _read_j6_grav_deg():
+    """Gravity atan2 angle minus factory ref, before user zero/sign."""
+    if not HAVE_BNO or _bno is None:
+        return None
+    for attempt in range(2):
+        try:
+            g = _bno.gravity
+            if g is None or any(v is None for v in g):
+                if attempt == 0:
+                    time.sleep(0.002)
+                    continue
+                return None
+            gravity = _normalize(g)
+            if gravity is None:
+                if attempt == 0:
+                    time.sleep(0.002)
+                    continue
+                return None
+            raw_deg = math.degrees(math.atan2(
+                gravity[J6_IMU_GRAV_NUM],
+                gravity[J6_IMU_GRAV_DEN],
+            ))
+            return _wrap_deg180(raw_deg - _J6_IMU_REF_DEG)
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.002)
+                continue
+            return None
+    return None
+
+
+def _apply_j6_imu_calibration(raw_deg: float) -> float:
+    with _lock:
+        sign = _j6_imu_sign
+        zero = _j6_imu_zero_offset
+    return _wrap_deg180(sign * (float(raw_deg) - zero))
+
+
+def _reset_imu_cache() -> None:
+    """Clear IMU angle cache after a fresh BNO055 init."""
+    global _last_imu_angle_deg, _last_imu_read_time
+    global _imu_snap_angle, _imu_snap_stale, _imu_last_poll_time
+    _last_imu_angle_deg = None
+    _last_imu_read_time = 0.0
+    _imu_snap_angle = None
+    _imu_snap_stale = False
+    _imu_last_poll_time = 0.0
+
+
+def _release_bno() -> None:
+    """Release the I2C bus so the next process start can reopen the BNO055."""
+    global _bno, _i2c, HAVE_BNO
+    _bno = None
+    HAVE_BNO = False
+    if _i2c is not None:
+        try:
+            if hasattr(_i2c, "deinit"):
+                _i2c.deinit()
+        except Exception:
+            pass
+        _i2c = None
+
+
+def _try_init_bno_once() -> bool:
+    """Try once to bring up the BNO055. Returns True on success."""
+    global _bno, _i2c, HAVE_BNO
+
+    _release_bno()
+    time.sleep(0.15)
 
     try:
         import board
         import busio
         import adafruit_bno055
-        _i2c = busio.I2C(board.SCL, board.SDA)
-        _bno = adafruit_bno055.BNO055_I2C(_i2c, address=0x29)
-        HAVE_BNO = True
-        print("[arm] BNO055 IMU ready — J6 auto-level enabled", flush=True)
+
+        i2c = busio.I2C(board.SCL, board.SDA)
+        bno = adafruit_bno055.BNO055_I2C(i2c, address=0x29)
+        # Confirm the chip responds before marking it ready.
+        for _ in range(10):
+            g = bno.gravity
+            if g is not None and not any(v is None for v in g):
+                _i2c = i2c
+                _bno = bno
+                HAVE_BNO = True
+                _reset_imu_cache()
+                print("[arm] BNO055 IMU ready — J6 auto-level enabled", flush=True)
+                return True
+            time.sleep(0.05)
+        _release_bno()
+        return False
     except Exception as _e:
-        HAVE_BNO = False
-        _bno = None
-        print(f"[arm] BNO055 not available ({_e}) — J6 manual-only", flush=True)
+        _release_bno()
+        print(f"[arm] BNO055 init failed ({_e})", flush=True)
+        return False
+
+
+def _init_optional_hardware() -> None:
+    """Probe BNO055 and MOSFET GPIO without blocking process startup."""
+    global _gpio_h, HAVE_GPIO, _lgpio
 
     try:
         import lgpio as _lgpio_mod
@@ -141,39 +245,71 @@ def _init_optional_hardware() -> None:
         _gpio_h = None
         print(f"[arm] lgpio not available ({_e}) — MOSFET control disabled", flush=True)
 
+    attempt = 0
+    while not HAVE_BNO:
+        if _try_init_bno_once():
+            break
+        attempt += 1
+        if attempt == 1:
+            print(
+                "[arm] BNO055 not ready — retrying (release I2C after prior stop)...",
+                flush=True,
+            )
+        time.sleep(BNO_INIT_RETRY_SEC)
 
-def _read_j6_angle_deg():
-    """Read BNO055 gravity vector and return tilt angle (degrees). None on error."""
+
+def _read_j6_angle_deg_raw():
+    """Single BNO055 gravity read. None on error; does not touch the IMU cache."""
+    raw = _read_j6_grav_deg()
+    if raw is None:
+        return None
+    return _apply_j6_imu_calibration(raw)
+
+
+def _poll_imu_cache(force=False):
+    """Rate-limited BNO055 read; one I2C transaction per control loop."""
     global _last_imu_angle_deg, _last_imu_read_time
+    global _imu_snap_angle, _imu_snap_stale, _imu_last_poll_time
+
     if not HAVE_BNO:
-        return None
-    try:
-        g = _bno.gravity
-        if g is None or any(v is None for v in g):
-            return None
-        gravity = _normalize(g)
-        if gravity is None:
-            return None
-        dot = _clamp(sum(gravity[i] * _LEVEL_NORMAL[i] for i in range(3)), -1.0, 1.0)
-        angle = math.degrees(math.asin(dot))
+        _imu_snap_angle = None
+        _imu_snap_stale = False
+        return
+
+    now = time.time()
+    if not force and (now - _imu_last_poll_time) < IMU_MIN_READ_INTERVAL_SEC:
+        if _last_imu_read_time > 0.0:
+            age = now - _last_imu_read_time
+            _imu_snap_stale = age > IMU_STALE_WARN_SEC
+            if age > IMU_READ_STALE_SEC:
+                _imu_snap_angle = None
+            elif _imu_snap_angle is None and _last_imu_angle_deg is not None:
+                _imu_snap_angle = _last_imu_angle_deg
+        return
+
+    _imu_last_poll_time = now
+    angle = _read_j6_angle_deg_raw()
+    now = time.time()
+
+    if angle is not None:
         _last_imu_angle_deg = angle
-        _last_imu_read_time = time.time()
-        return angle
-    except Exception:
-        return None
+        _last_imu_read_time = now
+        _imu_snap_angle = angle
+        _imu_snap_stale = False
+        return
+
+    if _last_imu_angle_deg is not None and (now - _last_imu_read_time) <= IMU_READ_STALE_SEC:
+        _imu_snap_angle = _last_imu_angle_deg
+        _imu_snap_stale = (now - _last_imu_read_time) > IMU_STALE_WARN_SEC
+        return
+
+    _imu_snap_angle = None
+    _imu_snap_stale = True
 
 
 def _cached_j6_angle_deg():
-    """Return fresh IMU angle, or last good reading if BNO glitched briefly."""
-    angle = _read_j6_angle_deg()
-    if angle is not None:
-        return angle, False
-    if (
-        _last_imu_angle_deg is not None
-        and (time.time() - _last_imu_read_time) <= IMU_READ_STALE_SEC
-    ):
-        return _last_imu_angle_deg, True
-    return None, False
+    """Return the latest polled IMU angle and whether it is getting old."""
+    return _imu_snap_angle, _imu_snap_stale
 
 
 def _compute_j6_pwm(j6_input_us, j6_target_angle_deg):
@@ -201,7 +337,7 @@ def _compute_j6_pwm(j6_input_us, j6_target_angle_deg):
 
     # Stick centered — IMU auto-level only when claw hold is ON and BNO is healthy
     if not _j6_manual_mode():
-        angle = _read_j6_angle_deg()
+        angle, _stale = _cached_j6_angle_deg()
         if angle is not None:
             err = angle + j6_target_angle_deg
             if abs(err) < J6_DEADBAND_DEG:
@@ -289,16 +425,21 @@ _joint_us      = _default_joint_us()
 _j6_target_deg = 0.0
 _last_pkt_time = 0.0
 _rx_count      = 0
-_mosfet_on     = False
+_mosfet_on     = True
 _manual_mode   = False
 _manual_aux_pwm = _default_manual_aux_pwm()
 _claw_hold_enabled = True
+_arm_enabled       = False
+_preset_motion     = False
 _telem_sock    = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 _telem_subscribers: set = set()
 _telem_sub_lock = threading.Lock()
 _telem_send_failures: dict = {}
 _last_imu_angle_deg = None
 _last_imu_read_time = 0.0
+_imu_snap_angle = None
+_imu_snap_stale = False
+_imu_last_poll_time = 0.0
 
 
 # ── MOSFET control ────────────────────────────────────────────────────────────
@@ -320,6 +461,8 @@ def _send_arm_telemetry(j6_pwm_out: int) -> None:
     with _lock:
         j6_target = _j6_target_deg
         claw_hold = _claw_hold_enabled
+        imu_zero = _j6_imu_zero_offset
+        imu_sign = _j6_imu_sign
     imu_ok = _imu_available_for_autolevel()
     manual = _j6_manual_mode(claw_hold)
 
@@ -334,6 +477,9 @@ def _send_arm_telemetry(j6_pwm_out: int) -> None:
         "arm_claw_hold_request": bool(claw_hold),
         "arm_claw_hold_active": bool(claw_hold and imu_ok),
         "arm_j6_manual": bool(manual),
+        "arm_enabled": bool(_arm_enabled),
+        "arm_imu_zero_offset": round(imu_zero, 2),
+        "arm_imu_sign": round(imu_sign, 3),
     }).encode("utf-8")
 
     with _telem_sub_lock:
@@ -356,6 +502,22 @@ def _send_arm_telemetry(j6_pwm_out: int) -> None:
                       flush=True)
 
 
+def _apply_arm_enable_cmd(cmd: dict) -> None:
+    """Enable/disable all arm motion (tied to ROV disarmed mode on topside)."""
+    global _arm_enabled, _manual_mode, _joint_us, _j6_target_deg, _last_pkt_time, _rx_count, _preset_motion
+    enabled = bool(cmd.get("enabled", False))
+    with _lock:
+        _arm_enabled = enabled
+        if not enabled:
+            _manual_mode = False
+            _preset_motion = False
+            _joint_us = _default_joint_us()
+            _j6_target_deg = 0.0
+            _last_pkt_time = 0.0
+            _rx_count = 0
+    print(f"[arm] Arm {'ENABLED' if enabled else 'DISABLED (disarmed)'}", flush=True)
+
+
 def _apply_claw_hold_cmd(cmd: dict) -> None:
     """Enable/disable J6 IMU auto-level (claw hold)."""
     global _claw_hold_enabled
@@ -366,9 +528,74 @@ def _apply_claw_hold_cmd(cmd: dict) -> None:
     print(f"[arm] Claw hold {'ON' if enabled else 'OFF'} → J6 {mode}", flush=True)
 
 
+def _apply_arm_imu_cal_cmd(cmd: dict) -> None:
+    """Apply persisted sign/zero from topside config."""
+    global _j6_imu_sign, _j6_imu_zero_offset
+    with _lock:
+        if "sign" in cmd:
+            _j6_imu_sign = float(cmd["sign"])
+        if "zero_offset_deg" in cmd:
+            _j6_imu_zero_offset = float(cmd["zero_offset_deg"])
+        sign = _j6_imu_sign
+        zero = _j6_imu_zero_offset
+    print(f"[arm] IMU cal → sign={sign:+.0f} zero={zero:.1f}°", flush=True)
+
+
+def _apply_arm_imu_zero_cmd(cmd: dict) -> None:
+    """Set current wrist pose as 0° (updates zero offset)."""
+    global _j6_imu_zero_offset
+    raw = _read_j6_grav_deg()
+    if raw is None:
+        print("[arm] IMU zero failed — no BNO055 reading", flush=True)
+        return
+    with _lock:
+        _j6_imu_zero_offset = raw
+        zero = _j6_imu_zero_offset
+    _poll_imu_cache(force=True)
+    angle = _cached_j6_angle_deg()[0]
+    print(
+        f"[arm] IMU zero set → offset={zero:.1f}° (now {angle:.1f}°)",
+        flush=True,
+    )
+
+
+def _apply_preset_motion_cmd(cmd: dict) -> None:
+    """While enabled, ignore arm_sender UDP so preset steps are not overwritten."""
+    global _preset_motion, _manual_mode
+    enabled = bool(cmd.get("enabled", False))
+    with _lock:
+        if not _arm_enabled and enabled:
+            return
+        _preset_motion = enabled
+        if enabled:
+            _manual_mode = False
+    print(
+        f"[arm] Preset motion {'ON — ignoring arm_sender UDP' if enabled else 'OFF'}",
+        flush=True,
+    )
+
+
+def _apply_preset_step_cmd(cmd: dict) -> None:
+    """Apply one preset step (single joint moved in working pose)."""
+    global _joint_us, _j6_target_deg, _last_pkt_time
+    pwms = cmd.get("pwm")
+    if not isinstance(pwms, list) or len(pwms) < 7:
+        return
+    with _lock:
+        if not _arm_enabled:
+            return
+        _joint_us = [_clamp_us(pwms[i]) for i in range(7)]
+        if "j6_angle" in cmd:
+            _j6_target_deg = float(cmd["j6_angle"])
+        _last_pkt_time = time.time()
+
 def _apply_manual_pwm_cmd(cmd: dict) -> None:
     """Handle manual AUX PWM commands from the web UI (overrides arm_sender UDP)."""
     global _manual_mode, _manual_aux_pwm
+
+    with _lock:
+        if not _arm_enabled:
+            return
 
     if cmd.get("center"):
         with _lock:
@@ -422,12 +649,18 @@ def _arm_control_listener():
         return
     while True:
         try:
-            data, addr = s.recvfrom(256)
+            data, addr = s.recvfrom(512)
             cmd = json.loads(data.decode())
             if cmd.get("cmd") == "mosfet":
-                _set_mosfet(bool(cmd.get("state", False)))
+                _set_mosfet(bool(cmd.get("state", True)))
                 _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
-                print(f"[arm] MOSFET {'ON' if _mosfet_on else 'OFF'} (web UI)")
+                print(f"[arm] MOSFET {'ON' if _mosfet_on else 'OFF'} (web UI)", flush=True)
+            elif cmd.get("cmd") == "preset_motion":
+                _apply_preset_motion_cmd(cmd)
+                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+            elif cmd.get("cmd") == "preset_step":
+                _apply_preset_step_cmd(cmd)
+                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
             elif cmd.get("cmd") == "manual_pwm":
                 _apply_manual_pwm_cmd(cmd)
                 _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
@@ -437,6 +670,15 @@ def _arm_control_listener():
                 print(f"[arm] Arm telemetry → {addr[0]}:{port}", flush=True)
             elif cmd.get("cmd") == "claw_hold":
                 _apply_claw_hold_cmd(cmd)
+                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+            elif cmd.get("cmd") == "arm_imu_cal":
+                _apply_arm_imu_cal_cmd(cmd)
+                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+            elif cmd.get("cmd") == "arm_imu_zero":
+                _apply_arm_imu_zero_cmd(cmd)
+                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+            elif cmd.get("cmd") == "arm_enable":
+                _apply_arm_enable_cmd(cmd)
                 _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
         except socket.timeout:
             pass
@@ -466,6 +708,10 @@ def _build_rc_manual(aux_vals=None):
 def _build_rc_array():
     """Build the 18-element RC array to send, computing J6 fresh each call."""
     with _lock:
+        if not _arm_enabled:
+            rc = [IGNORE] * 18
+            _fill_rc_neutral(rc)
+            return rc
         manual = _manual_mode
         if manual:
             aux_vals = list(_manual_aux_pwm)
@@ -574,6 +820,7 @@ def main():
     try:
         while True:
             now = time.time()
+            _poll_imu_cache()
 
             if master is None and (now - last_mav_try) >= MAV_RETRY_SEC:
                 last_mav_try = now
@@ -590,8 +837,12 @@ def main():
                 parts = line.split(",")
                 if len(parts) >= 7:
                     with _lock:
-                        if _manual_mode:
+                        if not _arm_enabled:
+                            pass
+                        elif _manual_mode:
                             pass  # web manual override active — ignore arm_sender
+                        elif _preset_motion:
+                            pass  # preset sequence active — ignore arm_sender
                         else:
                             vals = [float(x) for x in parts]
                             _joint_us      = [_clamp_us(vals[i]) for i in range(7)]
@@ -643,11 +894,12 @@ def main():
                     hold_neutral = _should_hold_neutral(lpt)
                     with _lock:
                         claw_hold = _claw_hold_enabled
+                        armed = _arm_enabled
                     j6_manual = _j6_manual_mode(claw_hold) if not hold_neutral else True
                     j6_pwm = J6_OUT_CENTER if hold_neutral else _compute_j6_pwm(_clamp_us(jus[5]), j6t)
                     print(
-                        f"[arm] rx={rx} hold={hold_neutral} claw={claw_hold} j6={'MAN' if j6_manual else 'IMU'} "
-                        f"mosfet={_mosfet_on} | "
+                        f"[arm] rx={rx} armed={armed} hold={hold_neutral} claw={claw_hold} "
+                        f"j6={'MAN' if j6_manual else 'IMU'} mosfet={_mosfet_on} | "
                         f"J1={jus[0]} J2={jus[1]} J3={jus[2]} J4={jus[3]} "
                         f"J5={jus[4]} J6={j6_pwm}(in={jus[5]},tgt={j6t:.1f}) "
                         f"Claw={jus[6]}"
@@ -670,6 +922,7 @@ def main():
             _lgpio.gpio_write(_gpio_h, MOSFET_GPIO, 0)
             _lgpio.gpiochip_close(_gpio_h)
 
+        _release_bno()
         print("[arm] Done.")
 
 

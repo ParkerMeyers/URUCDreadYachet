@@ -7,6 +7,14 @@ let _currentLog  = 'arm';
 const _logs = { thrust: [], arm: [], onboard_stab: [], onboard_arm: [], onboard_cam: [], colmap: [], crabs: [] };
 let _onboardPollTimer = null;
 const _onboardProgressSeen = new Set();
+const _dotStarting = {};
+const ONBOARD_DOT_BY_STEP = {
+  mavproxy: 'dot-mavproxy',
+  stabilization: 'dot-stab',
+  arm_ctrl: 'dot-arm',
+  camera: 'dot-cam',
+};
+const ONBOARD_DOTS = Object.values(ONBOARD_DOT_BY_STEP);
 let _telemetryRecording = false;
 let _lastBatteryToast = '';
 let _missionPollTimer = null;
@@ -48,6 +56,10 @@ if (typeof io !== 'undefined') {
   socket.on('onboard_progress', (entry) => {
     handleOnboardProgress(entry);
   });
+
+  socket.on('preset_progress', (data) => {
+    handlePresetProgress(data);
+  });
 } else {
   console.error('Socket.IO client failed to load — live updates use HTTP polling fallback');
 }
@@ -70,21 +82,14 @@ function handleOnboardProgress({ step, status, msg, time }) {
   }
 
   // Update status dots immediately from progress events
-  if (step === 'mavproxy') {
-    if (status === 'done') setDot('dot-mavproxy', true);
-    if (status === 'error') setDotError('dot-mavproxy');
+  if (step === 'sync' && (status === 'starting' || status === 'wait')) {
+    ONBOARD_DOTS.forEach(setDotStarting);
   }
-  if (step === 'stabilization') {
-    if (status === 'done') setDot('dot-stab', true);
-    if (status === 'error') setDotError('dot-stab');
-  }
-  if (step === 'arm_ctrl') {
-    if (status === 'done') setDot('dot-arm', true);
-    if (status === 'error') setDotError('dot-arm');
-  }
-  if (step === 'camera') {
-    if (status === 'done') setDot('dot-cam', true);
-    if (status === 'error') setDotError('dot-cam');
+  const dotId = ONBOARD_DOT_BY_STEP[step];
+  if (dotId) {
+    if (status === 'starting' || status === 'wait') setDotStarting(dotId);
+    else if (status === 'done') setDot(dotId, true);
+    else if (status === 'error') setDotError(dotId);
   }
 
   const summary = document.getElementById('onboard-summary');
@@ -213,6 +218,7 @@ async function startOnboard() {
   const summary = document.getElementById('onboard-summary');
   if (logEl) { logEl.innerHTML = ''; logEl.style.display = 'block'; }
   if (summary) { summary.textContent = 'Starting onboard programs…'; summary.style.color = 'var(--amber)'; }
+  ONBOARD_DOTS.forEach(setDotStarting);
   _onboardProgressSeen.clear();
   const btn = document.getElementById('btn-start-onboard');
   if (btn) btn.disabled = true;
@@ -240,6 +246,7 @@ async function startOnboard() {
 async function stopOnboard() {
   await fetch('/api/onboard/stop', { method: 'POST' });
   toast('Onboard programs stopped');
+  ONBOARD_DOTS.forEach(id => setDotState(id, 'idle'));
   const logEl = document.getElementById('onboard-progress-log');
   if (logEl) { logEl.innerHTML = ''; logEl.style.display = 'none'; }
 }
@@ -248,6 +255,7 @@ async function startTopside() {
   await saveConfig();
   const msg = document.getElementById('topside-msg');
   msg.textContent = 'Starting arm_sender.py…';
+  setDotStarting('dot-armlocal');
   const r = await fetch('/api/topside/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -255,6 +263,9 @@ async function startTopside() {
   });
   const d = await r.json();
   const armRes = d.results && d.results.arm_sender;
+  if (armRes && armRes.ok) setDot('dot-armlocal', true);
+  else if (armRes) setDotError('dot-armlocal');
+  else setDotState('dot-armlocal', 'idle');
   msg.textContent = armRes ? `arm_sender: ${armRes.ok ? '✓ '+armRes.msg : '✕ '+armRes.msg}` : JSON.stringify(d);
   toast(armRes && armRes.ok ? 'Arm sender started' : 'Arm sender failed', armRes && armRes.ok ? 'ok' : 'err');
 }
@@ -268,7 +279,7 @@ async function stopTopside() {
 // ─────────────────────────────────────────────────────────────
 // CONTROL ACTIONS
 // ─────────────────────────────────────────────────────────────
-let _mosfetOn = false;
+let _mosfetOn = true;
 
 async function toggleMosfet() {
   _mosfetOn = !_mosfetOn;
@@ -290,6 +301,48 @@ function updateMosfetUI(on) {
 
 let _currentMode = 'disarmed';
 
+function isRobotArmed() {
+  return _currentMode === 'armed' || _currentMode === 'stabilize';
+}
+
+function updateArmControlsUI() {
+  const armed = isRobotArmed();
+  const presetsLocked = !armed || _presetRunning;
+  document.querySelectorAll('#arm-preset-btns .action-btn').forEach(btn => {
+    btn.disabled = presetsLocked;
+    btn.classList.toggle('disabled', presetsLocked);
+  });
+  const manualBtn = document.getElementById('btn-manual-pwm');
+  if (manualBtn) {
+    manualBtn.disabled = !armed || _presetRunning;
+    manualBtn.classList.toggle('disabled', !armed || _presetRunning);
+  }
+  const armImuZeroBtn = document.getElementById('btn-arm-imu-zero');
+  if (armImuZeroBtn) {
+    const imuOk = armImuAvailable(_tel);
+    armImuZeroBtn.disabled = !imuOk;
+    armImuZeroBtn.classList.toggle('disabled', !imuOk);
+  }
+}
+
+function handlePresetProgress(data) {
+  if (!data) return;
+  if (data.status === 'running') {
+    _presetRunning = true;
+    const joint = data.joint || '?';
+    const step = data.step || '?';
+    const total = data.total || '?';
+    toast(`Preset ${data.label || data.preset}: ${joint} (${step}/${total})`, '');
+  } else if (data.status === 'done') {
+    _presetRunning = false;
+    toast(data.msg || `Preset ${data.label || data.preset} complete`, 'ok');
+  } else if (data.status === 'error') {
+    _presetRunning = false;
+    toast(data.msg || 'Preset failed', 'err');
+  }
+  updateArmControlsUI();
+}
+
 async function setMode(mode) {
   const r = await fetch('/api/mode', {
     method: 'POST',
@@ -307,6 +360,8 @@ async function setMode(mode) {
       _ctrlState.stabilize  = false;
       _ctrlState.depth_hold = false;
       _ctrlState.yaw_hold   = false;
+      _manualPwmEnabled = false;
+      updateManualPwmUI();
     } else if (mode === 'stabilize') {
       // Stabilize mode enables stabilization automatically
       _ctrlState.stabilize = true;
@@ -315,9 +370,13 @@ async function setMode(mode) {
       _ctrlState.stabilize = false;
     }
     updateFlagUI();
+    updateArmControlsUI();
   }
   const modeNames = { disarmed:'DISARMED', armed:'DRIVE/ARMED', stabilize:'STABILIZE' };
   toast('Mode: ' + (modeNames[mode] || mode.toUpperCase()), mode === 'disarmed' ? '' : 'ok');
+  if (mode === 'disarmed') {
+    toast('Arm motion locked — switch to ARMED to move joints', 'warn');
+  }
 }
 
 function updateModeUI(mode) {
@@ -335,6 +394,7 @@ function updateModeUI(mode) {
     pillMode.innerHTML = `<span class="status-dot"></span> ${(mode||'--').toUpperCase()}`;
     pillMode.className = 'status-pill ' + (modeColors[mode] || '');
   }
+  updateArmControlsUI();
 }
 
 async function startColmap() {
@@ -352,10 +412,24 @@ async function startCrabs() {
 }
 
 async function sendArmPreset(name) {
+  if (!isRobotArmed()) {
+    toast('Arm presets disabled while DISARMED', 'warn');
+    return;
+  }
+  if (_presetRunning) {
+    toast('Another preset sequence is already running', 'warn');
+    return;
+  }
   const r = await fetch(`/api/arm_preset/${encodeURIComponent(name)}`, { method: 'POST' });
   const d = await r.json();
   const label = (_armPresets[name] && _armPresets[name].label) || name;
-  toast(d.ok ? `Arm preset: ${label}` : d.msg, d.ok ? 'ok' : 'err');
+  if (d.ok && d.sequential) {
+    _presetRunning = true;
+    updateArmControlsUI();
+    toast(d.msg || `Moving to ${label} (J6→J1→Claw)…`, 'ok');
+  } else {
+    toast(d.ok ? `Arm preset: ${label}` : d.msg, d.ok ? 'ok' : 'err');
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -365,6 +439,7 @@ const ARM_JOINT_NAMES = ['J1', 'J2', 'J3', 'J4', 'J5', 'J6', 'Claw'];
 let _armPresets = {};
 let _armLastPwm = null;
 let _armPresetEditing = null;
+let _presetRunning = false;
 
 async function loadArmPresets() {
   try {
@@ -391,6 +466,7 @@ function renderArmPresetButtons() {
     const label = (_armPresets[name] && _armPresets[name].label) || name;
     return `<button type="button" class="action-btn" onclick="sendArmPreset('${name}')" title="${name}">${escapeHtml(label)}</button>`;
   }).join('');
+  updateArmControlsUI();
 }
 
 function buildArmPwmGrid() {
@@ -628,6 +704,10 @@ function hideManualPwmOutside(e) {
 }
 
 async function setManualPwmEnabled(enabled) {
+  if (!isRobotArmed()) {
+    toast('Manual AUX disabled while DISARMED', 'warn');
+    return;
+  }
   await saveConfig();
   const r = await fetch('/api/manual_pwm', {
     method: 'POST',
@@ -803,6 +883,10 @@ function armImuAvailable(t) {
 }
 
 function toggleClawHold() {
+  if (!isRobotArmed()) {
+    toast('Claw hold disabled while DISARMED', 'warn');
+    return;
+  }
   if (!armImuAvailable(_tel)) {
     toast('Arm IMU not available — J6 is in manual mode', 'warn');
     return;
@@ -866,6 +950,19 @@ function calibrateIMU() {
   toast('IMU zero sent — current pitch/roll set as targets', 'ok');
 }
 
+async function zeroArmIMU() {
+  if (!armImuAvailable(_tel)) {
+    toast('Arm IMU not available', 'warn');
+    return;
+  }
+  const r = await fetch('/api/arm_imu_zero', { method: 'POST' });
+  const d = await r.json();
+  const detail = (d.angle_deg != null)
+    ? ` (${Number(d.angle_deg).toFixed(1)}°)`
+    : '';
+  toast(d.ok ? `Arm IMU zeroed${detail}` : (d.msg || 'Arm IMU zero failed'), d.ok ? 'ok' : 'err');
+}
+
 function updateFlagUI() {
   const stabBtn  = document.getElementById('flag-stab');
   const depthBtn = document.getElementById('flag-depth');
@@ -887,7 +984,11 @@ function updateFlagUI() {
     yawBtn.className   = 'ctrl-flag' + (_ctrlState.yaw_hold ? ' active-yaw' : '');
   }
   if (clawBtn) {
-    if (!imuOk) {
+    if (!isRobotArmed()) {
+      clawBtn.textContent = 'CLAW: --';
+      clawBtn.className = 'ctrl-flag disabled';
+      clawBtn.title = 'Arm disabled while DISARMED';
+    } else if (!imuOk) {
       clawBtn.textContent = 'CLAW: MAN';
       clawBtn.className = 'ctrl-flag disabled';
       clawBtn.title = 'Arm IMU offline — wrist (J6) manual control';
@@ -954,8 +1055,15 @@ function updateStatus() {
   }
 
   if (s.mode) { _currentMode = s.mode; updateModeUI(s.mode); }
-  if (typeof s.mosfet_on !== 'undefined') { _mosfetOn = s.mosfet_on; updateMosfetUI(s.mosfet_on); }
+  if (typeof s.mosfet_on !== 'undefined' && s.mosfet_on) {
+    _mosfetOn = true;
+    updateMosfetUI(true);
+  }
   if (typeof s.claw_hold === 'boolean') { _ctrlState.claw_hold = s.claw_hold; updateFlagUI(); }
+  if (typeof s.preset_running === 'boolean') {
+    _presetRunning = s.preset_running;
+  }
+  updateArmControlsUI();
 
   const ap = document.getElementById('tel-arm-proc');
   if (ap) {
@@ -1028,16 +1136,29 @@ function _getActiveGamepad() {
   return null;
 }
 
-function setDot(id, running) {
+function setDotState(id, state) {
   const el = document.getElementById(id);
   if (!el) return;
-  el.className = 'dot ' + (running ? 'running' : '');
+  if (state === 'starting') _dotStarting[id] = true;
+  else delete _dotStarting[id];
+  el.className = 'dot'
+    + (state === 'running' ? ' running' : '')
+    + (state === 'error' ? ' error' : '')
+    + (state === 'starting' ? ' starting' : '');
+}
+
+function setDotStarting(id) {
+  setDotState(id, 'starting');
+}
+
+function setDot(id, running) {
+  if (running) setDotState(id, 'running');
+  else if (_dotStarting[id]) setDotState(id, 'starting');
+  else setDotState(id, 'idle');
 }
 
 function setDotError(id) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.className = 'dot error';
+  setDotState(id, 'error');
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1111,6 +1232,7 @@ function updateTelemetry() {
   }
 
   updateFlagUI();
+  updateArmControlsUI();
 
   // Telemetry bar
   const state = t.rx_state || '--';

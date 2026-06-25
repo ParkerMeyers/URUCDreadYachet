@@ -504,6 +504,7 @@ class MavlinkReader:
 
         self.last_rate_request = 0.0
         self.last_pressure_debug_print = 0.0
+        self._connected_at = 0.0
 
         self.battery_voltage_v = None
         self.battery_current_a = None
@@ -522,6 +523,22 @@ class MavlinkReader:
         print(f"Connecting MAVLink: {self.mavlink_url}")
         self.master = connect_mavlink(self.mavlink_url)
         self.last_rate_request = 0.0
+        self.have_attitude = False
+        self.have_depth = False
+        self.last_attitude_update = 0.0
+        self.last_depth_update = 0.0
+        self.last_any_message = 0.0
+        self._connected_at = time.time()
+
+    def _fc_targets(self):
+        """Return (system, component) once heartbeat has identified the FC."""
+        target_system = int(getattr(self.master, "target_system", 0) or 0)
+        target_component = int(getattr(self.master, "target_component", 0) or 0)
+        if target_system == 0:
+            return None
+        if target_component == 0:
+            target_component = mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1
+        return target_system, target_component
 
     def link_dead(self):
         if self.last_any_message <= 0.0:
@@ -539,7 +556,18 @@ class MavlinkReader:
             return False
         if (time.time() - self.last_any_message) > MAVLINK_LINK_TIMEOUT_SEC:
             return False
+
         att_age = self.attitude_age_sec()
+        if not self.have_attitude:
+            # Never received ATTITUDE on this TCP session — common after MAVProxy
+            # restart; resync alone is not enough, we must reconnect.
+            if self._connected_at <= 0.0:
+                return False
+            link_age = time.time() - self._connected_at
+            if self.last_any_message >= self._connected_at and link_age >= MAVLINK_SENSOR_RECONNECT_SEC:
+                return True
+            return False
+
         if att_age is None or att_age < MAVLINK_SENSOR_RECONNECT_SEC:
             return False
         if not self.have_depth:
@@ -577,6 +605,8 @@ class MavlinkReader:
             else:
                 print("[mavlink] Reconnected (no heartbeat yet)")
             self.last_rate_request = 0.0
+            self.request_message_rates(force=True)
+            self.bootstrap_sensor_streams(timeout_sec=5.0)
             return True
         except Exception as e:
             print(f"[mavlink] Reconnect failed: {e}")
@@ -589,16 +619,24 @@ class MavlinkReader:
         self.last_sensor_resync = now
         self.last_rate_request = 0.0
         print("[mavlink] Re-requesting ATTITUDE / pressure message rates")
+        self.request_message_rates(force=True)
 
-    def request_message_rates(self):
+    def request_message_rates(self, *, force=False):
         now = time.time()
 
-        if now - self.last_rate_request < 2.0:
+        if not force and now - self.last_rate_request < 2.0:
             return
 
         self.last_rate_request = now
 
-        requests = [
+        targets = self._fc_targets()
+        if targets is None:
+            print("[mavlink] Skipping rate request — no FC heartbeat yet")
+            return
+
+        target_system, target_component = targets
+
+        interval_requests = [
             (msg_id("MAVLINK_MSG_ID_ATTITUDE", 30), 20000),
             (msg_id("MAVLINK_MSG_ID_SCALED_PRESSURE", 29), 50000),
             (msg_id("MAVLINK_MSG_ID_SCALED_PRESSURE2", 137), 50000),
@@ -607,11 +645,22 @@ class MavlinkReader:
             (msg_id("MAVLINK_MSG_ID_BATTERY_STATUS", 147), 1000000),
         ]
 
-        target_system = self.master.target_system or 1
-        target_component = self.master.target_component or 1
-
-        for message_id, interval_us in requests:
+        for message_id, interval_us in interval_requests:
             try:
+                # Reset then re-arm — FC often ignores interval changes after link restart.
+                self.master.mav.command_long_send(
+                    target_system,
+                    target_component,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    message_id,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
                 self.master.mav.command_long_send(
                     target_system,
                     target_component,
@@ -627,6 +676,46 @@ class MavlinkReader:
                 )
             except Exception as e:
                 print(f"Could not request MAVLink message {message_id}: {e}")
+
+        # Legacy stream request — still needed on some ArduSub builds after MAVProxy restart.
+        for stream_id, rate_hz in (
+            (mavutil.mavlink.MAV_DATA_STREAM_EXTRA1, 20),
+            (mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS, 2),
+        ):
+            try:
+                self.master.mav.request_data_stream_send(
+                    target_system,
+                    target_component,
+                    stream_id,
+                    rate_hz,
+                    1,
+                )
+            except Exception as e:
+                print(f"Could not request data stream {stream_id}: {e}")
+
+        print(
+            f"[mavlink] Requested ATTITUDE/pressure streams "
+            f"(sys={target_system} comp={target_component})"
+        )
+
+    def bootstrap_sensor_streams(self, timeout_sec=12.0):
+        """Poll until ATTITUDE arrives — critical after MAVProxy / stab restart."""
+        print("[mavlink] Waiting for ATTITUDE stream...")
+        deadline = time.time() + timeout_sec
+        last_req = 0.0
+        while time.time() < deadline:
+            self.poll()
+            if self.have_attitude:
+                age = self.attitude_age_sec()
+                print(f"[mavlink] ATTITUDE stream OK (age={age:.2f}s)")
+                return True
+            now = time.time()
+            if now - last_req >= 0.5:
+                last_req = now
+                self.request_message_rates(force=True)
+            time.sleep(0.05)
+        print("[mavlink] WARNING: no ATTITUDE yet — will reconnect/resync in main loop")
+        return False
 
     def update_depth(self, depth_m, source):
         depth_m = clamp_depth(float(depth_m))
@@ -1110,6 +1199,9 @@ def main():
               f"component {mav.master.target_component}.")
     else:
         print("[INFO] No heartbeat yet — continuing. Will retry in main loop.")
+
+    mav.request_message_rates(force=True)
+    mav.bootstrap_sensor_streams(timeout_sec=15.0)
 
     pixhawk = PixhawkOutput(mav.master)
     pixhawk.neutral_all()

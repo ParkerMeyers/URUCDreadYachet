@@ -1,5 +1,7 @@
 {
   "arm_camera_url": "http://192.168.69.100:8160",
+  "arm_imu_sign": -1.0,
+  "arm_imu_zero_offset": -154.0,
   "arm_presets": {
     "sample": {
       "j6_angle": 15.0,

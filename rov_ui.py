@@ -103,6 +103,12 @@ _ctrl_keepalive_seq = 0
 ARM_JOINT_NAMES = ["J1", "J2", "J3", "J4", "J5", "J6", "Claw"]
 ARM_PWM_MIN = 500
 ARM_PWM_MAX = 2500
+ARM_DEFAULT_PWM = [1500, 1500, 1500, 1500, 1500, 1500, 1515]  # J1..J6, Claw
+
+# Preset motion order: J6 → J5 → … → J1 → Claw (indices into pwm[7])
+ARM_PRESET_JOINT_ORDER = (5, 4, 3, 2, 1, 0, 6)
+ARM_PRESET_DELAY_MIN_SEC = 0.45
+ARM_PRESET_DELAY_MAX_SEC = 4.0
 
 # Pix6 AUX1–7 joint labels (matches onboard/new_ar.py AUX_LABELS)
 MANUAL_AUX_LABELS = ["J5", "J2", "J6", "J1", "J3", "J4", "Claw"]
@@ -145,6 +151,8 @@ DEFAULT_CONFIG = {
     "arm_udp_port":        5006,
     "mosfet_control_port": 5007,
     "arm_telemetry_port":  5008,
+    "arm_imu_sign":        -1.0,
+    "arm_imu_zero_offset": -154.0,
     "colmap_command":      "python3 colmap_run.py",
     "crabs_command":       "python3 crabs.py",
     "battery_warn_v":      12.0,
@@ -207,12 +215,143 @@ def _clamp_arm_pwm(value) -> int:
     return int(max(ARM_PWM_MIN, min(ARM_PWM_MAX, int(round(float(value))))))
 
 
+_preset_lock = threading.Lock()
+
+
+def _pwm_to_csv(pwms: list, j6_angle: float) -> str:
+    vals = [_clamp_arm_pwm(v) for v in pwms[:7]]
+    while len(vals) < 7:
+        vals.append(1500)
+    return ",".join(str(x) for x in vals) + f",{float(j6_angle):.2f}"
+
+
 def _preset_to_csv(preset: dict) -> str:
     pwms = [_clamp_arm_pwm(v) for v in preset["pwm"][:7]]
     while len(pwms) < 7:
         pwms.append(1500)
     angle = float(preset.get("j6_angle", 0.0))
-    return ",".join(str(x) for x in pwms) + f",{angle:.2f}"
+    return _pwm_to_csv(pwms, angle)
+
+
+def _current_arm_pose() -> tuple[list[int], float]:
+    """Last known J1..Claw PWM + J6 target angle from arm_sender telemetry."""
+    raw = STATE.get("arm_last_pwm")
+    if isinstance(raw, dict) and isinstance(raw.get("pwm"), list) and len(raw["pwm"]) >= 7:
+        pwms = [_clamp_arm_pwm(x) for x in raw["pwm"][:7]]
+        angle = float(raw.get("j6_angle", 0.0))
+        return pwms, angle
+    return list(ARM_DEFAULT_PWM), 0.0
+
+
+def _joint_move_delay_sec(from_us: int, to_us: int) -> float:
+    """Wait time proportional to PWM travel (full span ≈ max delay)."""
+    delta = abs(_clamp_arm_pwm(to_us) - _clamp_arm_pwm(from_us))
+    if delta < 12:
+        return 0.0
+    span = float(ARM_PWM_MAX - ARM_PWM_MIN)
+    travel = delta / span
+    delay = ARM_PRESET_DELAY_MIN_SEC + travel * (
+        ARM_PRESET_DELAY_MAX_SEC - ARM_PRESET_DELAY_MIN_SEC
+    )
+    return round(min(ARM_PRESET_DELAY_MAX_SEC, max(ARM_PRESET_DELAY_MIN_SEC, delay)), 3)
+
+
+def _emit_preset_progress(payload: dict) -> None:
+    socketio.emit("preset_progress", payload)
+    emit_status()
+
+
+def _run_preset_sequence(preset_name: str, preset: dict) -> None:
+    """Move joints one at a time J6→J1→Claw with distance-based pauses."""
+    label = str(preset.get("label") or preset_name)
+    target_pwms = [_clamp_arm_pwm(v) for v in preset["pwm"][:7]]
+    while len(target_pwms) < 7:
+        target_pwms.append(1500)
+    target_angle = float(preset.get("j6_angle", 0.0))
+
+    try:
+        _send_pi_arm_control({"cmd": "preset_motion", "enabled": True})
+        current_pwms, current_angle = _current_arm_pose()
+        working = list(current_pwms)
+        angle = current_angle
+        total = len(ARM_PRESET_JOINT_ORDER)
+
+        for step_i, joint_idx in enumerate(ARM_PRESET_JOINT_ORDER, start=1):
+            if not _robot_armed():
+                _emit_preset_progress({
+                    "status": "error",
+                    "preset": preset_name,
+                    "label": label,
+                    "msg": "Preset aborted — ROV disarmed",
+                })
+                return
+
+            joint_name = ARM_JOINT_NAMES[joint_idx]
+            from_us = working[joint_idx]
+            to_us = target_pwms[joint_idx]
+            working[joint_idx] = to_us
+            if joint_idx == 5:
+                angle = target_angle
+
+            delay = _joint_move_delay_sec(from_us, to_us)
+            _send_pi_arm_control({
+                "cmd": "preset_step",
+                "pwm": list(working),
+                "j6_angle": angle,
+            })
+
+            with _state_lock:
+                STATE["arm_last_pwm"] = {"pwm": list(working), "j6_angle": angle}
+
+            _emit_preset_progress({
+                "status": "running",
+                "preset": preset_name,
+                "label": label,
+                "joint": joint_name,
+                "step": step_i,
+                "total": total,
+                "delay_sec": delay,
+                "from_us": from_us,
+                "to_us": to_us,
+            })
+
+            if delay > 0:
+                time.sleep(delay)
+
+        _emit_preset_progress({
+            "status": "done",
+            "preset": preset_name,
+            "label": label,
+            "msg": f"Preset '{label}' complete",
+        })
+    except Exception as e:
+        _emit_preset_progress({
+            "status": "error",
+            "preset": preset_name,
+            "label": label,
+            "msg": str(e),
+        })
+    finally:
+        _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
+        with _state_lock:
+            STATE["preset_running"] = False
+            STATE["preset_active_name"] = ""
+        emit_status()
+
+
+def _start_preset_sequence(preset_name: str, preset: dict) -> tuple[bool, str]:
+    with _preset_lock:
+        if STATE.get("preset_running"):
+            return False, "Another preset sequence is already running"
+        STATE["preset_running"] = True
+        STATE["preset_active_name"] = preset_name
+    threading.Thread(
+        target=_run_preset_sequence,
+        args=(preset_name, preset),
+        daemon=True,
+        name=f"preset-{preset_name}",
+    ).start()
+    return True, f"Moving to preset '{preset_name}' (J6→J1→Claw)"
 
 
 def _normalize_preset_entry(raw) -> dict | None:
@@ -286,7 +425,34 @@ def _parse_arm_sent_line(line: str) -> dict | None:
         return None
 
 
+def _robot_armed() -> bool:
+    return STATE.get("mode", "disarmed") in ("armed", "stabilize")
+
+
+def _sync_arm_enable():
+    """Tell new_ar.py whether arm motion is allowed (disabled when DISARMED)."""
+    _send_pi_arm_control({"cmd": "arm_enable", "enabled": _robot_armed()})
+
+
+def _sync_arm_power():
+    """Servo rail has no MOSFET — keep software power state ON for compatibility."""
+    STATE["mosfet_on"] = True
+    _send_pi_arm_control({"cmd": "mosfet", "state": True})
+
+
+def _apply_disarmed_arm_lockout():
+    """Stop arm motion and overrides when the ROV is disarmed (servo power stays on)."""
+    if _robot_armed():
+        _sync_arm_enable()
+        return
+    STATE["manual_pwm_enabled"] = False
+    _send_pi_arm_control({"cmd": "arm_enable", "enabled": False})
+    _send_pi_arm_control({"cmd": "manual_pwm", "enabled": False})
+
+
 def _send_arm_csv(csv_line: str):
+    if not _robot_armed():
+        return
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.sendto(
@@ -404,7 +570,7 @@ STATE = {
     "ssh_connected":       False,
     "ssh_error":           "",
     "mode":                "disarmed",
-    "mosfet_on":           False,
+    "mosfet_on":           True,
     "last_telemetry_time": 0.0,
     "last_arm_telemetry_time": 0.0,
     "telemetry_packets":   0,
@@ -416,6 +582,8 @@ STATE = {
     "onboard_starting":      False,
     "onboard_progress":      [],
     "arm_last_pwm":          None,
+    "preset_running":        False,
+    "preset_active_name":    "",
     "manual_pwm_enabled":    False,
     "manual_aux_pwm":        list(MANUAL_AUX_DEFAULTS),
     "claw_hold":             True,
@@ -1148,6 +1316,36 @@ def _arm_telemetry_age_sec() -> float | None:
     return round(time.time() - last, 2)
 
 
+def _reset_onboard_telemetry_state() -> None:
+    """Clear stale telemetry after onboard stop/restart so UI waits for fresh data."""
+    tel = STATE["telemetry"]
+    tel["rx_state"] = "NO_TELEMETRY"
+    tel["attitude_stale"] = False
+    tel["depth_stale"] = False
+    tel["mavlink_link_dead"] = False
+    tel["control_timeout"] = False
+    tel["arm_imu_ok"] = False
+    tel["arm_bno_ready"] = False
+    tel["arm_imu_stale"] = False
+    tel["arm_imu_angle_deg"] = None
+    tel["arm_j6_target_deg"] = None
+    tel["arm_j6_pwm_out"] = None
+    tel["arm_claw_hold_active"] = False
+    STATE["last_telemetry_time"] = 0.0
+    STATE["last_arm_telemetry_time"] = 0.0
+    STATE["telemetry_packets"] = 0
+    STATE["telemetry_rate_hz"] = 0.0
+
+
+def _on_onboard_stack_ready() -> None:
+    """Re-subscribe topside listeners after Pi processes restart."""
+    _reset_onboard_telemetry_state()
+    _subscribe_arm_telemetry()
+    _sync_arm_claw_hold()
+    socketio.emit("telemetry", _telemetry_emit_payload())
+    emit_status()
+
+
 def _telemetry_emit_payload() -> dict:
     payload = dict(STATE["telemetry"])
     payload["link_health"] = _compute_link_health()
@@ -1219,6 +1417,10 @@ def _update_arm_telemetry_from_json(pkt: dict):
     tel["arm_claw_hold_request"] = bool(pkt.get("arm_claw_hold_request", tel.get("arm_claw_hold_request", True)))
     tel["arm_claw_hold_active"]  = bool(pkt.get("arm_claw_hold_active", False))
     tel["arm_j6_manual"]         = bool(pkt.get("arm_j6_manual", True))
+    if pkt.get("arm_imu_zero_offset") is not None:
+        tel["arm_imu_zero_offset"] = float(pkt["arm_imu_zero_offset"])
+    if pkt.get("arm_imu_sign") is not None:
+        tel["arm_imu_sign"] = float(pkt["arm_imu_sign"])
     STATE["last_arm_telemetry_time"] = time.time()
     socketio.emit("telemetry", _telemetry_emit_payload())
 
@@ -1228,6 +1430,15 @@ def _sync_arm_claw_hold():
     _send_pi_arm_control({
         "cmd": "claw_hold",
         "enabled": bool(STATE.get("claw_hold", True)),
+    })
+
+
+def _sync_arm_imu_cal():
+    """Push persisted arm IMU sign/zero to new_ar.py."""
+    _send_pi_arm_control({
+        "cmd": "arm_imu_cal",
+        "sign": float(config.get("arm_imu_sign", -1.0)),
+        "zero_offset_deg": float(config.get("arm_imu_zero_offset", -154.0)),
     })
 
 
@@ -1257,6 +1468,9 @@ def _start_arm_telemetry_subscribe_loop():
         while True:
             _subscribe_arm_telemetry()
             _sync_arm_claw_hold()
+            _sync_arm_imu_cal()
+            _sync_arm_enable()
+            _sync_arm_power()
             time.sleep(5.0)
 
     threading.Thread(target=_loop, daemon=True, name="arm-tel-sub").start()
@@ -1280,6 +1494,9 @@ def _start_arm_telemetry_listener():
         print(f"[INFO] Arm telemetry listener active on UDP port {port}")
         _subscribe_arm_telemetry()
         _sync_arm_claw_hold()
+        _sync_arm_imu_cal()
+        _sync_arm_enable()
+        _sync_arm_power()
         while True:
             try:
                 data, _ = s.recvfrom(4096)
@@ -1504,6 +1721,8 @@ def emit_status():
         "telemetry_record_file": STATE.get("telemetry_record_file", ""),
         "link_health":           link,
         "arm_last_pwm":          STATE.get("arm_last_pwm"),
+        "preset_running":        STATE.get("preset_running", False),
+        "preset_active_name":    STATE.get("preset_active_name", ""),
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
         "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS)),
         "claw_hold":             STATE.get("claw_hold", True),
@@ -1683,9 +1902,8 @@ def api_start_onboard():
                         "mavproxy", "starting",
                         f"Launching MAVProxy on {ser}{auto_note}...",
                     )
-                    ok_m, msg_m = ssh.ensure_mavproxy()
-                    fresh_mav = ok_m and "already running" not in msg_m
-                    if ok_m and fresh_mav:
+                    ok_m, msg_m = ssh._start_mavproxy_fresh()
+                    if ok_m:
                         ok_m, msg_m = _wait_onboard_running(
                             ssh.is_mavproxy_running, "MAVProxy", timeout_sec=30.0
                         )
@@ -1783,6 +2001,9 @@ def api_start_onboard():
                 timeout: float,
                 extra_args: str,
             ):
+                # Let stabilization connect and bootstrap ATTITUDE before arm hammers MAVLink.
+                if step == "arm_ctrl":
+                    time.sleep(2.5)
                 ok, msg = ssh.supervisor_start_and_wait(
                     svc, timeout_sec=timeout, extra_args=extra_args,
                 )
@@ -1843,7 +2064,10 @@ def api_start_onboard():
                 "done" if core_ok else "error",
                 summary,
             )
-            emit_status()
+            if core_ok:
+                _on_onboard_stack_ready()
+            else:
+                emit_status()
         except Exception as e:
             _emit_onboard_progress("complete", "error", f"Onboard start error: {e}")
             STATE["onboard_starting"] = False
@@ -1857,12 +2081,15 @@ def api_start_onboard():
 def api_stop_onboard():
     ssh.supervisor_stop_all()
     ssh.stop_mavproxy()
+    ssh.exec("sleep 0.75", timeout=5)
     STATE["onboard_stab"]     = False
     STATE["onboard_arm"]      = False
     STATE["onboard_cam"]      = False
     STATE["onboard_mavproxy"] = False
     STATE["onboard_starting"] = False
+    _reset_onboard_telemetry_state()
     emit_status()
+    socketio.emit("telemetry", _telemetry_emit_payload())
     return jsonify({"ok": True})
 
 
@@ -1925,6 +2152,27 @@ def api_stop_topside():
     return jsonify({"ok": True})
 
 
+@app.route("/api/arm_imu_zero", methods=["POST"])
+def api_arm_imu_zero():
+    ok, msg = _send_pi_arm_control({"cmd": "arm_imu_zero"})
+    if not ok:
+        return jsonify({"ok": False, "msg": msg}), 500
+    time.sleep(0.25)
+    tel = STATE.get("telemetry", {})
+    offset = tel.get("arm_imu_zero_offset")
+    angle = tel.get("arm_imu_angle_deg")
+    if offset is not None:
+        config["arm_imu_zero_offset"] = float(offset)
+        save_config_file()
+    emit_status()
+    return jsonify({
+        "ok": True,
+        "msg": "Arm IMU zeroed — flat is now 0°",
+        "offset_deg": offset,
+        "angle_deg": angle,
+    })
+
+
 @app.route("/api/claw_hold", methods=["GET", "POST"])
 def api_claw_hold():
     if request.method == "GET":
@@ -1932,6 +2180,12 @@ def api_claw_hold():
             "ok": True,
             "enabled": bool(STATE.get("claw_hold", True)),
         })
+
+    if not _robot_armed():
+        return jsonify({
+            "ok": False,
+            "msg": "Claw hold disabled while DISARMED",
+        }), 403
 
     data = request.get_json(force=True) or {}
     enabled = bool(data.get("enabled", True))
@@ -1944,7 +2198,7 @@ def api_claw_hold():
 @app.route("/api/mosfet", methods=["POST"])
 def api_mosfet():
     data = request.get_json(force=True) or {}
-    state = bool(data.get("state", False))
+    state = bool(data.get("state", True))
     ok, msg = ssh.send_mosfet(state)
     STATE["mosfet_on"] = state
     emit_status()
@@ -1963,6 +2217,13 @@ def api_manual_pwm_get():
 
 @app.route("/api/manual_pwm", methods=["POST"])
 def api_manual_pwm():
+    if not _robot_armed():
+        return jsonify({
+            "ok": False,
+            "msg": "Manual AUX disabled while DISARMED",
+            "enabled": False,
+        }), 403
+
     data = request.get_json(force=True) or {}
     action = (data.get("action") or "").strip().lower()
 
@@ -2046,6 +2307,7 @@ def api_mode():
     if mode not in ("disarmed", "armed", "stabilize"):
         return jsonify({"ok": False, "msg": "invalid mode"})
     STATE["mode"] = mode
+    _apply_disarmed_arm_lockout()
     emit_status()
     return jsonify({"ok": True, "mode": mode})
 
@@ -2145,18 +2407,21 @@ def api_arm_presets_delete(name):
 
 @app.route("/api/arm_preset/<name>", methods=["POST"])
 def api_arm_preset(name):
+    if not _robot_armed():
+        return jsonify({"ok": False, "msg": "Arm presets disabled while DISARMED"}), 403
     normalize_arm_presets()
     preset = config.get("arm_presets", {}).get(_slug_preset_name(name))
     if not preset:
         return jsonify({"ok": False, "msg": f"Unknown preset: {name}"}), 404
     try:
-        csv_line = _preset_to_csv(preset)
-        _send_arm_csv(csv_line)
+        ok, msg = _start_preset_sequence(_slug_preset_name(name), preset)
+        if not ok:
+            return jsonify({"ok": False, "msg": msg}), 409
         return jsonify({
             "ok": True,
-            "msg": f"Sent arm preset '{name}'",
+            "msg": msg,
             "preset": name,
-            "csv": csv_line,
+            "sequential": True,
         })
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -2209,6 +2474,8 @@ def api_status():
         "telemetry_record_file": STATE.get("telemetry_record_file", ""),
         "link_health":           _compute_link_health(),
         "arm_last_pwm":          STATE.get("arm_last_pwm"),
+        "preset_running":        STATE.get("preset_running", False),
+        "preset_active_name":    STATE.get("preset_active_name", ""),
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
         "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS)),
         "claw_hold":             STATE.get("claw_hold", True),
@@ -2307,6 +2574,7 @@ def main():
     _start_arm_telemetry_listener()
     _start_arm_telemetry_subscribe_loop()
     _start_control_keepalive()
+    _sync_arm_power()
     threading.Thread(target=_monitor_loop, daemon=True).start()
 
     url = f"http://localhost:{args.port}"

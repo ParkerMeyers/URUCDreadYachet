@@ -198,8 +198,13 @@ def cmd_stop(name: str) -> dict:
 
 
 def cmd_stop_all() -> dict:
-    for name in SERVICES:
-        _stop_service(SERVICES[name])
+    # Stop arm first so BNO055 I2C is released before the next start.
+    _stop_service(SERVICES["arm"])
+    time.sleep(0.35)
+    for name, svc in SERVICES.items():
+        if name == "arm":
+            continue
+        _stop_service(svc)
     return {"ok": True, "stopped": list(SERVICES.keys())}
 
 

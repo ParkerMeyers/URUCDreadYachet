@@ -258,9 +258,9 @@
   <div class="controlbar">
 
     <span class="control-label">Power</span>
-    <div class="mosfet-toggle" id="mosfet-toggle" onclick="toggleMosfet()">
+    <div class="mosfet-toggle on" id="mosfet-toggle" onclick="toggleMosfet()">
       <div class="mosfet-indicator"></div>
-      <span id="mosfet-label">MOSFET OFF</span>
+      <span id="mosfet-label">MOSFET ON</span>
     </div>
 
     <div class="ctrl-sep"></div>
@@ -295,6 +295,7 @@
 
     <span class="control-label">Arm</span>
     <span id="arm-preset-btns" class="arm-preset-btns"></span>
+    <button class="action-btn" id="btn-arm-imu-zero" onclick="zeroArmIMU()">⊕ ZERO ARM IMU</button>
     <button class="action-btn" id="btn-manual-pwm" onclick="showManualPwm()">⌨ Manual AUX</button>
     <button class="action-btn" onclick="showArmPresets()">⚙ Presets</button>
 

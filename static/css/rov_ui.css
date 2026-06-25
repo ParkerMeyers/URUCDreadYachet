@@ -85,6 +85,14 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 .dot.running { background:var(--green); box-shadow:0 0 6px var(--green); }
 .dot.error   { background:var(--red);   box-shadow:0 0 6px var(--red); }
 .dot.warn    { background:var(--amber); box-shadow:0 0 6px var(--amber); }
+.dot.starting {
+  background:var(--amber); box-shadow:0 0 6px var(--amber);
+  animation:dot-flash 1s ease-in-out infinite;
+}
+@keyframes dot-flash {
+  0%, 100% { opacity:1; box-shadow:0 0 8px var(--amber); }
+  50%      { opacity:0.3; box-shadow:0 0 2px var(--amber); }
+}
 
 /* progress log */
 .progress-log {
@@ -337,6 +345,17 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 .ctrl-flag.disabled:hover,
 .ctrl-flag:disabled:hover { border-color:var(--border); }
 
+.mosfet-toggle.disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+.action-btn.disabled,
+.action-btn:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+  pointer-events: none;
+}
 .mosfet-toggle {
   display:flex; align-items:center; gap:8px;
   padding:5px 12px; border-radius:6px;
