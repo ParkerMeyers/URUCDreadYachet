@@ -122,8 +122,27 @@ def _stop_service(svc: dict) -> None:
     _clear_pid(svc["pidfile"])
 
 
+def _release_video_devices_from_args(extra_args: str) -> None:
+    """Free V4L2 nodes before launching camera_stream (PipeWire, stale grabbers)."""
+    for dev in re.findall(r"/dev/video\d+", extra_args):
+        try:
+            proc = subprocess.run(
+                ["fuser", dev],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                subprocess.run(["fuser", "-k", dev], check=False)
+        except OSError:
+            pass
+    time.sleep(0.5)
+
+
 def _start_service(svc: dict, extra_args: str = "") -> int:
     _stop_service(svc)
+    if svc.get("script", "").endswith("camera_stream.py"):
+        _release_video_devices_from_args(extra_args)
     log_path = Path(svc["log"])
     log_path.write_text("", encoding="utf-8")
 
@@ -131,14 +150,18 @@ def _start_service(svc: dict, extra_args: str = "") -> int:
     if extra_args.strip():
         cmd.extend(extra_args.split())
 
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
     with open(log_path, "ab", buffering=0) as logf:
         proc = subprocess.Popen(
-            cmd,
+            ["python3", "-u", *cmd[1:]],
             cwd=str(ROOT),
             stdin=subprocess.DEVNULL,
             stdout=logf,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=env,
         )
 
     _write_pid(svc["pidfile"], proc.pid)

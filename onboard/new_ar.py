@@ -36,39 +36,18 @@ from pymavlink import mavutil
 
 from mavlink_rc import MAVLINK_ONBOARD, connect_mavlink, send_rc_channels_override, wait_for_heartbeat
 
-# ── Optional: BNO055 IMU ──────────────────────────────────────────────────────
-try:
-    import board
-    import busio
-    import adafruit_bno055
-    _i2c = busio.I2C(board.SCL, board.SDA)
-    _bno = adafruit_bno055.BNO055_I2C(_i2c, address=0x29)
-    HAVE_BNO = True
-    print("[arm] BNO055 IMU ready — J6 auto-level enabled")
-except Exception as _e:
-    HAVE_BNO = False
-    _bno     = None
-    print(f"[arm] BNO055 not available ({_e}) — J6 manual-only")
-
-# ── Optional: MOSFET via lgpio ────────────────────────────────────────────────
-MOSFET_GPIO = 17
-MOSFET_PORT = 5007
-
-try:
-    import lgpio as _lgpio
-    _gpio_h = _lgpio.gpiochip_open(0)
-    _lgpio.gpio_claim_output(_gpio_h, MOSFET_GPIO, 0)
-    HAVE_GPIO = True
-    print(f"[arm] lgpio ready — MOSFET on GPIO{MOSFET_GPIO}")
-except Exception as _e:
-    HAVE_GPIO = False
-    _lgpio   = None
-    _gpio_h  = None
-    print(f"[arm] lgpio not available ({_e}) — MOSFET control disabled")
+# ── Optional hardware (initialized lazily — I2C/GPIO can block at import) ─────
+_bno = None
+HAVE_BNO = False
+_gpio_h = None
+HAVE_GPIO = False
+_lgpio = None
 
 # ── Config ────────────────────────────────────────────────────────────────────
 UDP_PORT    = 5006
 MAVLINK_URL = MAVLINK_ONBOARD
+MOSFET_GPIO = 17
+MOSFET_PORT = 5007
 CENTER_US   = 1500
 MIN_US      = 500
 MAX_US      = 2500
@@ -116,6 +95,37 @@ def _normalize(v):
 
 
 _LEVEL_NORMAL = _normalize(_LEVEL_NORMAL_RAW)
+
+
+def _init_optional_hardware() -> None:
+    """Probe BNO055 and MOSFET GPIO without blocking process startup."""
+    global _bno, HAVE_BNO, _gpio_h, HAVE_GPIO, _lgpio
+
+    try:
+        import board
+        import busio
+        import adafruit_bno055
+        _i2c = busio.I2C(board.SCL, board.SDA)
+        _bno = adafruit_bno055.BNO055_I2C(_i2c, address=0x29)
+        HAVE_BNO = True
+        print("[arm] BNO055 IMU ready — J6 auto-level enabled", flush=True)
+    except Exception as _e:
+        HAVE_BNO = False
+        _bno = None
+        print(f"[arm] BNO055 not available ({_e}) — J6 manual-only", flush=True)
+
+    try:
+        import lgpio as _lgpio_mod
+        _lgpio = _lgpio_mod
+        _gpio_h = _lgpio.gpiochip_open(0)
+        _lgpio.gpio_claim_output(_gpio_h, MOSFET_GPIO, 0)
+        HAVE_GPIO = True
+        print(f"[arm] lgpio ready — MOSFET on GPIO{MOSFET_GPIO}", flush=True)
+    except Exception as _e:
+        HAVE_GPIO = False
+        _lgpio = None
+        _gpio_h = None
+        print(f"[arm] lgpio not available ({_e}) — MOSFET control disabled", flush=True)
 
 
 def _read_j6_angle_deg():
@@ -263,16 +273,23 @@ def _send_heartbeat(master):
 def main():
     global _joint_us, _j6_target_deg, _last_pkt_time, _rx_count
 
-    print(f"[arm] Connecting to MAVProxy at {MAVLINK_URL} ...")
-    master = connect_mavlink(MAVLINK_URL)
+    print("[arm] Arm controller starting...", flush=True)
+    threading.Thread(
+        target=_init_optional_hardware, daemon=True, name="arm-hw-init",
+    ).start()
 
-    print("[arm] Waiting for heartbeat from Pix6 ...")
-    hb = wait_for_heartbeat(master, timeout=20)
+    print(f"[arm] Connecting to MAVProxy at {MAVLINK_URL} ...", flush=True)
+    # MAVProxy is verified ready before the supervisor launches us — short retry.
+    master = connect_mavlink(MAVLINK_URL, timeout=20.0)
+
+    print("[arm] Waiting for heartbeat from Pix6 ...", flush=True)
+    hb = wait_for_heartbeat(master, timeout=15)
     if hb:
         print(f"[arm] Heartbeat OK "
-              f"(system={master.target_system} component={master.target_component})")
+              f"(system={master.target_system} component={master.target_component})",
+              flush=True)
     else:
-        print("[arm] *** No heartbeat in 20 s — continuing anyway ***")
+        print("[arm] *** No heartbeat in 15 s — continuing anyway ***", flush=True)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", UDP_PORT))
@@ -280,9 +297,9 @@ def main():
 
     threading.Thread(target=_mosfet_listener, daemon=True).start()
 
-    print(f"[arm] Listening on UDP {UDP_PORT}")
-    print(f"[arm] AUX1=J4  AUX2=J1  AUX3=J3  AUX4=J6  AUX5=J5  AUX6=J2  AUX7=Claw")
-    print(f"[arm] BNO055={'yes' if HAVE_BNO else 'no'}  MOSFET={'yes' if HAVE_GPIO else 'no'}")
+    print(f"[arm] Listening on UDP {UDP_PORT}", flush=True)
+    print(f"[arm] AUX1=J4  AUX2=J1  AUX3=J3  AUX4=J6  AUX5=J5  AUX6=J2  AUX7=Claw", flush=True)
+    print(f"[arm] BNO055={'yes' if HAVE_BNO else 'no'}  MOSFET={'yes' if HAVE_GPIO else 'no'}", flush=True)
 
     last_send      = 0.0
     last_heartbeat = 0.0

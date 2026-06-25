@@ -24,9 +24,11 @@ Usage:
 
 import argparse
 import socket
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 try:
     import cv2
@@ -39,6 +41,172 @@ except ImportError:
 BOUNDARY = b"frame"
 _placeholder_lock = threading.Lock()
 _placeholder_frame: bytes | None = None
+
+# V4L2_CAP_VIDEO_CAPTURE from linux/videodev2.h
+_V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+
+
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def _is_usb_webcam(device: str) -> bool:
+    """USB UVC camera only (excludes Pi internal pispbe / hevc nodes)."""
+    name = Path(device).name
+    dev_node = Path(f"/sys/class/video4linux/{name}/device")
+    try:
+        real = dev_node.resolve()
+    except OSError:
+        return False
+    return "/usb" in str(real).lower()
+
+
+def _is_capture_node(device: str) -> bool:
+    """True if sysfs marks this node as a video-capture device (not metadata)."""
+    name = Path(device).name
+    caps_path = Path(f"/sys/class/video4linux/{name}/device_caps")
+    if not caps_path.is_file():
+        return _is_primary_capture_node(device)
+    try:
+        caps = int(caps_path.read_text(encoding="utf-8").strip(), 16)
+        return bool(caps & _V4L2_CAP_VIDEO_CAPTURE)
+    except (OSError, ValueError):
+        return True
+
+
+def _is_primary_capture_node(device: str) -> bool:
+    """
+    UVC webcams expose /dev/videoN (capture, index=0) and /dev/videoN+1 (metadata).
+    Prefer nodes with index 0 — matches v4l2-ctl --list-devices grouping.
+    """
+    name = Path(device).name
+    index_path = Path(f"/sys/class/video4linux/{name}/index")
+    if index_path.is_file():
+        try:
+            return int(index_path.read_text(encoding="utf-8").strip()) == 0
+        except (OSError, ValueError):
+            pass
+    # Odd-numbered nodes are usually metadata when caps sysfs is missing.
+    if name[5:].isdigit():
+        return int(name[5:]) % 2 == 0
+    return True
+
+
+def _device_to_v4l2_index(device: str) -> int:
+    """Map /dev/videoN → N for OpenCV (Pi builds reject path strings)."""
+    name = Path(device).name
+    if name.startswith("video") and name[5:].isdigit():
+        return int(name[5:])
+    return int(device)
+
+
+def _device_busy_pids(device: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["fuser", device],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    except OSError:
+        pass
+    return ""
+
+
+def release_video_device(device: str, *, force: bool = False) -> None:
+    """Log and optionally SIGKILL processes holding a V4L2 node."""
+    pids = _device_busy_pids(device)
+    if not pids:
+        return
+    _log(f"[cam] {device} busy — PIDs: {pids}")
+    if force:
+        subprocess.run(["fuser", "-k", device], check=False)
+        time.sleep(0.4)
+
+
+def list_capture_devices(*, usb_only: bool = False) -> list[str]:
+    """Return /dev/videoN paths that support video capture, in numeric order."""
+    base = Path("/sys/class/video4linux")
+    if not base.is_dir():
+        return []
+    devices: list[tuple[int, str]] = []
+    for entry in base.glob("video*"):
+        if not entry.name[5:].isdigit():
+            continue
+        dev = f"/dev/{entry.name}"
+        if usb_only and not _is_usb_webcam(dev):
+            continue
+        if not _is_capture_node(dev):
+            continue
+        if usb_only and not _is_primary_capture_node(dev):
+            continue
+        devices.append((int(entry.name[5:]), dev))
+    devices.sort(key=lambda item: item[0])
+    return [dev for _, dev in devices]
+
+
+def resolve_camera_device(requested: str, used: set[str]) -> str:
+    """
+    Pick a capture-capable V4L2 node.
+
+    UVC webcams expose two nodes per camera (video + metadata).  Opening the
+    metadata node produces OpenCV's "can't be used to capture" warning.
+    """
+    req = (requested or "").strip()
+    if req and req.lower() != "auto":
+        if not _is_capture_node(req):
+            idx = Path(req).name
+            alt = f"/dev/video{int(idx[5:]) - 1}" if idx[5:].isdigit() else ""
+            if alt and _is_capture_node(alt) and alt not in used:
+                _log(f"[cam] {req} is a metadata node — using {alt} instead")
+                return alt
+        return req
+
+    for dev in list_capture_devices(usb_only=True):
+        if dev not in used:
+            return dev
+    return req or "/dev/video0"
+
+
+def _fourcc(name: str) -> int:
+    return cv2.VideoWriter_fourcc(*name)
+
+
+# UVC webcams on Pi usually need MJPEG for reliable capture at 640×480.
+_CAPTURE_PROFILES: tuple[tuple[str, int, int], ...] = (
+    ("MJPG", 640, 480),
+    ("MJPG", 320, 240),
+    ("YUYV", 640, 480),
+    ("YUYV", 320, 240),
+)
+
+
+def _configure_capture(cap: "cv2.VideoCapture", width: int, height: int, fps: int) -> tuple[int, int, str]:
+    """
+    Try common UVC format profiles.  Returns (actual_w, actual_h, fourcc_used).
+    MJPEG first — uncompressed YUYV at 640×480 often fails with two cameras.
+    """
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    profiles = [(f, width, height)] + [
+        (f, w, h) for f, w, h in _CAPTURE_PROFILES
+        if not (f == "MJPG" and w == width and h == height)
+    ]
+    for fourcc_name, w, h in profiles:
+        cap.set(cv2.CAP_PROP_FOURCC, _fourcc(fourcc_name))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        cap.set(cv2.CAP_PROP_FPS, fps)
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # Warm up — first frames after format change are often empty on UVC.
+        for _ in range(8):
+            cap.grab()
+        ret, frame = cap.read()
+        if ret and frame is not None and frame.size > 0:
+            return actual_w, actual_h, fourcc_name
+    return width, height, "?"
 
 
 def _build_placeholder(width: int, height: int) -> bytes | None:
@@ -89,22 +257,35 @@ class CameraStream:
         t.start()
         return self
 
-    def _open_capture(self) -> "cv2.VideoCapture":
+    def _open_capture(self) -> "cv2.VideoCapture | None":
         """
-        Open the V4L2 device, bypassing GStreamer.
-
-        The apt-packaged OpenCV on Raspberry Pi OS uses GStreamer as its
-        default backend and misinterprets "/dev/videoN" paths as URIs,
-        printing "no source element for URI" errors.  Passing CAP_V4L2
-        (or converting a bare integer string to int) forces the correct
-        backend.
+        Open via numeric V4L2 index — Pi OpenCV builds reject /dev/videoN paths
+        ("can't be used to capture by name") but accept cv2.VideoCapture(N, CAP_V4L2).
         """
+        idx = _device_to_v4l2_index(self.device)
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            pids = _device_busy_pids(self.device)
+            if pids:
+                _log(f"[cam] {self.device} (index {idx}): open failed — "
+                     f"device busy (PIDs {pids})")
+            cap.release()
+            return None
         try:
-            # Accept bare integer indices ("0", "2") as well as device paths
-            return cv2.VideoCapture(int(self.device))
-        except ValueError:
-            # Full path like "/dev/video0" — force the V4L2 backend explicitly
-            return cv2.VideoCapture(self.device, cv2.CAP_V4L2)
+            actual_w, actual_h, fmt = _configure_capture(
+                cap, self.width, self.height, self.fps,
+            )
+            if fmt == "?":
+                cap.release()
+                return None
+            self.width = actual_w
+            self.height = actual_h
+            _log(f"[cam] {self.device}: opened {actual_w}×{actual_h} fmt={fmt}")
+        except Exception as exc:
+            _log(f"[cam] {self.device}: configure failed ({exc})")
+            cap.release()
+            return None
+        return cap
 
     def _capture_loop(self) -> None:
         cap = None
@@ -114,23 +295,14 @@ class CameraStream:
             # (Re-)open the camera device
             if cap is None or not cap.isOpened():
                 cap = self._open_capture()
-                if cap.isOpened():
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                    cap.set(cv2.CAP_PROP_FPS,          self.fps)
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
-                    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    actual_f = int(cap.get(cv2.CAP_PROP_FPS))
-                    print(f"[cam] {self.device}: opened "
-                          f"({actual_w}×{actual_h} @{actual_f}fps)")
+                if cap is not None and cap.isOpened():
                     retry_delay = 5.0
                 else:
-                    if cap:
+                    if cap is not None:
                         cap.release()
                     cap = None
-                    print(f"[cam] {self.device}: not available — "
-                          f"retry in {retry_delay:.0f}s")
+                    _log(f"[cam] {self.device}: not available — "
+                         f"retry in {retry_delay:.0f}s")
                     time.sleep(retry_delay)
                     retry_delay = min(retry_delay * 1.5, 30.0)
                     continue
@@ -138,7 +310,7 @@ class CameraStream:
             # Grab and encode a frame
             ret, frame = cap.read()
             if not ret:
-                print(f"[cam] {self.device}: read failed — reopening")
+                _log(f"[cam] {self.device}: read failed — reopening")
                 cap.release()
                 cap = None
                 time.sleep(1.0)
@@ -243,7 +415,7 @@ def _serve_camera(stream: CameraStream, port: int) -> None:
     handler = _make_handler(stream)
     server  = ThreadingHTTPServer(("0.0.0.0", port), handler)
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    print(f"[cam] http://0.0.0.0:{port}  ←  {stream.device}")
+    print(f"[cam] http://0.0.0.0:{port}  ←  {stream.device}", flush=True)
     server.serve_forever()
 
 
@@ -286,22 +458,40 @@ def main() -> None:
     args = parser.parse_args()
 
     if not HAVE_CV2:
-        print("[cam] FATAL: opencv-python-headless not installed.")
-        print("[cam]   pip install opencv-python-headless")
-        print("[cam]   Streams will serve placeholder frames only.")
+        _log("[cam] FATAL: opencv-python-headless not installed.")
+        _log("[cam]   pip install opencv-python-headless")
+        _log("[cam]   Streams will serve placeholder frames only.")
 
     global _placeholder_frame
     _placeholder_frame = _build_placeholder(args.width, args.height)
 
+    usb_cams = list_capture_devices(usb_only=True)
+    if usb_cams:
+        _log(f"[cam] USB webcams: {', '.join(usb_cams)}")
+    else:
+        _log("[cam] WARNING: no USB capture devices found")
+    platform_count = len(list_capture_devices()) - len(usb_cams)
+    if platform_count > 0:
+        _log(f"[cam] ({platform_count} Pi ISP/codec nodes ignored — not webcams)")
+
+    used: set[str] = set()
+    cam0_dev = resolve_camera_device(args.cam0, used)
+    used.add(cam0_dev)
+    cam1_dev = resolve_camera_device(args.cam1, used)
+
+    for dev in (cam0_dev, cam1_dev):
+        release_video_device(dev, force=True)
+
     stream0 = CameraStream(
-        args.cam0, args.width, args.height, args.fps, args.quality,
+        cam0_dev, args.width, args.height, args.fps, args.quality,
     )
     stream1 = CameraStream(
-        args.cam1, args.width, args.height, args.fps, args.quality,
+        cam1_dev, args.width, args.height, args.fps, args.quality,
     )
 
     if HAVE_CV2:
         stream0.start()
+        time.sleep(2.0)  # stagger USB opens — two UVC cams at once often fail on Pi
         stream1.start()
 
     t0 = threading.Thread(
@@ -312,13 +502,14 @@ def main() -> None:
         target=_serve_camera, args=(stream1, args.port1),
         daemon=True, name="srv-cam1",
     )
+
+    _log("[cam] Dual-camera MJPEG server running")
+    _log(f"[cam]   Cam 0 ({cam0_dev}): http://0.0.0.0:{args.port0}")
+    _log(f"[cam]   Cam 1 ({cam1_dev}): http://0.0.0.0:{args.port1}")
+    _log(f"[cam]   {args.width}×{args.height}  @{args.fps}fps  quality={args.quality}")
+
     t0.start()
     t1.start()
-
-    print(f"[cam] Dual-camera MJPEG server running")
-    print(f"[cam]   Cam 0 ({args.cam0}): http://0.0.0.0:{args.port0}")
-    print(f"[cam]   Cam 1 ({args.cam1}): http://0.0.0.0:{args.port1}")
-    print(f"[cam]   {args.width}×{args.height}  @{args.fps}fps  quality={args.quality}")
 
     try:
         while True:

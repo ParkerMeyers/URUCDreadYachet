@@ -1054,7 +1054,7 @@ def api_start_onboard():
             _emit_onboard_progress(
                 "stabilization", "starting", "Launching stabilization.py..."
             )
-            ok_s, msg_s = ssh.supervisor_start_and_wait("stab", timeout_sec=55.0)
+            ok_s, msg_s = ssh.supervisor_start_and_wait("stab", timeout_sec=75.0)
             STATE["onboard_stab"] = ok_s
             _emit_onboard_progress(
                 "stabilization", "done" if ok_s else "error", msg_s
@@ -1064,7 +1064,7 @@ def api_start_onboard():
             _emit_onboard_progress(
                 "arm_ctrl", "starting", "Launching new_ar.py (arm controller)..."
             )
-            ok_a, msg_a = ssh.supervisor_start_and_wait("arm", timeout_sec=55.0)
+            ok_a, msg_a = ssh.supervisor_start_and_wait("arm", timeout_sec=75.0)
             STATE["onboard_arm"] = ok_a
             _emit_onboard_progress(
                 "arm_ctrl", "done" if ok_a else "error", msg_a
@@ -1078,7 +1078,7 @@ def api_start_onboard():
             cam1_dev = config.get("camera1_device", "/dev/video2")
             cam_args = f"--cam0 {cam0_dev} --cam1 {cam1_dev}"
             ok_c, msg_c = ssh.supervisor_start_and_wait(
-                "cam", timeout_sec=25.0, extra_args=cam_args
+                "cam", timeout_sec=45.0, extra_args=cam_args
             )
             STATE["onboard_cam"] = ok_c
             _emit_onboard_progress(
