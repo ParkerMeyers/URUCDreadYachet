@@ -1100,7 +1100,7 @@ function compositeOverlayFrame(recCanvas, camNum, t, lockedW, lockedH) {
   const scale = Math.max(0.65, H / 520);
   ctx.font = `bold ${Math.max(8, 9 * scale)}px sans-serif`;
   ctx.textAlign = 'left';
-  ctx.fillStyle = 'rgba(1,62,205,0.75)';
+  ctx.fillStyle = 'rgba(0,212,255,0.75)';
   ctx.fillText(meta.label, 10 * scale, 18 * scale);
   drawRecordBadge(ctx, W, scale);
 
@@ -2302,9 +2302,9 @@ function drawAttitudeOverlay(ctx, W, H, rollDeg, pitchDeg, yawDeg, live) {
   ctx.rotate(rollRad);
   ctx.translate(0, pitchOff);
 
-  ctx.fillStyle = uiAccent(0.06);
+  ctx.fillStyle = 'rgba(0, 95, 135, 0.06)';
   ctx.fillRect(-span, -H * 2, span * 2, H * 2);
-  ctx.fillStyle = 'rgba(0,14,47,0.12)';
+  ctx.fillStyle = 'rgba(0, 12, 28, 0.12)';
   ctx.fillRect(-span, 0, span * 2, H * 2);
 
   for (let p = -40; p <= 40; p += 10) {
@@ -2313,8 +2313,8 @@ function drawAttitudeOverlay(ctx, W, H, rollDeg, pitchDeg, yawDeg, live) {
     const half = major ? span * 0.8 : (Math.abs(p) % 20 === 0 ? span * 0.55 : span * 0.28);
 
     ctx.strokeStyle = major
-      ? (live ? 'rgba(1,62,205,0.30)' : 'rgba(255,179,32,0.28)')
-      : 'rgba(1,62,205,0.28)';
+      ? (live ? 'rgba(0,212,255,0.30)' : 'rgba(255,179,32,0.28)')
+      : 'rgba(0,212,255,0.28)';
     ctx.lineWidth = major ? 1 : 1;
     ctx.beginPath();
     ctx.moveTo(-half, y);
@@ -2334,7 +2334,7 @@ function drawAttitudeOverlay(ctx, W, H, rollDeg, pitchDeg, yawDeg, live) {
   ctx.restore();
 
   const wing = Math.min(W, H) * 0.11;
-  ctx.strokeStyle = live ? 'rgba(1,62,205,0.95)' : 'rgba(255,179,32,0.65)';
+  ctx.strokeStyle = live ? 'rgba(0,212,255,0.95)' : 'rgba(255,179,32,0.65)';
   ctx.fillStyle = ctx.strokeStyle;
   ctx.lineWidth = 2.5;
   ctx.lineCap = 'round';
@@ -2350,7 +2350,7 @@ function drawAttitudeOverlay(ctx, W, H, rollDeg, pitchDeg, yawDeg, live) {
 
   const arcR = Math.min(W, H) * 0.24;
   const arcCy = cy - arcR * 0.55;
-  ctx.strokeStyle = 'rgba(1,62,205,0.45)';
+  ctx.strokeStyle = 'rgba(0,212,255,0.45)';
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   ctx.arc(cx, arcCy, arcR, Math.PI * 1.12, Math.PI * 1.88);
@@ -2363,7 +2363,7 @@ function drawAttitudeOverlay(ctx, W, H, rollDeg, pitchDeg, yawDeg, live) {
     const y1 = arcCy + arcR * Math.sin(a);
     const x2 = cx + (arcR + tick) * Math.cos(a);
     const y2 = arcCy + (arcR + tick) * Math.sin(a);
-    ctx.strokeStyle = deg === 0 ? 'rgba(0,224,138,0.85)' : 'rgba(1,62,205,0.45)';
+    ctx.strokeStyle = deg === 0 ? 'rgba(0,224,138,0.85)' : 'rgba(0,212,255,0.45)';
     ctx.lineWidth = deg === 0 ? 2 : 1;
     ctx.beginPath();
     ctx.moveTo(x1, y1);
@@ -2394,7 +2394,7 @@ function drawYawTape(ctx, W, H, yawDeg, live) {
 
   ctx.fillStyle = 'rgba(0,0,0,0.5)';
   ctx.fillRect(0, tapeY - 6, W, tapeH + 14);
-  ctx.strokeStyle = 'rgba(1,62,205,0.2)';
+  ctx.strokeStyle = 'rgba(0,212,255,0.2)';
   ctx.lineWidth = 1;
   ctx.strokeRect(0.5, tapeY - 6.5, W - 1, tapeH + 13);
 
@@ -2408,7 +2408,7 @@ function drawYawTape(ctx, W, H, yawDeg, live) {
     if (x < -24 || x > W + 24) continue;
 
     const major = normD % 30 === 0;
-    ctx.strokeStyle = major ? 'rgba(1,62,205,0.75)' : 'rgba(1,62,205,0.28)';
+    ctx.strokeStyle = major ? 'rgba(0,212,255,0.75)' : 'rgba(0,212,255,0.28)';
     ctx.lineWidth = major ? 1.5 : 1;
     ctx.beginPath();
     ctx.moveTo(x, tapeY);
@@ -2458,11 +2458,11 @@ function drawCommandMiniHUD(ctx, W, H, t) {
 
   ctx.beginPath();
   ctx.arc(cx, cy, R, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(1,62,205,0.22)';
+  ctx.strokeStyle = 'rgba(0,212,255,0.22)';
   ctx.lineWidth = 1.5;
   ctx.stroke();
 
-  ctx.strokeStyle = 'rgba(1,62,205,0.15)';
+  ctx.strokeStyle = 'rgba(0,212,255,0.15)';
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy);
@@ -2490,7 +2490,7 @@ function drawCommandMiniHUD(ctx, W, H, t) {
     const bh = R * 0.65;
     ctx.beginPath();
     ctx.roundRect(bx - 3, cy - bh, 6, bh * 2, 3);
-    ctx.fillStyle = 'rgba(1,62,205,0.08)';
+    ctx.fillStyle = 'rgba(0,212,255,0.08)';
     ctx.fill();
     const barH = Math.abs(vert) * bh;
     const barY = vert > 0 ? cy - barH : cy;
@@ -2502,7 +2502,7 @@ function drawCommandMiniHUD(ctx, W, H, t) {
     ctx.fill();
   }
 
-  ctx.fillStyle = uiAccent(0.55);
+  ctx.fillStyle = 'rgba(0,212,255,0.55)';
   ctx.font = `bold ${Math.max(7, R * 0.22)}px sans-serif`;
   ctx.textAlign = 'center';
   ctx.fillText('CMD', cx, cy - R - 6);
@@ -2576,7 +2576,7 @@ function drawArmGripperHUD(ctx, W, H, t) {
   ctx.translate(cx, cy);
 
   // faint crosshair
-  ctx.strokeStyle = uiAccent(0.12);
+  ctx.strokeStyle = 'rgba(0,212,255,0.12)';
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(-shaftLen * 1.15, 0);
@@ -2622,7 +2622,7 @@ function drawArmGripperHUD(ctx, W, H, t) {
 
   ctx.beginPath();
   ctx.arc(0, 0, 4, 0, Math.PI * 2);
-  ctx.fillStyle = live ? uiAccent(0.95) : 'rgba(255,179,32,0.85)';
+  ctx.fillStyle = live ? 'rgba(0,212,255,0.95)' : 'rgba(255,179,32,0.85)';
   ctx.fill();
   ctx.restore();
 
@@ -2635,7 +2635,7 @@ function drawArmGripperHUD(ctx, W, H, t) {
   ctx.beginPath();
   ctx.arc(dcx, dcy, dialR + 10, 0, Math.PI * 2);
   ctx.fill();
-  ctx.strokeStyle = uiAccent(0.35);
+  ctx.strokeStyle = 'rgba(0,212,255,0.35)';
   ctx.lineWidth = 1.5;
   ctx.stroke();
 
@@ -2645,7 +2645,7 @@ function drawArmGripperHUD(ctx, W, H, t) {
     const tick = major ? 8 : 4;
     ctx.strokeStyle = deg === 0
       ? 'rgba(0,224,138,0.85)'
-      : (major ? uiAccent(0.55) : uiAccent(0.25));
+      : (major ? 'rgba(0,212,255,0.55)' : 'rgba(0,212,255,0.25)');
     ctx.lineWidth = major ? 2 : 1;
     ctx.beginPath();
     ctx.moveTo(dcx + (dialR - tick) * Math.cos(a), dcy + (dialR - tick) * Math.sin(a));
@@ -2666,7 +2666,7 @@ function drawArmGripperHUD(ctx, W, H, t) {
   ctx.restore();
 
   ctx.font = `bold ${Math.max(9, H * 0.022)}px sans-serif`;
-  drawLegibleText(ctx, 'GRIP', dcx, dcy - dialR - 14, uiAccent(0.85), 'center');
+  drawLegibleText(ctx, 'GRIP', dcx, dcy - dialR - 14, 'rgba(0,212,255,0.85)', 'center');
 
   const label = live
     ? `${angleDeg.toFixed(1)}°${stale ? ' ~' : ''}`
@@ -2750,20 +2750,12 @@ function setCameraView(mode) {
   });
 
   resizeHUDs();
-  requestAnimationFrame(() => {
-    const control = document.getElementById('control');
-    if (!control || !control.classList.contains('active')) return;
-    const showForward = mode !== 'arm';
-    const showArm = mode !== 'forward';
-    const cam1 = document.getElementById('cam1');
-    const cam2 = document.getElementById('cam2');
-    if (showForward && cam1 && cam1.style.display !== 'block') {
-      setupCamera('cam1', 'no-sig-1', 1);
-    }
-    if (showArm && cam2 && cam2.style.display !== 'block') {
-      setTimeout(() => setupCamera('cam2', 'no-sig-2', 2), 300);
-    }
-  });
+  // Both streams run continuously regardless of view — the view-* classes only
+  // show/hide wraps via CSS. Switching views must NOT tear down or restart a
+  // live feed, so this is layout-only. startAllCameras() owns stream setup and
+  // dead streams self-heal via the per-stream watchdog/retry. (Previously this
+  // re-ran setupCamera here, which fought startAllCameras and made the two feeds
+  // abort each other on open.)
 }
 
 // ─────────────────────────────────────────────────────────────

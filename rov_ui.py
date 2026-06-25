@@ -1817,18 +1817,31 @@ def camera_stream(cam_num):
     cam_url = config.get(url_key, "")
 
     def _gen():
+        # One browser request == one upstream connection. If the upstream drops
+        # or errors, end the response and let the browser reconnect with a fresh
+        # request (the client already has watchdog/retry logic). The old
+        # `while True` retry looped forever server-side: when a browser aborted a
+        # feed (which happens constantly as views/streams reconnect), the
+        # generator kept sleeping and re-opening connections to the Pi, leaking
+        # threads that starved camera_stream.py — so the dashboard feeds died
+        # while a single direct-URL connection still worked.
         if not HAVE_REQUESTS or not cam_url:
             return
-        while True:
-            try:
-                r = _requests.get(cam_url, stream=True, timeout=(5, 30))
-                r.raise_for_status()
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        yield chunk
-            except Exception:
-                time.sleep(3)
-                continue
+        r = None
+        try:
+            r = _requests.get(cam_url, stream=True, timeout=(5, 30))
+            r.raise_for_status()
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        except Exception:
+            return
+        finally:
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
 
     content_type = "multipart/x-mixed-replace; boundary=frame"
     if HAVE_REQUESTS and cam_url:
