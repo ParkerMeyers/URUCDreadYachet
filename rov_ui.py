@@ -444,13 +444,12 @@ def _sync_arm_enable():
 
 
 def _sync_arm_power():
-    """Servo rail has no MOSFET — keep software power state ON for compatibility."""
-    STATE["mosfet_on"] = True
-    _send_pi_arm_control({"cmd": "mosfet", "state": True})
+    """Push current MOSFET state to new_ar.py (GPIO17 servo power rail)."""
+    _send_pi_arm_control({"cmd": "mosfet", "state": bool(STATE.get("mosfet_on", False))})
 
 
 def _apply_disarmed_arm_lockout():
-    """Stop arm motion and overrides when the ROV is disarmed (servo power stays on)."""
+    """Stop arm motion and overrides when the ROV is disarmed (MOSFET unchanged)."""
     if _robot_armed():
         _sync_arm_unlock()
         return
@@ -589,7 +588,7 @@ STATE = {
     "ssh_connected":       False,
     "ssh_error":           "",
     "mode":                "disarmed",
-    "mosfet_on":           True,
+    "mosfet_on":           False,
     "last_telemetry_time": 0.0,
     "last_arm_telemetry_time": 0.0,
     "telemetry_packets":   0,
@@ -2353,7 +2352,7 @@ def api_claw_hold():
 @app.route("/api/mosfet", methods=["POST"])
 def api_mosfet():
     data = request.get_json(force=True) or {}
-    state = bool(data.get("state", True))
+    state = bool(data.get("state", False))
     ok, msg = ssh.send_mosfet(state)
     STATE["mosfet_on"] = state
     emit_status()

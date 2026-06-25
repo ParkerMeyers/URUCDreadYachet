@@ -282,7 +282,7 @@ async function stopTopside() {
 // ─────────────────────────────────────────────────────────────
 // CONTROL ACTIONS
 // ─────────────────────────────────────────────────────────────
-let _mosfetOn = true;
+let _mosfetOn = false;
 
 async function toggleMosfet() {
   _mosfetOn = !_mosfetOn;
@@ -1639,9 +1639,9 @@ function updateStatus() {
   }
 
   if (s.mode) { _currentMode = s.mode; updateModeUI(s.mode); }
-  if (typeof s.mosfet_on !== 'undefined' && s.mosfet_on) {
-    _mosfetOn = true;
-    updateMosfetUI(true);
+  if (typeof s.mosfet_on !== 'undefined') {
+    _mosfetOn = !!s.mosfet_on;
+    updateMosfetUI(_mosfetOn);
   }
   if (typeof s.claw_hold === 'boolean') { _ctrlState.claw_hold = s.claw_hold; updateFlagUI(); }
   if (typeof s.preset_running === 'boolean') {

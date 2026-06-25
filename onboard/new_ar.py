@@ -429,7 +429,7 @@ _joint_us      = _default_joint_us()
 _j6_target_deg = 0.0
 _last_pkt_time = 0.0
 _rx_count      = 0
-_mosfet_on     = True
+_mosfet_on     = False
 _manual_mode   = False
 _manual_aux_pwm = _default_manual_aux_pwm()
 _claw_hold_enabled = True
@@ -694,7 +694,7 @@ def _arm_control_listener():
             data, addr = s.recvfrom(512)
             cmd = json.loads(data.decode())
             if cmd.get("cmd") == "mosfet":
-                _set_mosfet(bool(cmd.get("state", True)))
+                _set_mosfet(bool(cmd.get("state", False)))
                 _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
                 print(f"[arm] MOSFET {'ON' if _mosfet_on else 'OFF'} (web UI)", flush=True)
             elif cmd.get("cmd") == "preset_motion":
