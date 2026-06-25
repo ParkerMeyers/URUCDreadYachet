@@ -2084,6 +2084,25 @@ def favicon():
     return Response(status=204)
 
 
+@app.context_processor
+def _inject_static_ver():
+    def static_ver(path: str) -> str:
+        full = ROV_ROOT / "static" / path
+        try:
+            return str(int(full.stat().st_mtime))
+        except OSError:
+            return "0"
+
+    return {"static_ver": static_ver}
+
+
+@app.after_request
+def _no_cache_static(response):
+    if request.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
 @app.route("/")
 def index():
     return render_template("index.html")

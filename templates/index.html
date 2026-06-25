@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <title>DreadRachet ROV</title>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
-<link rel="stylesheet" href="{{ url_for('static', filename='css/rov_ui.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/rov_ui.css') }}?v={{ static_ver('css/rov_ui.css') }}">
 
 </head>
 <body>
@@ -618,6 +618,6 @@
 <!-- Toast container -->
 <div class="toast-container" id="toast-container"></div>
 
-<script src="{{ url_for('static', filename='js/rov_ui.js') }}"></script>
+<script src="{{ url_for('static', filename='js/rov_ui.js') }}?v={{ static_ver('js/rov_ui.js') }}"></script>
 </body>
 </html>
