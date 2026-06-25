@@ -252,13 +252,15 @@
   <!-- Control bar -->
   <div class="controlbar">
 
+    <div id="mosfet-section" class="hidden">
     <span class="control-label">Power</span>
-    <div class="mosfet-toggle on" id="mosfet-toggle" onclick="toggleMosfet()">
+    <div class="mosfet-toggle" id="mosfet-toggle" onclick="toggleMosfet()">
       <div class="mosfet-indicator"></div>
-      <span id="mosfet-label">MOSFET ON</span>
+      <span id="mosfet-label">MOSFET OFF</span>
     </div>
 
     <div class="ctrl-sep"></div>
+    </div>
 
     <span class="control-label">Mode</span>
     <button class="mode-btn active-disarmed" id="mode-disarmed"

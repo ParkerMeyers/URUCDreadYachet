@@ -152,6 +152,7 @@ DEFAULT_CONFIG = {
     "telemetry_port":      5006,
     "arm_udp_port":        5006,
     "mosfet_control_port": 5007,
+    "mosfet_enabled":      False,  # set True + new_ar.MOSFET_ENABLED to restore GPIO rail
     "arm_telemetry_port":  5008,
     "arm_imu_sign":        -1.0,
     "arm_imu_zero_offset": -154.0,
@@ -443,8 +444,15 @@ def _sync_arm_enable():
         _send_pi_arm_control({"cmd": "arm_enable", "enabled": False})
 
 
+def _mosfet_enabled() -> bool:
+    load_config_file()
+    return bool(config.get("mosfet_enabled", False))
+
+
 def _sync_arm_power():
     """Push current MOSFET state to new_ar.py (GPIO17 servo power rail)."""
+    if not _mosfet_enabled():
+        return
     _send_pi_arm_control({"cmd": "mosfet", "state": bool(STATE.get("mosfet_on", False))})
 
 
@@ -587,7 +595,7 @@ STATE = {
     "ssh_connected":       False,
     "ssh_error":           "",
     "mode":                "disarmed",
-    "mosfet_on":           True,
+    "mosfet_on":           False,
     "last_telemetry_time": 0.0,
     "last_arm_telemetry_time": 0.0,
     "telemetry_packets":   0,
@@ -856,6 +864,8 @@ class SSHManager:
         return out
 
     def send_mosfet(self, state: bool):
+        if not _mosfet_enabled():
+            return True, "MOSFET disabled (hardware not installed)"
         payload = json.dumps({"cmd": "mosfet", "state": state}).encode()
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1072,14 +1082,6 @@ class SSHManager:
 
     def stop_mavproxy(self):
         self.exec("pkill -f mavproxy 2>/dev/null; pkill -f MAVProxy 2>/dev/null || true")
-
-    def stop_arm_boot_guard(self):
-        """Release Pix6 serial held by arm_boot_guard before starting MAVProxy."""
-        self.exec(
-            "systemctl stop rov-arm-boot 2>/dev/null; "
-            "pkill -f 'arm_boot_guard' 2>/dev/null; "
-            "sleep 0.4"
-        )
 
     def is_mavproxy_running(self):
         # pgrep -a shows full command line; -f matches against it.
@@ -1790,6 +1792,7 @@ def emit_status():
         "ssh_error":             STATE["ssh_error"],
         "mode":                  STATE["mode"],
         "mosfet_on":             STATE["mosfet_on"],
+        "mosfet_enabled":        _mosfet_enabled(),
         "telemetry_listener_ok": STATE["telemetry_listener_ok"],
         "onboard_starting":      STATE["onboard_starting"],
         "onboard_progress":      progress,
@@ -2186,8 +2189,7 @@ def api_start_onboard():
             ok_sync, msg_sync = ssh.sync_onboard_files()
             _emit_onboard_progress("sync", "done" if ok_sync else "error", msg_sync)
 
-            # Step 1: stop boot guard (holds /dev/ttyACM0) then MAVProxy
-            ssh.stop_arm_boot_guard()
+            # Step 1: MAVProxy (try configured port, then auto-detect ttyACM/ttyUSB)
             normalize_onboard_config()
             preferred_serial = config.get("mavproxy_serial", "/dev/ttyACM0")
             serial_candidates = ssh.mavproxy_serial_candidates()
@@ -2287,15 +2289,14 @@ def api_start_onboard():
             cam1_dev = config.get("camera1_device", "/dev/video2")
             cam_args = f"--cam0 {cam0_dev} --cam1 {cam1_dev}"
 
-            # Arm before stabilization so AUX neutral override is live ASAP.
             service_specs = [
-                ("arm_ctrl", "arm", "onboard_arm", 45.0, ""),
                 ("stabilization", "stab", "onboard_stab", 75.0, ""),
+                ("arm_ctrl", "arm", "onboard_arm", 45.0, ""),
                 ("camera", "cam", "onboard_cam", 30.0, cam_args),
             ]
             service_labels = {
-                "arm_ctrl": "new_ar.py (arm controller)",
                 "stabilization": "stabilization.py",
+                "arm_ctrl": "new_ar.py (arm controller)",
                 "camera": "camera_stream.py (MJPEG feeds)",
             }
             service_results: dict[str, tuple[bool, str]] = {}
@@ -2590,12 +2591,19 @@ def api_claw_hold():
 
 @app.route("/api/mosfet", methods=["POST"])
 def api_mosfet():
+    if not _mosfet_enabled():
+        return jsonify({
+            "ok": False,
+            "msg": "MOSFET disabled — hardware not installed",
+            "mosfet_on": False,
+            "mosfet_enabled": False,
+        }), 400
     data = request.get_json(force=True) or {}
     state = bool(data.get("state", False))
     ok, msg = ssh.send_mosfet(state)
     STATE["mosfet_on"] = state
     emit_status()
-    return jsonify({"ok": ok, "msg": msg, "mosfet_on": state})
+    return jsonify({"ok": ok, "msg": msg, "mosfet_on": state, "mosfet_enabled": True})
 
 
 @app.route("/api/manual_pwm", methods=["GET"])
@@ -2935,6 +2943,7 @@ def api_status():
         "ssh_connected":         STATE["ssh_connected"],
         "mode":                  STATE["mode"],
         "mosfet_on":             STATE["mosfet_on"],
+        "mosfet_enabled":        _mosfet_enabled(),
         "telemetry_listener_ok": STATE["telemetry_listener_ok"],
         "onboard_starting":      STATE["onboard_starting"],
         "onboard_progress":      progress,

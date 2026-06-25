@@ -365,6 +365,8 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 .ctrl-flag.disabled:hover,
 .ctrl-flag:disabled:hover { border-color:var(--border); }
 
+.mosfet-toggle.hidden,
+.hidden { display: none !important; }
 .mosfet-toggle.disabled {
   opacity: 0.38;
   cursor: not-allowed;

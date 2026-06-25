@@ -280,9 +280,11 @@ async function stopTopside() {
 // ─────────────────────────────────────────────────────────────
 // CONTROL ACTIONS
 // ─────────────────────────────────────────────────────────────
-let _mosfetOn = true;
+let _mosfetOn = false;
+let _mosfetEnabled = false;
 
 async function toggleMosfet() {
+  if (!_mosfetEnabled) return;
   _mosfetOn = !_mosfetOn;
   await fetch('/api/mosfet', {
     method: 'POST',
@@ -294,8 +296,13 @@ async function toggleMosfet() {
 }
 
 function updateMosfetUI(on) {
+  const section = document.getElementById('mosfet-section');
   const toggle = document.getElementById('mosfet-toggle');
   const label  = document.getElementById('mosfet-label');
+  if (section) {
+    section.classList.toggle('hidden', !_mosfetEnabled);
+  }
+  if (!toggle || !label) return;
   if (on) { toggle.classList.add('on');    label.textContent = 'MOSFET ON'; }
   else    { toggle.classList.remove('on'); label.textContent = 'MOSFET OFF'; }
 }
@@ -1655,8 +1662,13 @@ function updateStatus() {
   }
 
   if (s.mode) { _currentMode = s.mode; updateModeUI(s.mode); }
+  if (typeof s.mosfet_enabled === 'boolean') {
+    _mosfetEnabled = s.mosfet_enabled;
+  }
   if (typeof s.mosfet_on !== 'undefined') {
     _mosfetOn = !!s.mosfet_on;
+    updateMosfetUI(_mosfetOn);
+  } else {
     updateMosfetUI(_mosfetOn);
   }
   if (typeof s.claw_hold === 'boolean') { _ctrlState.claw_hold = s.claw_hold; updateFlagUI(); }

@@ -54,6 +54,8 @@ BNO_INIT_RETRY_SEC = 1.0
 # ── Config ────────────────────────────────────────────────────────────────────
 UDP_PORT    = 5006
 MAVLINK_URL = MAVLINK_ONBOARD_ARM
+# Set True to drive GPIO17 servo power rail again (hardware removed for now).
+MOSFET_ENABLED = False
 MOSFET_GPIO = 17
 MOSFET_PORT = 5007
 CENTER_US   = 1500
@@ -231,6 +233,10 @@ def _try_init_bno_once() -> bool:
 def _init_mosfet_gpio() -> None:
     """Drive MOSFET GPIO immediately — must run before AUX servos need power."""
     global _gpio_h, HAVE_GPIO, _lgpio
+
+    if not MOSFET_ENABLED:
+        print("[arm] MOSFET control disabled (MOSFET_ENABLED=False)", flush=True)
+        return
 
     try:
         import lgpio as _lgpio_mod
@@ -432,7 +438,7 @@ _joint_us      = _default_joint_us()
 _j6_target_deg = 0.0
 _last_pkt_time = 0.0
 _rx_count      = 0
-_mosfet_on     = True
+_mosfet_on     = False
 _manual_mode   = False
 _manual_aux_pwm = _default_manual_aux_pwm()
 _claw_hold_enabled = True
@@ -458,6 +464,8 @@ _imu_last_poll_time = 0.0
 # ── MOSFET control ────────────────────────────────────────────────────────────
 def _set_mosfet(on: bool):
     global _mosfet_on
+    if not MOSFET_ENABLED:
+        return
     _mosfet_on = on
     if HAVE_GPIO:
         _lgpio.gpio_write(_gpio_h, MOSFET_GPIO, 1 if on else 0)
@@ -697,9 +705,10 @@ def _arm_control_listener():
             data, addr = s.recvfrom(512)
             cmd = json.loads(data.decode())
             if cmd.get("cmd") == "mosfet":
-                _set_mosfet(bool(cmd.get("state", False)))
-                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
-                print(f"[arm] MOSFET {'ON' if _mosfet_on else 'OFF'} (web UI)", flush=True)
+                if MOSFET_ENABLED:
+                    _set_mosfet(bool(cmd.get("state", False)))
+                    _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+                    print(f"[arm] MOSFET {'ON' if _mosfet_on else 'OFF'} (web UI)", flush=True)
             elif cmd.get("cmd") == "preset_motion":
                 _apply_preset_motion_cmd(cmd)
                 _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
@@ -802,29 +811,6 @@ def _send_heartbeat(master):
         mavutil.mavlink.MAV_AUTOPILOT_INVALID,
         0, 0, 0,
     )
-
-
-def _eager_neutral_override(timeout: float = 8.0) -> None:
-    """Send neutral AUX override as soon as MAVProxy is up (covers boot-guard handoff)."""
-    try:
-        master = connect_mavlink(MAVLINK_URL, timeout=timeout)
-    except Exception as exc:
-        print(f"[arm] Eager neutral skipped — MAVLink not ready ({exc})", flush=True)
-        return
-    rc = [IGNORE] * 18
-    _fill_rc_neutral(rc)
-    try:
-        for _ in range(30):
-            _send_rc_override(master, rc)
-            time.sleep(0.05)
-        print("[arm] Eager neutral AUX override sent", flush=True)
-    except Exception as exc:
-        print(f"[arm] Eager neutral send failed ({exc})", flush=True)
-    finally:
-        try:
-            master.close()
-        except Exception:
-            pass
 
 
 def _try_connect_mavlink():
@@ -968,9 +954,6 @@ def main():
     threading.Thread(
         target=_init_optional_hardware, daemon=True, name="arm-hw-init",
     ).start()
-    threading.Thread(
-        target=_eager_neutral_override, daemon=True, name="arm-eager-neutral",
-    ).start()
 
     # Bind UDP first so arm_sender / UI can reach us while MAVLink connects.
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -991,7 +974,8 @@ def main():
     print(f"[arm] Manual AUX PWM on UDP {MOSFET_PORT} (cmd=manual_pwm)", flush=True)
     print(f"[arm] AUX1=J5  AUX2=J2  AUX3=J6  AUX4=J1  AUX5=J3  AUX6=J4  AUX7=Claw", flush=True)
     print(f"[arm] BNO055={'yes' if HAVE_BNO else 'pending'}  "
-          f"MOSFET={'yes' if HAVE_GPIO else 'pending'}  MAVLink=connecting", flush=True)
+          f"MOSFET={'yes' if MOSFET_ENABLED and HAVE_GPIO else 'off'}  "
+          f"MAVLink=connecting", flush=True)
 
     last_send      = 0.0
     last_heartbeat = 0.0
@@ -1135,7 +1119,7 @@ def main():
 
         _drop_mavlink_master()
 
-        if HAVE_GPIO and _gpio_h is not None:
+        if MOSFET_ENABLED and HAVE_GPIO and _gpio_h is not None:
             _lgpio.gpio_write(_gpio_h, MOSFET_GPIO, 0)
             _lgpio.gpiochip_close(_gpio_h)
 
