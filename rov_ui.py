@@ -596,6 +596,9 @@ STATE = {
     "telemetry_packets":   0,
     "telemetry_rate_hz":   0.0,
     "last_ctrl_time":      0.0,
+    "ctrl_stabilize":      False,
+    "ctrl_depth_hold":     False,
+    "ctrl_yaw_hold":       False,
     "telemetry_listener_ok": False,
     "telemetry_recording":   False,
     "telemetry_record_file": "",
@@ -1286,9 +1289,9 @@ def _get_active_ctrl_packet() -> dict:
         "lateral": 0.0,
         "yaw": 0.0,
         "vertical": 0.0,
-        "stabilize": armed and mode == "stabilize",
-        "depth_hold": False,
-        "yaw_hold": False,
+        "stabilize": STATE.get("ctrl_stabilize", False) if armed else False,
+        "depth_hold": STATE.get("ctrl_depth_hold", False) if armed else False,
+        "yaw_hold": STATE.get("ctrl_yaw_hold", False) if armed else False,
         "gain_percent": STATE["telemetry"].get("gain_percent", 100),
         "telemetry_port": int(config["telemetry_port"]),
     }
@@ -2681,6 +2684,10 @@ def api_mode():
     if mode not in ("disarmed", "armed", "stabilize"):
         return jsonify({"ok": False, "msg": "invalid mode"})
     STATE["mode"] = mode
+    if mode == "disarmed":
+        STATE["ctrl_stabilize"] = False
+        STATE["ctrl_depth_hold"] = False
+        STATE["ctrl_yaw_hold"] = False
     _apply_disarmed_arm_lockout()
     emit_status()
     return jsonify({"ok": True, "mode": mode})
@@ -3001,6 +3008,9 @@ def _apply_browser_ctrl(data: dict):
         _last_browser_ctrl = data
         _last_browser_ctrl_time = time.time()
     STATE["last_ctrl_time"] = time.time()
+    STATE["ctrl_stabilize"] = bool(data.get("stabilize", False))
+    STATE["ctrl_depth_hold"] = bool(data.get("depth_hold", False))
+    STATE["ctrl_yaw_hold"] = bool(data.get("yaw_hold", False))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

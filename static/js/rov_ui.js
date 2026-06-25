@@ -2222,10 +2222,21 @@ function _gamepadControlTick() {
     _dpadDownPrev = dpadDown;
   }
 
-  // Show raw stick demand when disarmed (HUD preview) but send zeros to Pi
-  const sending = onCtrl && (_currentMode === 'armed' || _currentMode === 'stabilize');
+  // HUD preview when disarmed; send stick commands whenever ARMED/STABILIZE
+  const armed = _currentMode === 'armed' || _currentMode === 'stabilize';
   let sendForward = forward, sendLateral = lateral, sendYaw = yaw, sendVertical = vertical;
-  if (!sending) { sendForward = 0; sendLateral = 0; sendYaw = 0; sendVertical = 0; }
+  if (!armed) { sendForward = 0; sendLateral = 0; sendYaw = 0; sendVertical = 0; }
+
+  const sticksActive = Math.abs(forward) > 0.05 || Math.abs(lateral) > 0.05
+    || Math.abs(yaw) > 0.05 || Math.abs(vertical) > 0.05;
+  const gpPill = document.getElementById('pill-gamepad');
+  if (gpPill) {
+    if (armed && !onCtrl && sticksActive) {
+      gpPill.title = 'Driving without control overlay — open Control for S/D/Y keys';
+    } else {
+      gpPill.title = '';
+    }
+  }
 
   _localCmds = { forward, lateral, yaw, vertical };
   _tel.cmd_forward  = forward;
@@ -2246,9 +2257,9 @@ function _gamepadControlTick() {
     lateral:     sendLateral,
     yaw:         sendYaw,
     vertical:    sendVertical,
-    stabilize:   sending ? _ctrlState.stabilize  : false,
-    depth_hold:  sending ? _ctrlState.depth_hold : false,
-    yaw_hold:    sending ? _ctrlState.yaw_hold   : false,
+    stabilize:   armed ? _ctrlState.stabilize  : false,
+    depth_hold:  armed ? _ctrlState.depth_hold : false,
+    yaw_hold:    armed ? _ctrlState.yaw_hold   : false,
     gain_percent: _ctrlState.gain_percent,
     telemetry_port: CTRL_CFG.TELEMETRY_PORT,
   };

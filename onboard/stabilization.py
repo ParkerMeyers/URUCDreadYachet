@@ -60,18 +60,18 @@ MIN_US = 1100
 MAX_US = 1900
 MAX_PWM_DELTA_US = 400
 
-CONTROL_TIMEOUT_SEC = 0.80
+CONTROL_TIMEOUT_SEC = 1.50
 IMU_TIMEOUT_SEC = 2.00
 DEPTH_TIMEOUT_SEC = 2.50
 LOOP_HZ = 100
+OVERRIDE_HZ = 20
+STICK_FILTER_ALPHA = 0.35
 
 MAVLINK_LINK_TIMEOUT_SEC = 3.0
 MAVLINK_RECONNECT_COOLDOWN_SEC = 5.0
 MAVLINK_MAX_MSGS_PER_POLL = 500
 MAVLINK_SENSOR_RESYNC_SEC = 2.0
 MAVLINK_SENSOR_RECONNECT_SEC = 5.0
-
-INPUT_DEADZONE = 0.08
 
 DEPTH_HOLD_VERTICAL_DEADZONE = 0.08
 DEPTH_RECAPTURE_DELAY_SEC = 0.75
@@ -930,6 +930,8 @@ class PixhawkOutput:
 
     Requires SERVO1..8_FUNCTION = 51..58 (RCPassThru) in QGroundControl.
     MOTORS index 0-7 maps directly to Pix6 outputs 1-8 (RC channels 1-8).
+
+    Matches motor_test_onboard.py: hold last PWM and retransmit at OVERRIDE_HZ.
     """
 
     IGNORE = 65535  # MAVLink sentinel: leave this RC channel unchanged
@@ -937,14 +939,11 @@ class PixhawkOutput:
     def __init__(self, master):
         self.master = master
         self._last_heartbeat = 0.0
+        self._last_send = 0.0
+        self._last_pwm = {name: NEUTRAL_US for name in MOTORS}
 
     def set_master(self, master):
         self.master = master
-
-    def _target(self):
-        ts = self.master.target_system or 1
-        tc = self.master.target_component or 1
-        return ts, tc
 
     def _send_heartbeat_if_due(self):
         """
@@ -964,23 +963,38 @@ class PixhawkOutput:
         except Exception:
             pass
 
-    def send_pwm(self, pwm_by_name: dict):
-        """
-        Send one RC_CHANNELS_OVERRIDE frame covering all 8 thruster channels.
-        pwm_by_name maps motor name → PWM microseconds (1100-1900).
-        Channels not in pwm_by_name are set to IGNORE (unchanged on the FC).
-        """
+    def update_pwm(self, pwm_by_name: dict):
+        """Store latest thruster PWM values (mixer output)."""
+        for motor_name, pwm in pwm_by_name.items():
+            self._last_pwm[motor_name] = int(clamp(pwm, MIN_US, MAX_US))
+
+    def _send_override_now(self):
+        """Transmit RC_CHANNELS_OVERRIDE for all 8 thruster channels."""
         self._send_heartbeat_if_due()
 
-        rc = [self.IGNORE] * 8      # all 8 motors live on channels 1-8 (indices 0-7)
-        for motor_name, pwm in pwm_by_name.items():
-            idx = MOTORS[motor_name]          # 0-based → rc[0..7] = RC ch 1..8
-            rc[idx] = int(clamp(pwm, MIN_US, MAX_US))
+        rc = [self.IGNORE] * 18
+        for motor_name, pwm in self._last_pwm.items():
+            idx = MOTORS[motor_name]
+            rc[idx] = pwm
 
         try:
             send_rc_channels_override(self.master, rc, ignore=self.IGNORE)
         except Exception as e:
             print(f"[WARN] RC_CHANNELS_OVERRIDE send failed: {e}")
+
+    def tick_send(self, now=None):
+        """Resend held PWM at fixed OVERRIDE_HZ (decoupled from control loop)."""
+        now = time.time() if now is None else now
+        if now - self._last_send < 1.0 / OVERRIDE_HZ:
+            return
+        self._last_send = now
+        self._send_override_now()
+
+    def send_pwm(self, pwm_by_name: dict):
+        """Update stored PWM and send immediately (shutdown / neutral)."""
+        self.update_pwm(pwm_by_name)
+        self._send_override_now()
+        self._last_send = time.time()
 
     def neutral_all(self):
         """Set all thruster channels to neutral (1500 µs)."""
@@ -1017,7 +1031,7 @@ class ControlReceiver:
         self.telemetry_port = DEFAULT_TELEMETRY_PORT
         self.telemetry_addr = None
 
-        self.last_packet_time = 0.0
+        self.last_packet_time = time.time()
         self.last_sender = None
         self.seq = 0
 
@@ -1037,10 +1051,10 @@ class ControlReceiver:
             except Exception:
                 continue
 
-            self.forward = deadzone(float(packet.get("forward", 0.0)), INPUT_DEADZONE)
-            self.lateral = deadzone(float(packet.get("lateral", 0.0)), INPUT_DEADZONE)
-            self.yaw = deadzone(float(packet.get("yaw", 0.0)), INPUT_DEADZONE)
-            self.vertical = deadzone(float(packet.get("vertical", 0.0)), INPUT_DEADZONE)
+            self.forward = float(packet.get("forward", 0.0))
+            self.lateral = float(packet.get("lateral", 0.0))
+            self.yaw = float(packet.get("yaw", 0.0))
+            self.vertical = float(packet.get("vertical", 0.0))
 
             self.stabilize = bool(packet.get("stabilize", False))
             self.depth_hold = bool(packet.get("depth_hold", False))
@@ -1223,6 +1237,11 @@ def main():
         ROLL_ERROR_DEADBAND_DEG,
     )
 
+    filt_forward = 0.0
+    filt_lateral = 0.0
+    filt_yaw = 0.0
+    filt_vertical = 0.0
+
     last_time = time.time()
     last_print = 0.0
     last_telemetry = 0.0
@@ -1298,6 +1317,10 @@ def main():
 
             if control_timed_out:
                 control.zero_controls()
+                filt_forward = 0.0
+                filt_lateral = 0.0
+                filt_yaw = 0.0
+                filt_vertical = 0.0
                 stabilize_active = False
                 depth_hold_request = False
                 yaw_hold_request = False
@@ -1385,8 +1408,8 @@ def main():
                 pitch_correction = pitch_pid.update(pitch_error, dt)
 
                 roll_error = angle_error_deg(
-                    mav.filtered_roll_deg,
                     roll_hold_target_deg,
+                    mav.filtered_roll_deg,
                 )
                 roll_correction = roll_pid.update(roll_error, dt)
 
@@ -1593,21 +1616,26 @@ def main():
             # ----------------------------------------------------
             # Final mixer inputs.
             # ----------------------------------------------------
+            filt_forward += STICK_FILTER_ALPHA * (control.forward - filt_forward)
+            filt_lateral += STICK_FILTER_ALPHA * (control.lateral - filt_lateral)
+            filt_yaw += STICK_FILTER_ALPHA * (control.yaw - filt_yaw)
+            filt_vertical += STICK_FILTER_ALPHA * (control.vertical - filt_vertical)
+
             vertical_for_mixer = clamp(
-                control.vertical + depth_correction,
+                filt_vertical + depth_correction,
                 -1.0,
                 1.0,
             )
 
             yaw_for_mixer = clamp(
-                control.yaw + yaw_correction,
+                filt_yaw + yaw_correction,
                 -1.0,
                 1.0,
             )
 
             cmds = mix_thrusters(
-                forward=control.forward,
-                lateral=control.lateral,
+                forward=filt_forward,
+                lateral=filt_lateral,
                 yaw=yaw_for_mixer,
                 vertical=vertical_for_mixer,
                 pitch_correction=pitch_correction,
@@ -1621,7 +1649,8 @@ def main():
                 motor_name: command_to_pwm_us(motor_name, cmd)
                 for motor_name, cmd in cmds.items()
             }
-            pixhawk.send_pwm(pwm_out)
+            pixhawk.update_pwm(pwm_out)
+            pixhawk.tick_send(now)
 
             # ----------------------------------------------------
             # Telemetry back to sender.
