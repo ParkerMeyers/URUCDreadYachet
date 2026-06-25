@@ -133,7 +133,12 @@ def _release_video_devices_from_args(extra_args: str) -> None:
                 check=False,
             )
             if proc.returncode == 0 and proc.stdout.strip():
-                subprocess.run(["fuser", "-k", dev], check=False)
+                subprocess.run(
+                    ["fuser", "-k", dev],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
         except OSError:
             pass
     time.sleep(0.5)

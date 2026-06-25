@@ -122,7 +122,12 @@ def release_video_device(device: str, *, force: bool = False) -> None:
         return
     _log(f"[cam] {device} busy — PIDs: {pids}")
     if force:
-        subprocess.run(["fuser", "-k", device], check=False)
+        subprocess.run(
+            ["fuser", "-k", device],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
         time.sleep(0.4)
 
 
