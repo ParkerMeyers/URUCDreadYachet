@@ -120,6 +120,12 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 .btn-row { display:flex; gap:8px; flex-wrap:wrap; }
 .proceed-row { width:100%; max-width:900px; text-align:center; }
 .proceed-row .btn { padding:12px 40px; font-size:1rem; }
+.proceed-row .btn.not-ready {
+  background:var(--bg3); border:1px solid var(--border2); color:var(--dim);
+}
+.proceed-row .btn.not-ready:hover {
+  filter:none; transform:none; border-color:var(--border2); color:var(--text);
+}
 
 /* ── ssh status pill ── */
 .ssh-badge {
@@ -328,6 +334,10 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 }
 .modal-header h2 { font-size:1.1rem; font-weight:700; color:var(--accent); flex:1; }
 .modal-body { overflow-y:auto; padding:20px; }
+.offline-systems-list {
+  margin:8px 0 0; padding-left:20px; font-size:.85rem; color:var(--red);
+}
+.offline-systems-list li { margin:4px 0; }
 .kb-section { margin-bottom:24px; }
 .kb-section h3 {
   font-size:0.72rem; text-transform:uppercase; letter-spacing:1px;

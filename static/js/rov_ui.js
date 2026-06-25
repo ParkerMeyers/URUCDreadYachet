@@ -403,6 +403,7 @@ function updateStatus() {
   setDot('dot-arm',      s.onboard_arm);
   setDot('dot-cam',      s.onboard_cam);
   setDot('dot-armlocal', s.arm_running);
+  updateOpenControlButton(s);
 
   // Telemetry listener status on launch screen
   const telemDot = document.getElementById('dot-telem-launch');
@@ -881,8 +882,258 @@ function setLayout(layout) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// DIRECTION HUD CANVAS
+// ATTITUDE + DIRECTION HUD CANVAS
 // ─────────────────────────────────────────────────────────────
+function telAngle(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normYaw360(deg) {
+  return ((deg % 360) + 360) % 360;
+}
+
+function drawAttitudeOverlay(ctx, W, H, rollDeg, pitchDeg, yawDeg, live) {
+  const cx = W * 0.5;
+  const cy = H * 0.5;
+  const pitchScale = H / 75;
+  const rollRad = rollDeg * Math.PI / 180;
+  const pitchOff = pitchDeg * pitchScale;
+  const span = W * 1.4;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(rollRad);
+  ctx.translate(0, pitchOff);
+
+  ctx.fillStyle = 'rgba(0, 95, 135, 0.14)';
+  ctx.fillRect(-span, -H * 2, span * 2, H * 2);
+  ctx.fillStyle = 'rgba(0, 12, 28, 0.28)';
+  ctx.fillRect(-span, 0, span * 2, H * 2);
+
+  for (let p = -40; p <= 40; p += 10) {
+    const y = -p * pitchScale;
+    const major = p === 0;
+    const half = major ? span : (Math.abs(p) % 20 === 0 ? span * 0.55 : span * 0.28);
+
+    ctx.strokeStyle = major
+      ? (live ? 'rgba(0,212,255,0.95)' : 'rgba(255,179,32,0.55)')
+      : 'rgba(0,212,255,0.35)';
+    ctx.lineWidth = major ? 2.5 : 1;
+    ctx.beginPath();
+    ctx.moveTo(-half, y);
+    ctx.lineTo(half, y);
+    ctx.stroke();
+
+    if (!major && Math.abs(p) <= 30) {
+      ctx.fillStyle = 'rgba(220,230,255,0.55)';
+      ctx.font = `${Math.max(8, H * 0.022)}px monospace`;
+      ctx.textAlign = 'left';
+      ctx.fillText(String(Math.abs(p)), half + 6, y + 3);
+      ctx.textAlign = 'right';
+      ctx.fillText(String(Math.abs(p)), -half - 6, y + 3);
+    }
+  }
+
+  ctx.restore();
+
+  const wing = Math.min(W, H) * 0.11;
+  ctx.strokeStyle = live ? 'rgba(0,212,255,0.95)' : 'rgba(255,179,32,0.65)';
+  ctx.fillStyle = ctx.strokeStyle;
+  ctx.lineWidth = 2.5;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(cx - wing, cy);
+  ctx.lineTo(cx - wing * 0.18, cy);
+  ctx.moveTo(cx + wing * 0.18, cy);
+  ctx.lineTo(cx + wing, cy);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  const arcR = Math.min(W, H) * 0.24;
+  const arcCy = cy - arcR * 0.55;
+  ctx.strokeStyle = 'rgba(0,212,255,0.45)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(cx, arcCy, arcR, Math.PI * 1.12, Math.PI * 1.88);
+  ctx.stroke();
+
+  for (let deg = -60; deg <= 60; deg += 10) {
+    const a = -Math.PI / 2 + deg * Math.PI / 180;
+    const tick = deg === 0 || Math.abs(deg) === 30 || Math.abs(deg) === 60 ? 11 : 6;
+    const x1 = cx + arcR * Math.cos(a);
+    const y1 = arcCy + arcR * Math.sin(a);
+    const x2 = cx + (arcR + tick) * Math.cos(a);
+    const y2 = arcCy + (arcR + tick) * Math.sin(a);
+    ctx.strokeStyle = deg === 0 ? 'rgba(0,224,138,0.85)' : 'rgba(0,212,255,0.45)';
+    ctx.lineWidth = deg === 0 ? 2 : 1;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.translate(cx, arcCy);
+  ctx.rotate(rollRad);
+  ctx.fillStyle = live ? 'rgba(0,224,138,0.95)' : 'rgba(255,179,32,0.85)';
+  ctx.beginPath();
+  ctx.moveTo(0, -arcR + 2);
+  ctx.lineTo(-8, -arcR + 18);
+  ctx.lineTo(8, -arcR + 18);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  drawYawTape(ctx, W, H, yawDeg, live);
+
+  const pad = 10;
+  ctx.fillStyle = 'rgba(0,0,0,0.42)';
+  ctx.fillRect(pad, pad, 118, 52);
+  ctx.strokeStyle = 'rgba(0,212,255,0.25)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(pad, pad, 118, 52);
+
+  const fs = Math.max(9, H * 0.024);
+  ctx.font = `${fs}px monospace`;
+  ctx.textAlign = 'left';
+  ctx.fillStyle = live ? 'rgba(220,230,255,0.9)' : 'rgba(255,179,32,0.85)';
+  const rTxt = live ? `${rollDeg >= 0 ? '+' : ''}${rollDeg.toFixed(1)}` : '--';
+  const pTxt = live ? `${pitchDeg >= 0 ? '+' : ''}${pitchDeg.toFixed(1)}` : '--';
+  const yTxt = live ? normYaw360(yawDeg).toFixed(0).padStart(3, '0') : '---';
+  ctx.fillText(`R ${rTxt}°`, pad + 8, pad + 18);
+  ctx.fillText(`P ${pTxt}°`, pad + 8, pad + 34);
+  ctx.fillText(`Y ${yTxt}°`, pad + 8, pad + 50);
+}
+
+function drawYawTape(ctx, W, H, yawDeg, live) {
+  const tapeY = H - 34;
+  const tapeH = 20;
+  const cx = W * 0.5;
+  const pxPerDeg = Math.max(2.2, W / 180);
+
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(0, tapeY - 6, W, tapeH + 14);
+  ctx.strokeStyle = 'rgba(0,212,255,0.2)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, tapeY - 6.5, W - 1, tapeH + 13);
+
+  const centerYaw = live ? normYaw360(yawDeg) : 0;
+  const visible = W / pxPerDeg;
+  const start = centerYaw - visible * 0.5;
+
+  for (let d = Math.floor(start / 5) * 5; d <= start + visible + 5; d += 5) {
+    const normD = normYaw360(d);
+    const x = cx + (d - centerYaw) * pxPerDeg;
+    if (x < -24 || x > W + 24) continue;
+
+    const major = normD % 30 === 0;
+    ctx.strokeStyle = major ? 'rgba(0,212,255,0.75)' : 'rgba(0,212,255,0.28)';
+    ctx.lineWidth = major ? 1.5 : 1;
+    ctx.beginPath();
+    ctx.moveTo(x, tapeY);
+    ctx.lineTo(x, tapeY + (major ? 12 : 7));
+    ctx.stroke();
+
+    if (major) {
+      ctx.fillStyle = 'rgba(220,230,255,0.85)';
+      ctx.font = `${Math.max(8, H * 0.02)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText(normD.toFixed(0).padStart(3, '0'), x, tapeY + tapeH + 2);
+    }
+  }
+
+  ctx.fillStyle = live ? 'rgba(0,224,138,0.95)' : 'rgba(255,179,32,0.85)';
+  ctx.beginPath();
+  ctx.moveTo(cx, tapeY - 4);
+  ctx.lineTo(cx - 7, tapeY + 5);
+  ctx.lineTo(cx + 7, tapeY + 5);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.fillStyle = 'rgba(0,212,255,0.55)';
+  ctx.font = `bold ${Math.max(8, H * 0.018)}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText('HDG', cx, tapeY - 8);
+
+  if (!live) {
+    ctx.fillStyle = 'rgba(255,179,32,0.85)';
+    ctx.font = `${Math.max(8, H * 0.018)}px sans-serif`;
+    ctx.fillText('NO IMU', cx, H - 6);
+  }
+}
+
+function drawCommandMiniHUD(ctx, W, H, t) {
+  const size = Math.min(W, H) * 0.17;
+  const cx = size + 14;
+  const cy = H - size - 52;
+  const R = size * 0.72;
+
+  const fwd  = t.cmd_forward  || 0;
+  const lat  = t.cmd_lateral  || 0;
+  const yaw  = t.cmd_yaw      || 0;
+  const vert = t.cmd_vertical || 0;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.beginPath();
+  ctx.arc(cx, cy, R + 10, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(0,212,255,0.22)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.strokeStyle = 'rgba(0,212,255,0.15)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy);
+  ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R);
+  ctx.stroke();
+
+  if (Math.abs(fwd) > 0.02) {
+    drawArrow(ctx, cx, cy, cx, cy - fwd * R * 0.82, '#00e08a', Math.abs(fwd));
+  }
+  if (Math.abs(lat) > 0.02) {
+    drawArrow(ctx, cx, cy, cx + lat * R * 0.82, cy, '#ffb320', Math.abs(lat));
+  }
+  if (Math.abs(yaw) > 0.02) {
+    const startA = -Math.PI / 2;
+    const sweepA = yaw * Math.PI * 0.85;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R * 0.86, startA, startA + sweepA, yaw < 0);
+    ctx.strokeStyle = `rgba(255,100,100,${Math.min(1, Math.abs(yaw) * 0.7 + 0.3)})`;
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+  }
+
+  if (Math.abs(vert) > 0.02) {
+    const bx = cx + R + 8;
+    const bh = R * 0.65;
+    ctx.beginPath();
+    ctx.roundRect(bx - 3, cy - bh, 6, bh * 2, 3);
+    ctx.fillStyle = 'rgba(0,212,255,0.08)';
+    ctx.fill();
+    const barH = Math.abs(vert) * bh;
+    const barY = vert > 0 ? cy - barH : cy;
+    ctx.beginPath();
+    ctx.roundRect(bx - 3, barY, 6, barH, 2);
+    ctx.fillStyle = vert > 0
+      ? `rgba(0,224,138,${Math.abs(vert) * 0.7 + 0.3})`
+      : `rgba(255,61,90,${Math.abs(vert) * 0.7 + 0.3})`;
+    ctx.fill();
+  }
+
+  ctx.fillStyle = 'rgba(0,212,255,0.55)';
+  ctx.font = `bold ${Math.max(7, R * 0.22)}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText('CMD', cx, cy - R - 6);
+}
+
 function drawHUD(canvasId, t) {
   const canvas = document.getElementById(canvasId);
   if (!canvas) return;
@@ -893,103 +1144,31 @@ function drawHUD(canvasId, t) {
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  const W  = canvas.width;
-  const H  = canvas.height;
-  const cx = W * 0.5;
-  const cy = H * 0.5;
-  const R  = Math.min(W, H) * 0.20;
+  const W = canvas.width;
+  const H = canvas.height;
 
-  const fwd  = t.cmd_forward  || 0;
-  const lat  = t.cmd_lateral  || 0;
-  const yaw  = t.cmd_yaw      || 0;
-  const vert = t.cmd_vertical || 0;
+  const roll  = telAngle(t.roll_deg);
+  const pitch = telAngle(t.pitch_deg);
+  const yaw   = telAngle(t.yaw_deg);
+  const live  = roll !== null && pitch !== null && yaw !== null;
 
-  // Outer ring
-  ctx.beginPath();
-  ctx.arc(cx, cy, R, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(0,212,255,0.25)';
-  ctx.lineWidth = 1.5;
-  ctx.stroke();
+  drawAttitudeOverlay(
+    ctx, W, H,
+    live ? roll : 0,
+    live ? pitch : 0,
+    live ? yaw : 0,
+    live
+  );
+  drawCommandMiniHUD(ctx, W, H, t);
 
-  // Crosshair
-  ctx.strokeStyle = 'rgba(0,212,255,0.18)';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy);
-  ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R);
-  ctx.stroke();
-
-  // Center dot
-  ctx.beginPath();
-  ctx.arc(cx, cy, 3, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(0,212,255,0.5)';
-  ctx.fill();
-
-  // Forward arrow
-  if (Math.abs(fwd) > 0.02) {
-    const ey = cy - fwd * R * 0.85;
-    drawArrow(ctx, cx, cy, cx, ey, '#00e08a', Math.abs(fwd));
-  }
-
-  // Lateral arrow
-  if (Math.abs(lat) > 0.02) {
-    const ex = cx + lat * R * 0.85;
-    drawArrow(ctx, cx, cy, ex, cy, '#ffb320', Math.abs(lat));
-  }
-
-  // Yaw arc
-  if (Math.abs(yaw) > 0.02) {
-    const startA = -Math.PI / 2;
-    const sweepA = yaw * Math.PI * 0.9;
-    ctx.beginPath();
-    ctx.arc(cx, cy, R * 0.88, startA, startA + sweepA, yaw < 0);
-    ctx.strokeStyle = `rgba(255,100,100,${Math.min(1, Math.abs(yaw) * 0.7 + 0.3)})`;
-    ctx.lineWidth = 3;
-    ctx.stroke();
-    const endA = startA + sweepA;
-    const ax = cx + R * 0.88 * Math.cos(endA);
-    const ay = cy + R * 0.88 * Math.sin(endA);
-    ctx.beginPath();
-    ctx.arc(ax, ay, 4, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(255,100,100,0.9)';
-    ctx.fill();
-  }
-
-  // Vertical indicator bar
-  if (Math.abs(vert) > 0.02) {
-    const bx  = cx + R * 1.35;
-    const bh  = R * 0.8;
-    const mid = cy;
-    ctx.beginPath();
-    ctx.roundRect(bx - 4, mid - bh, 8, bh * 2, 4);
-    ctx.fillStyle = 'rgba(0,212,255,0.08)';
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(0,212,255,0.2)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-    const barH = Math.abs(vert) * bh;
-    const barY = vert > 0 ? mid - barH : mid;
-    ctx.beginPath();
-    ctx.roundRect(bx - 4, barY, 8, barH, 3);
-    ctx.fillStyle = vert > 0
-      ? `rgba(0,224,138,${Math.abs(vert) * 0.7 + 0.3})`
-      : `rgba(255,61,90,${Math.abs(vert) * 0.7 + 0.3})`;
-    ctx.fill();
-    ctx.fillStyle = 'rgba(0,212,255,0.6)';
-    ctx.font = `${Math.max(9, R * 0.18)}px monospace`;
-    ctx.textAlign = 'center';
-    ctx.fillText('V', bx, mid - bh - 4);
-  }
-
-  // Mode label at bottom
   const modeLabels = { disarmed:'DISARMED', armed:'ARMED', stabilize:'STABILIZE' };
-  const modeColors = { disarmed:'rgba(255,61,90,0.8)', armed:'rgba(255,179,32,0.8)',
-                       stabilize:'rgba(0,224,138,0.8)' };
+  const modeColors = { disarmed:'rgba(255,61,90,0.85)', armed:'rgba(255,179,32,0.85)',
+                       stabilize:'rgba(0,224,138,0.85)' };
   const mode = _currentMode || 'disarmed';
-  ctx.font = `bold ${Math.max(9, R * 0.17)}px sans-serif`;
+  ctx.font = `bold ${Math.max(9, H * 0.022)}px sans-serif`;
   ctx.textAlign = 'center';
   ctx.fillStyle = modeColors[mode] || 'rgba(200,200,200,0.6)';
-  ctx.fillText(modeLabels[mode] || mode.toUpperCase(), cx, cy + R + 18);
+  ctx.fillText(modeLabels[mode] || mode.toUpperCase(), W * 0.5, H - 42);
 }
 
 function drawArrow(ctx, x1, y1, x2, y2, color, opacity) {
@@ -1061,7 +1240,65 @@ function setupCamera(imgId, noSigId, camNum) {
 // ─────────────────────────────────────────────────────────────
 // VIEW SWITCHING
 // ─────────────────────────────────────────────────────────────
-function openControl() {
+const _ONBOARD_SYSTEMS = [
+  { key: 'onboard_mavproxy', label: 'mavproxy (UDP bridge)' },
+  { key: 'onboard_stab',     label: 'stabilization.py' },
+  { key: 'onboard_arm',      label: 'new_ar.py' },
+  { key: 'onboard_cam',      label: 'camera_stream.py' },
+];
+
+function getOfflineOnboardSystems(status) {
+  const s = status || _status || {};
+  return _ONBOARD_SYSTEMS.filter(sys => !s[sys.key]).map(sys => sys.label);
+}
+
+function updateOpenControlButton(status) {
+  const btn = document.getElementById('btn-open-control');
+  if (!btn) return;
+  const ready = getOfflineOnboardSystems(status).length === 0;
+  btn.classList.toggle('btn-success', ready);
+  btn.classList.toggle('not-ready', !ready);
+}
+
+function showOfflineConfirm(offline) {
+  const list = document.getElementById('offline-systems-list');
+  if (list) {
+    list.innerHTML = offline.map(label => `<li>${label}</li>`).join('');
+  }
+  document.getElementById('offline-confirm-modal').style.display = 'flex';
+}
+
+function hideOfflineConfirm() {
+  document.getElementById('offline-confirm-modal').style.display = 'none';
+}
+
+function hideOfflineConfirmOutside(e) {
+  if (e.target === document.getElementById('offline-confirm-modal')) hideOfflineConfirm();
+}
+
+function confirmOpenControl() {
+  hideOfflineConfirm();
+  _doOpenControl();
+}
+
+async function openControl() {
+  let status = _status;
+  try {
+    const r = await fetch('/api/status');
+    status = await r.json();
+    _status = status;
+    updateStatus();
+  } catch (_) {}
+
+  const offline = getOfflineOnboardSystems(status);
+  if (offline.length > 0) {
+    showOfflineConfirm(offline);
+    return;
+  }
+  _doOpenControl();
+}
+
+function _doOpenControl() {
   saveConfig();
   activateGamepad();
   document.getElementById('launch').classList.remove('active');

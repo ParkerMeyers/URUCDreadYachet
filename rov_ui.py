@@ -444,11 +444,60 @@ class SSHManager:
         return False
 
     def is_mavproxy_fc_connected(self):
-        """True once MAVProxy log shows the flight controller is online."""
+        """True only when recent MAVProxy log shows the FC is currently online."""
         out, _, _ = self.exec(
-            "grep -E 'Detected vehicle|online system' /tmp/rov_mavproxy.log 2>/dev/null | tail -1"
+            "tail -n 30 /tmp/rov_mavproxy.log 2>/dev/null || true"
         )
-        return bool(out.strip())
+        lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+        if not lines:
+            return False
+
+        recent = lines[-15:]
+        trailing_no_link = 0
+        for ln in reversed(recent):
+            lower = ln.lower()
+            if "no link" in lower or "link down" in lower:
+                trailing_no_link += 1
+            else:
+                break
+        if trailing_no_link >= 3:
+            return False
+
+        return any(
+            "detected vehicle" in ln.lower() or "online system" in ln.lower()
+            for ln in recent
+        )
+
+    def serial_port_exists(self):
+        """True when the configured Pix6 serial device node is present."""
+        ser = config.get("mavproxy_serial", "/dev/ttyACM0")
+        out, _, _ = self.exec(f"test -e {shlex.quote(ser)} && echo exists")
+        return "exists" in out
+
+    def list_serial_candidates(self):
+        """Return ttyACM/ttyUSB device paths visible on the Pi."""
+        out, _, _ = self.exec(
+            "ls -1 /dev/ttyACM* /dev/ttyUSB* 2>/dev/null || true"
+        )
+        return [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+
+    def mavproxy_diagnosis(self):
+        """Human-readable summary when MAVProxy has no FC link."""
+        ser = config.get("mavproxy_serial", "/dev/ttyACM0")
+        parts = []
+        if not self.serial_port_exists():
+            parts.append(f"{ser} not found")
+            alts = self.list_serial_candidates()
+            if alts:
+                parts.append(f"available: {', '.join(alts)}")
+            else:
+                parts.append("no /dev/ttyACM* or /dev/ttyUSB* devices")
+        else:
+            parts.append(f"{ser} exists but MAVProxy reports no link")
+        log_tail = self.get_mavproxy_log(lines=3)
+        if log_tail:
+            parts.append(f"log: {log_tail.strip().splitlines()[-1][:80]}")
+        return " — ".join(parts)
 
     def stop_mavproxy(self):
         self.exec("pkill -f mavproxy 2>/dev/null; pkill -f MAVProxy 2>/dev/null || true")
@@ -467,7 +516,7 @@ class SSHManager:
         if not st:
             return {"mavproxy": False, "stab": False, "arm": False, "cam": False}
         return {
-            "mavproxy": self.is_mavproxy_running(),
+            "mavproxy": self.is_mavproxy_running() and self.is_mavproxy_fc_connected(),
             "stab":     bool(st.get("stab", {}).get("alive")),
             "arm":      bool(st.get("arm", {}).get("alive")),
             "cam":      bool(st.get("cam", {}).get("alive")),
@@ -1028,7 +1077,7 @@ def api_start_onboard():
                     if ok_m:
                         msg_m = (
                             "MAVProxy running but Pix6 not detected — "
-                            "check USB (/dev/ttyACM0) and power"
+                            + ssh.mavproxy_diagnosis()
                         )
                         ok_m = False
                 if ok_m and not ssh.wait_mavproxy_tcp_ready(timeout_sec=20.0):

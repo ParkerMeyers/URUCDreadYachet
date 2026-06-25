@@ -138,7 +138,7 @@
   </div>
 
   <div class="proceed-row">
-    <button class="btn btn-success" onclick="openControl()">Open Control Screen →</button>
+    <button class="btn btn-success not-ready" id="btn-open-control" onclick="openControl()">Open Control Screen →</button>
   </div>
 
 </div><!-- /launch -->
@@ -428,6 +428,24 @@
         </table>
       </div>
 
+    </div>
+  </div>
+</div>
+
+<!-- Offline systems confirm modal -->
+<div id="offline-confirm-modal" class="modal-overlay" style="display:none" onclick="hideOfflineConfirmOutside(event)">
+  <div class="modal-box" style="width:min(480px,95vw);">
+    <div class="modal-header">
+      <h2>⚠ Systems Offline</h2>
+    </div>
+    <div class="modal-body">
+      <p>Are you sure you want to continue with systems offline?</p>
+      <p style="font-size:.8rem;color:var(--dim);margin-top:8px">Offline Systems:</p>
+      <ul id="offline-systems-list" class="offline-systems-list"></ul>
+      <div class="btn-row" style="margin-top:20px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="hideOfflineConfirm()">Cancel</button>
+        <button class="btn btn-success" onclick="confirmOpenControl()">Continue Anyway</button>
+      </div>
     </div>
   </div>
 </div>
