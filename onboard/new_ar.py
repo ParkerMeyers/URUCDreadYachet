@@ -224,6 +224,13 @@ def _fill_rc_neutral(rc: list) -> None:
     rc[SPARE_RC_CH - 1] = CENTER_US
 
 
+def _should_hold_neutral(last_pkt_time: float) -> bool:
+    """Hold stop PWM until arm_sender is live, or after command timeout."""
+    if last_pkt_time <= 0:
+        return True
+    return time.time() - last_pkt_time > TIMEOUT_SEC
+
+
 # AUX1–AUX7 labels for manual override (web UI types AUX channel number)
 AUX_LABELS = ("J5", "J2", "J6", "J1", "J3", "J4", "Claw")
 
@@ -360,10 +367,8 @@ def _build_rc_array():
         j6_target_snap = _j6_target_deg
         last_pkt_snap  = _last_pkt_time
 
-    timed_out = (time.time() - last_pkt_snap > TIMEOUT_SEC) and (last_pkt_snap > 0)
-
-    if timed_out:
-        # Safety: stop all joints at neutral PWM
+    if _should_hold_neutral(last_pkt_snap):
+        # Safety: stop all joints at neutral PWM (no BNO auto-level before arm_sender)
         _fill_rc_neutral(rc)
         return rc
 
@@ -489,10 +494,10 @@ def main():
                         flush=True,
                     )
                 else:
-                    timed_out = (now - lpt > TIMEOUT_SEC) and (lpt > 0)
-                    j6_pwm = _compute_j6_pwm(_clamp_us(jus[5]), j6t) if not timed_out else CENTER_US
+                    hold_neutral = _should_hold_neutral(lpt)
+                    j6_pwm = J6_OUT_CENTER if hold_neutral else _compute_j6_pwm(_clamp_us(jus[5]), j6t)
                     print(
-                        f"[arm] rx={rx} timeout={timed_out} mosfet={_mosfet_on} | "
+                        f"[arm] rx={rx} hold={hold_neutral} mosfet={_mosfet_on} | "
                         f"J1={jus[0]} J2={jus[1]} J3={jus[2]} J4={jus[3]} "
                         f"J5={jus[4]} J6={j6_pwm}(in={jus[5]},tgt={j6t:.1f}) "
                         f"Claw={jus[6]}"
