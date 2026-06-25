@@ -61,9 +61,14 @@ MAX_US = 1900
 MAX_PWM_DELTA_US = 400
 
 CONTROL_TIMEOUT_SEC = 0.80
-IMU_TIMEOUT_SEC = 0.50
-DEPTH_TIMEOUT_SEC = 0.75
+IMU_TIMEOUT_SEC = 1.00
+DEPTH_TIMEOUT_SEC = 1.50
 LOOP_HZ = 100
+
+MAVLINK_LINK_TIMEOUT_SEC = 3.0
+MAVLINK_RECONNECT_COOLDOWN_SEC = 5.0
+MAVLINK_MAX_MSGS_PER_POLL = 500
+MAVLINK_SENSOR_RESYNC_SEC = 3.0
 
 INPUT_DEADZONE = 0.08
 
@@ -446,8 +451,11 @@ class SmoothPID:
 
 class MavlinkReader:
     def __init__(self, mavlink_url):
-        print(f"Connecting MAVLink: {mavlink_url}")
-        self.master = connect_mavlink(mavlink_url)
+        self.mavlink_url = mavlink_url
+        self.master = None
+        self.last_any_message = 0.0
+        self.last_reconnect_attempt = 0.0
+        self.last_sensor_resync = 0.0
 
         self.roll_deg = 0.0
         self.pitch_deg = 0.0
@@ -496,10 +504,64 @@ class MavlinkReader:
         self.last_rate_request = 0.0
         self.last_pressure_debug_print = 0.0
 
+        self._connect()
+
         print(
             f"Depth fixed zero: {PREFERRED_PRESSURE_SOURCE} "
             f"surface={FIXED_SURFACE_PRESSURE_HPA:.4f} hPa"
         )
+
+    def _connect(self):
+        print(f"Connecting MAVLink: {self.mavlink_url}")
+        self.master = connect_mavlink(self.mavlink_url)
+        self.last_rate_request = 0.0
+
+    def link_dead(self):
+        if self.last_any_message <= 0.0:
+            return False
+        return (time.time() - self.last_any_message) > MAVLINK_LINK_TIMEOUT_SEC
+
+    def sensors_stale(self):
+        return self.attitude_stale() and self.depth_stale()
+
+    def try_reconnect(self):
+        now = time.time()
+        if now - self.last_reconnect_attempt < MAVLINK_RECONNECT_COOLDOWN_SEC:
+            return False
+
+        self.last_reconnect_attempt = now
+        print("[mavlink] Link lost — reconnecting to MAVProxy...")
+
+        try:
+            if self.master is not None:
+                close = getattr(self.master, "close", None)
+                if callable(close):
+                    close()
+        except Exception:
+            pass
+
+        try:
+            self._connect()
+            hb = wait_for_heartbeat(self.master, timeout=5.0)
+            if hb:
+                print(
+                    f"[mavlink] Reconnected — system {self.master.target_system}, "
+                    f"component {self.master.target_component}"
+                )
+            else:
+                print("[mavlink] Reconnected (no heartbeat yet)")
+            return True
+        except Exception as e:
+            print(f"[mavlink] Reconnect failed: {e}")
+            return False
+
+    def resync_sensor_streams(self):
+        now = time.time()
+        if now - self.last_sensor_resync < MAVLINK_SENSOR_RESYNC_SEC:
+            return
+        self.last_sensor_resync = now
+        self.last_rate_request = 0.0
+        print("[mavlink] Re-requesting ATTITUDE / pressure message rates")
 
     def request_message_rates(self):
         now = time.time()
@@ -616,19 +678,14 @@ class MavlinkReader:
 
         self.request_message_rates()
 
-        while True:
-            msg = self.master.recv_match(
-                type=[
-                    "ATTITUDE",
-                    "SCALED_PRESSURE",
-                    "SCALED_PRESSURE2",
-                    "SCALED_PRESSURE3",
-                ],
-                blocking=False,
-            )
-
+        msgs_read = 0
+        while msgs_read < MAVLINK_MAX_MSGS_PER_POLL:
+            msg = self.master.recv_match(blocking=False)
             if msg is None:
                 break
+
+            msgs_read += 1
+            self.last_any_message = time.time()
 
             msg_type = msg.get_type()
 
@@ -710,6 +767,9 @@ class PixhawkOutput:
         self.master = master
         self._last_heartbeat = 0.0
 
+    def set_master(self, master):
+        self.master = master
+
     def _target(self):
         ts = self.master.target_system or 1
         tc = self.master.target_component or 1
@@ -779,6 +839,7 @@ class ControlReceiver:
         self.stabilize = False
         self.depth_hold = False
         self.yaw_hold = False
+        self.calibrate_imu = False
 
         self.gain_percent = 100
 
@@ -813,6 +874,7 @@ class ControlReceiver:
             self.stabilize = bool(packet.get("stabilize", False))
             self.depth_hold = bool(packet.get("depth_hold", False))
             self.yaw_hold = bool(packet.get("yaw_hold", False))
+            self.calibrate_imu = bool(packet.get("calibrate_imu", False))
 
             self.gain_percent = int(packet.get("gain_percent", self.gain_percent))
             self.seq = int(packet.get("seq", self.seq))
@@ -992,6 +1054,7 @@ def main():
     last_telemetry = 0.0
 
     previous_stabilize = False
+    previous_calibrate_imu = False
     previous_depth_hold_request = False
     previous_manual_vertical_active = False
 
@@ -1008,6 +1071,7 @@ def main():
 
     pitch_hold_target_deg = PITCH_TARGET_DEG
     roll_hold_target_deg = ROLL_TARGET_DEG
+    imu_targets_calibrated = False
 
     hold_depth_m = 0.0
     hold_yaw_deg = 0.0
@@ -1048,6 +1112,12 @@ def main():
             mav.poll()
             control.poll()
 
+            if mav.link_dead():
+                if mav.try_reconnect():
+                    pixhawk.set_master(mav.master)
+            elif mav.sensors_stale():
+                mav.resync_sensor_streams()
+
             control_timed_out = control.timed_out()
             attitude_stale = mav.attitude_stale()
             depth_stale = mav.depth_stale()
@@ -1067,6 +1137,27 @@ def main():
                 yaw_hold_request = control.yaw_hold
 
             # ----------------------------------------------------
+            # IMU zero / calibration (rising edge on calibrate_imu).
+            # ----------------------------------------------------
+            calibrate_imu_request = control.calibrate_imu
+            if calibrate_imu_request and not previous_calibrate_imu:
+                if attitude_stale:
+                    print("IMU CALIBRATE SKIPPED — attitude stale")
+                else:
+                    pitch_hold_target_deg = mav.filtered_pitch_deg
+                    roll_hold_target_deg = mav.filtered_roll_deg
+                    imu_targets_calibrated = True
+                    pitch_pid.reset()
+                    roll_pid.reset()
+                    print(
+                        f"IMU CALIBRATED | "
+                        f"pitch target={pitch_hold_target_deg:.1f} deg | "
+                        f"roll target={roll_hold_target_deg:.1f} deg"
+                    )
+
+            previous_calibrate_imu = calibrate_imu_request
+
+            # ----------------------------------------------------
             # Pitch / roll stabilization target handling.
             # ----------------------------------------------------
             if stabilize_active and not previous_stabilize:
@@ -1076,8 +1167,15 @@ def main():
                 if AUTO_CAPTURE_ATTITUDE_ON_STABILIZE:
                     pitch_hold_target_deg = mav.filtered_pitch_deg
                     roll_hold_target_deg = mav.filtered_roll_deg
+                    imu_targets_calibrated = True
                     print(
                         f"STABILIZATION ON | captured "
+                        f"pitch target={pitch_hold_target_deg:.1f} deg | "
+                        f"roll target={roll_hold_target_deg:.1f} deg"
+                    )
+                elif imu_targets_calibrated:
+                    print(
+                        f"STABILIZATION ON | calibrated "
                         f"pitch target={pitch_hold_target_deg:.1f} deg | "
                         f"roll target={roll_hold_target_deg:.1f} deg"
                     )
@@ -1363,6 +1461,11 @@ def main():
                     "control_timeout": control_timed_out,
                     "attitude_stale": attitude_stale,
                     "depth_stale": depth_stale,
+                    "mavlink_link_dead": mav.link_dead(),
+                    "mavlink_last_rx_age_sec": (
+                        None if mav.last_any_message <= 0.0
+                        else round(time.time() - mav.last_any_message, 2)
+                    ),
 
                     "stabilize": stabilize_active,
 

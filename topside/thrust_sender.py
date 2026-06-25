@@ -6,6 +6,7 @@ Controls:
 - S = pitch/roll stabilization toggle
 - D = depth hold toggle
 - Y = yaw hold toggle
+- C = zero / calibrate IMU (capture current pitch & roll as targets)
 - D-pad up/down = gain +/- 10%
 - ESC = quit
 
@@ -325,6 +326,7 @@ def main():
     global_stabilize_toggle_requested = False
     global_depth_toggle_requested = False
     global_yaw_toggle_requested = False
+    global_calibrate_imu_requested = False
     global_quit_requested = False
     global_gain_delta_requested = 0
 
@@ -332,6 +334,7 @@ def main():
         nonlocal global_stabilize_toggle_requested
         nonlocal global_depth_toggle_requested
         nonlocal global_yaw_toggle_requested
+        nonlocal global_calibrate_imu_requested
         nonlocal global_quit_requested
         nonlocal global_gain_delta_requested
 
@@ -357,6 +360,9 @@ def main():
 
                 elif ch == "y":
                     global_yaw_toggle_requested = True
+
+                elif ch == "c":
+                    global_calibrate_imu_requested = True
 
         except Exception:
             pass
@@ -419,6 +425,9 @@ def main():
                         yaw_hold = not yaw_hold
                         print(f"Yaw hold toggled by pygame keyboard: {yaw_hold}")
 
+                    elif event.key == pygame.K_c:
+                        global_calibrate_imu_requested = True
+
                     elif event.key == pygame.K_UP:
                         gain_percent = adjust_gain(gain_percent, GAIN_STEP_PERCENT)
                         print(f"Gain: {gain_percent}%")
@@ -449,6 +458,12 @@ def main():
                 global_yaw_toggle_requested = False
                 yaw_hold = not yaw_hold
                 print(f"Yaw hold toggled by global keyboard: {yaw_hold}")
+
+            calibrate_imu = False
+            if global_calibrate_imu_requested:
+                global_calibrate_imu_requested = False
+                calibrate_imu = True
+                print("IMU calibrate requested by global keyboard")
 
             if global_gain_delta_requested != 0:
                 gain_percent = adjust_gain(gain_percent, global_gain_delta_requested)
@@ -571,6 +586,7 @@ def main():
                 "stabilize": stabilize,
                 "depth_hold": depth_hold,
                 "yaw_hold": yaw_hold,
+                "calibrate_imu": calibrate_imu,
                 "gain_percent": gain_percent,
                 "telemetry_port": TELEMETRY_PORT,
             }

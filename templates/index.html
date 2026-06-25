@@ -245,6 +245,7 @@
     <div class="ctrl-sep"></div>
 
     <span class="control-label">Actions</span>
+    <button class="action-btn" onclick="calibrateIMU()">⊕ ZERO IMU</button>
     <button class="action-btn" onclick="startColmap()">▶ COLMAP</button>
     <button class="action-btn" onclick="startCrabs()">🦀 CRABS</button>
 
@@ -370,6 +371,7 @@
           <tr><td>S</td><td>Toggle pitch/roll stabilization ON/OFF</td></tr>
           <tr><td>D</td><td>Toggle depth hold ON/OFF</td></tr>
           <tr><td>Y</td><td>Toggle yaw hold ON/OFF</td></tr>
+          <tr><td>C</td><td>Zero / calibrate IMU — sets current pitch &amp; roll as stabilization targets</td></tr>
           <tr><td>↑ Arrow</td><td>Increase gain by 10%</td></tr>
           <tr><td>↓ Arrow</td><td>Decrease gain by 10%</td></tr>
           <tr><td>ESC</td><td>Emergency stop — sets DISARMED mode and clears all flags</td></tr>

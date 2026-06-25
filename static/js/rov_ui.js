@@ -354,6 +354,25 @@ function toggleYawHold() {
   toast(`Yaw Hold: ${_ctrlState.yaw_hold ? 'ON' : 'OFF'}`, _ctrlState.yaw_hold ? 'ok' : '');
 }
 
+function calibrateIMU() {
+  const sending = _currentMode === 'armed' || _currentMode === 'stabilize';
+  sendCtrlPacket({
+    seq: _ctrlState.seq++,
+    time: Date.now() / 1000,
+    forward:  sending ? _localCmds.forward  : 0,
+    lateral:  sending ? _localCmds.lateral  : 0,
+    yaw:      sending ? _localCmds.yaw      : 0,
+    vertical: sending ? _localCmds.vertical : 0,
+    stabilize:   sending ? _ctrlState.stabilize  : false,
+    depth_hold:  sending ? _ctrlState.depth_hold : false,
+    yaw_hold:    sending ? _ctrlState.yaw_hold   : false,
+    gain_percent: _ctrlState.gain_percent,
+    telemetry_port: CTRL_CFG.TELEMETRY_PORT,
+    calibrate_imu: true,
+  });
+  toast('IMU zero sent — current pitch/roll set as targets', 'ok');
+}
+
 function updateFlagUI() {
   const stabBtn  = document.getElementById('flag-stab');
   const depthBtn = document.getElementById('flag-depth');
@@ -618,6 +637,9 @@ document.addEventListener('keydown', (e) => {
       break;
     case 'y': case 'Y':
       toggleYawHold();
+      break;
+    case 'c': case 'C':
+      calibrateIMU();
       break;
     case 'ArrowUp':
       e.preventDefault();
