@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import gc
 import socket
 import subprocess
 import threading
@@ -187,18 +188,79 @@ _CAPTURE_PROFILES: tuple[tuple[str, int, int], ...] = (
     ("YUYV", 320, 240),
 )
 
+# Per-device open lock — different USB cameras can open in parallel on Pi.
+_open_locks: dict[str, threading.Lock] = {}
+_open_locks_guard = threading.Lock()
 
-def _configure_capture(cap: "cv2.VideoCapture", width: int, height: int, fps: int) -> tuple[int, int, str]:
+
+def _device_open_lock(device: str) -> threading.Lock:
+    with _open_locks_guard:
+        if device not in _open_locks:
+            _open_locks[device] = threading.Lock()
+        return _open_locks[device]
+
+
+def _capture_profiles(width: int, height: int) -> list[tuple[str, int, int]]:
+    seen: set[tuple[str, int, int]] = set()
+    ordered: list[tuple[str, int, int]] = []
+    for fmt, w, h in (("MJPG", width, height), *_CAPTURE_PROFILES):
+        key = (fmt, w, h)
+        if key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
+
+
+def _v4l2_prepare(device: str, width: int, height: int, fourcc: str = "MJPG") -> None:
+    """Set format via v4l2-ctl before OpenCV opens (more reliable on Pi 5)."""
+    subprocess.run(
+        [
+            "v4l2-ctl", f"--device={device}",
+            f"--set-fmt-video=width={width},height={height},pixelformat={fourcc}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def _v4l2_prepare_all(devices: list[str], width: int, height: int) -> None:
+    """Pre-configure every camera in parallel (separate USB buses)."""
+    threads = [
+        threading.Thread(
+            target=_v4l2_prepare,
+            args=(dev, width, height, "MJPG"),
+            daemon=True,
+            name=f"v4l2-{Path(dev).name}",
+        )
+        for dev in devices
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=3.0)
+
+
+def _release_capture(cap: "cv2.VideoCapture | None") -> None:
+    if cap is None:
+        return
+    try:
+        cap.release()
+    except Exception:
+        pass
+    gc.collect()
+
+
+def _configure_capture(
+    cap: "cv2.VideoCapture", device: str, width: int, height: int, fps: int,
+) -> tuple[int, int, str]:
     """
     Try common UVC format profiles.  Returns (actual_w, actual_h, fourcc_used).
     MJPEG first — uncompressed YUYV at 640×480 often fails with two cameras.
     """
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    profiles = [(f, width, height)] + [
-        (f, w, h) for f, w, h in _CAPTURE_PROFILES
-        if not (f == "MJPG" and w == width and h == height)
-    ]
-    for fourcc_name, w, h in profiles:
+    for fourcc_name, w, h in _capture_profiles(width, height):
+        _v4l2_prepare(device, w, h, fourcc_name)
         cap.set(cv2.CAP_PROP_FOURCC, _fourcc(fourcc_name))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
@@ -206,7 +268,7 @@ def _configure_capture(cap: "cv2.VideoCapture", width: int, height: int, fps: in
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         # Warm up — first frames after format change are often empty on UVC.
-        for _ in range(8):
+        for _ in range(2):
             cap.grab()
         ret, frame = cap.read()
         if ret and frame is not None and frame.size > 0:
@@ -251,6 +313,11 @@ class CameraStream:
         self._lock   = threading.Lock()
         self._frame: bytes | None = None
         self._running = False
+        self._ready   = threading.Event()
+
+    def wait_ready(self, timeout: float = 15.0) -> bool:
+        """Block until the first frame is captured (or timeout)."""
+        return self._ready.wait(timeout)
 
     def start(self) -> "CameraStream":
         self._running = True
@@ -267,58 +334,63 @@ class CameraStream:
         Open via numeric V4L2 index — Pi OpenCV builds reject /dev/videoN paths
         ("can't be used to capture by name") but accept cv2.VideoCapture(N, CAP_V4L2).
         """
-        idx = _device_to_v4l2_index(self.device)
-        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            pids = _device_busy_pids(self.device)
-            if pids:
-                _log(f"[cam] {self.device} (index {idx}): open failed — "
-                     f"device busy (PIDs {pids})")
-            cap.release()
-            return None
-        try:
-            actual_w, actual_h, fmt = _configure_capture(
-                cap, self.width, self.height, self.fps,
-            )
-            if fmt == "?":
-                cap.release()
+        with _device_open_lock(self.device):
+            idx = _device_to_v4l2_index(self.device)
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                pids = _device_busy_pids(self.device)
+                if pids:
+                    _log(f"[cam] {self.device} (index {idx}): open failed — "
+                         f"device busy (PIDs {pids})")
+                _release_capture(cap)
                 return None
-            self.width = actual_w
-            self.height = actual_h
-            _log(f"[cam] {self.device}: opened {actual_w}×{actual_h} fmt={fmt}")
-        except Exception as exc:
-            _log(f"[cam] {self.device}: configure failed ({exc})")
-            cap.release()
-            return None
-        return cap
+            try:
+                actual_w, actual_h, fmt = _configure_capture(
+                    cap, self.device, self.width, self.height, self.fps,
+                )
+                if fmt == "?":
+                    _release_capture(cap)
+                    return None
+                self.width = actual_w
+                self.height = actual_h
+                _log(f"[cam] {self.device}: opened {actual_w}×{actual_h} fmt={fmt}")
+            except Exception as exc:
+                _log(f"[cam] {self.device}: configure failed ({exc})")
+                _release_capture(cap)
+                return None
+            return cap
 
     def _capture_loop(self) -> None:
         cap = None
-        retry_delay = 5.0
+        retry_delay = 1.0
 
         while self._running:
             # (Re-)open the camera device
             if cap is None or not cap.isOpened():
                 cap = self._open_capture()
                 if cap is not None and cap.isOpened():
-                    retry_delay = 5.0
+                    retry_delay = 1.0
                 else:
-                    if cap is not None:
-                        cap.release()
+                    _release_capture(cap)
                     cap = None
                     _log(f"[cam] {self.device}: not available — "
-                         f"retry in {retry_delay:.0f}s")
+                         f"retry in {retry_delay:.1f}s")
                     time.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 1.5, 30.0)
+                    retry_delay = min(retry_delay * 1.5, 5.0)
                     continue
 
-            # Grab and encode a frame
+            # Grab and encode a frame (skip corrupt/partial MJPEG frames)
             ret, frame = cap.read()
-            if not ret:
+            if not ret or frame is None or frame.size == 0:
+                for _ in range(2):
+                    ret, frame = cap.read()
+                    if ret and frame is not None and frame.size > 0:
+                        break
+            if not ret or frame is None or frame.size == 0:
                 _log(f"[cam] {self.device}: read failed — reopening")
-                cap.release()
+                _release_capture(cap)
                 cap = None
-                time.sleep(1.0)
+                time.sleep(0.5)
                 continue
 
             ok, jpeg = cv2.imencode(
@@ -328,6 +400,7 @@ class CameraStream:
             if ok:
                 with self._lock:
                     self._frame = jpeg.tobytes()
+                self._ready.set()
 
             time.sleep(1.0 / max(1, self.fps))
 
@@ -495,8 +568,9 @@ def main() -> None:
     )
 
     if HAVE_CV2:
+        _v4l2_prepare_all([cam0_dev, cam1_dev], args.width, args.height)
+        _log("[cam] Starting both capture threads in parallel")
         stream0.start()
-        time.sleep(2.0)  # stagger USB opens — two UVC cams at once often fail on Pi
         stream1.start()
 
     t0 = threading.Thread(

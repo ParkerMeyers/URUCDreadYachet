@@ -1050,41 +1050,64 @@ def api_start_onboard():
                     emit_status()
                     return
 
-            # Step 2–4: onboard scripts via Pi-side supervisor (setsid + pidfile + log-ready)
-            _emit_onboard_progress(
-                "stabilization", "starting", "Launching stabilization.py..."
-            )
-            ok_s, msg_s = ssh.supervisor_start_and_wait("stab", timeout_sec=75.0)
-            STATE["onboard_stab"] = ok_s
-            _emit_onboard_progress(
-                "stabilization", "done" if ok_s else "error", msg_s
-            )
-            emit_status()
-
-            _emit_onboard_progress(
-                "arm_ctrl", "starting", "Launching new_ar.py (arm controller)..."
-            )
-            ok_a, msg_a = ssh.supervisor_start_and_wait("arm", timeout_sec=75.0)
-            STATE["onboard_arm"] = ok_a
-            _emit_onboard_progress(
-                "arm_ctrl", "done" if ok_a else "error", msg_a
-            )
-            emit_status()
-
-            _emit_onboard_progress(
-                "camera", "starting", "Launching camera_stream.py (MJPEG feeds)..."
-            )
+            # Step 2–4: stab, arm, cam in parallel (MAVProxy must be up first)
             cam0_dev = config.get("camera0_device", "/dev/video0")
             cam1_dev = config.get("camera1_device", "/dev/video2")
             cam_args = f"--cam0 {cam0_dev} --cam1 {cam1_dev}"
-            ok_c, msg_c = ssh.supervisor_start_and_wait(
-                "cam", timeout_sec=45.0, extra_args=cam_args
-            )
-            STATE["onboard_cam"] = ok_c
-            _emit_onboard_progress(
-                "camera", "done" if ok_c else "error", msg_c
-            )
-            emit_status()
+
+            parallel_specs = [
+                ("stabilization", "stab", "onboard_stab", 75.0, ""),
+                ("arm_ctrl", "arm", "onboard_arm", 75.0, ""),
+                ("camera", "cam", "onboard_cam", 45.0, cam_args),
+            ]
+            parallel_labels = {
+                "stabilization": "stabilization.py",
+                "arm_ctrl": "new_ar.py (arm controller)",
+                "camera": "camera_stream.py (MJPEG feeds)",
+            }
+            parallel_results: dict[str, tuple[bool, str]] = {}
+            results_lock = threading.Lock()
+
+            for step, _, _, _, _ in parallel_specs:
+                _emit_onboard_progress(
+                    step, "starting",
+                    f"Launching {parallel_labels[step]}...",
+                )
+
+            def _launch_onboard_service(
+                step: str,
+                svc: str,
+                state_key: str,
+                timeout: float,
+                extra_args: str,
+            ):
+                ok, msg = ssh.supervisor_start_and_wait(
+                    svc, timeout_sec=timeout, extra_args=extra_args,
+                )
+                with results_lock:
+                    parallel_results[step] = (ok, msg)
+                with _state_lock:
+                    STATE[state_key] = ok
+                _emit_onboard_progress(step, "done" if ok else "error", msg)
+                emit_status()
+
+            threads = [
+                threading.Thread(
+                    target=_launch_onboard_service,
+                    args=(step, svc, state_key, timeout, extra_args),
+                    name=f"onboard-{svc}",
+                    daemon=True,
+                )
+                for step, svc, state_key, timeout, extra_args in parallel_specs
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            ok_s, msg_s = parallel_results.get("stabilization", (False, "missing result"))
+            ok_a, msg_a = parallel_results.get("arm_ctrl", (False, "missing result"))
+            ok_c, msg_c = parallel_results.get("camera", (False, "missing result"))
 
             core_ok = ok_m and ok_s
             if core_ok and ok_a and ok_c:
