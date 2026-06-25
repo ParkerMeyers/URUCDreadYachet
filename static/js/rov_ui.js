@@ -4,9 +4,12 @@
 let _tel    = {};
 let _status = {};
 let _currentLog  = 'arm';
-const _logs = { thrust: [], arm: [], onboard_stab: [], onboard_arm: [], onboard_cam: [] };
+const _logs = { thrust: [], arm: [], onboard_stab: [], onboard_arm: [], onboard_cam: [], colmap: [], crabs: [] };
 let _onboardPollTimer = null;
 const _onboardProgressSeen = new Set();
+let _telemetryRecording = false;
+let _lastBatteryToast = '';
+let _missionPollTimer = null;
 let socket = null;
 
 function socketEmit(event, data) {
@@ -25,6 +28,7 @@ if (typeof io !== 'undefined') {
 
   socket.on('telemetry', (data) => {
     _tel = data;
+    if (data.link_health) _status.link_health = data.link_health;
     updateTelemetry();
     updateCtrlCmdsFromTelemetry();
   });
@@ -148,6 +152,7 @@ function getCfg() {
                  'camera0_device','camera1_device',
                  'thrust_udp_port','telemetry_port','arm_udp_port',
                  'mosfet_control_port','colmap_command','crabs_command',
+                 'battery_warn_v','battery_crit_v',
                  'mavproxy_bin','mavproxy_serial','mavproxy_baud',
                  'mavproxy_out1','mavproxy_out2'];
   const obj = {};
@@ -164,6 +169,18 @@ async function saveConfig() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(getCfg()),
   });
+}
+
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/config');
+    const cfg = await r.json();
+    Object.entries(cfg).forEach(([k, v]) => {
+      const el = document.getElementById('cfg-' + k);
+      if (el && v !== null && v !== undefined) el.value = v;
+    });
+    if (cfg.telemetry_port) CTRL_CFG.TELEMETRY_PORT = parseInt(cfg.telemetry_port, 10) || 5006;
+  } catch (_) {}
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -324,12 +341,318 @@ async function startColmap() {
   const r = await fetch('/api/colmap', { method: 'POST' });
   const d = await r.json();
   toast(d.ok ? '▶ COLMAP started' : 'COLMAP failed: ' + d.msg, d.ok ? 'ok' : 'err');
+  refreshMissionStatus();
 }
 
 async function startCrabs() {
   const r = await fetch('/api/crabs', { method: 'POST' });
   const d = await r.json();
   toast(d.ok ? '🦀 Crabs started' : 'Crabs failed: ' + d.msg, d.ok ? 'ok' : 'err');
+  refreshMissionStatus();
+}
+
+async function sendArmPreset(name) {
+  const r = await fetch(`/api/arm_preset/${encodeURIComponent(name)}`, { method: 'POST' });
+  const d = await r.json();
+  const label = (_armPresets[name] && _armPresets[name].label) || name;
+  toast(d.ok ? `Arm preset: ${label}` : d.msg, d.ok ? 'ok' : 'err');
+}
+
+// ─────────────────────────────────────────────────────────────
+// ARM PRESETS
+// ─────────────────────────────────────────────────────────────
+const ARM_JOINT_NAMES = ['J1', 'J2', 'J3', 'J4', 'J5', 'J6', 'Claw'];
+let _armPresets = {};
+let _armLastPwm = null;
+let _armPresetEditing = null;
+
+async function loadArmPresets() {
+  try {
+    const r = await fetch('/api/arm_presets');
+    const d = await r.json();
+    if (!d.ok) return;
+    _armPresets = d.presets || {};
+    if (d.current) _armLastPwm = d.current;
+    renderArmPresetButtons();
+    renderArmPresetList();
+    updateArmCurrentDisplay();
+  } catch (_) {}
+}
+
+function renderArmPresetButtons() {
+  const wrap = document.getElementById('arm-preset-btns');
+  if (!wrap) return;
+  const names = Object.keys(_armPresets);
+  if (!names.length) {
+    wrap.innerHTML = '<span style="font-size:.68rem;color:var(--dim)">No presets</span>';
+    return;
+  }
+  wrap.innerHTML = names.map(name => {
+    const label = (_armPresets[name] && _armPresets[name].label) || name;
+    return `<button type="button" class="action-btn" onclick="sendArmPreset('${name}')" title="${name}">${escapeHtml(label)}</button>`;
+  }).join('');
+}
+
+function buildArmPwmGrid() {
+  const grid = document.getElementById('arm-preset-pwm-grid');
+  if (!grid || grid.childElementCount) return;
+  grid.innerHTML = ARM_JOINT_NAMES.map((jn, i) => `
+    <div class="field">
+      <label>${jn} µs</label>
+      <input id="arm-pwm-${i}" type="number" min="500" max="2500" step="1" value="1500"/>
+    </div>
+  `).join('');
+}
+
+function getArmFormValues() {
+  const pwm = [];
+  for (let i = 0; i < 7; i++) {
+    const el = document.getElementById('arm-pwm-' + i);
+    pwm.push(el ? parseInt(el.value, 10) || 1500 : 1500);
+  }
+  const j6El = document.getElementById('arm-preset-j6');
+  const j6 = j6El ? parseFloat(j6El.value) : 0;
+  const nameEl = document.getElementById('arm-preset-name');
+  const labelEl = document.getElementById('arm-preset-label');
+  return {
+    name: nameEl ? nameEl.value.trim() : '',
+    label: labelEl ? labelEl.value.trim() : '',
+    pwm,
+    j6_angle: Number.isFinite(j6) ? j6 : 0,
+  };
+}
+
+function setArmFormValues(preset, name) {
+  _armPresetEditing = name || null;
+  const title = document.getElementById('arm-preset-form-title');
+  if (title) title.textContent = name ? `Edit: ${name}` : 'Add preset';
+  const nameEl = document.getElementById('arm-preset-name');
+  const labelEl = document.getElementById('arm-preset-label');
+  const j6El = document.getElementById('arm-preset-j6');
+  if (nameEl) {
+    nameEl.value = name || '';
+    nameEl.disabled = !!name;
+  }
+  if (labelEl) labelEl.value = (preset && preset.label) || '';
+  if (j6El) j6El.value = (preset && preset.j6_angle != null) ? preset.j6_angle : 0;
+  for (let i = 0; i < 7; i++) {
+    const el = document.getElementById('arm-pwm-' + i);
+    if (el) el.value = (preset && preset.pwm && preset.pwm[i] != null) ? preset.pwm[i] : 1500;
+  }
+}
+
+function resetArmPresetForm() {
+  _armPresetEditing = null;
+  setArmFormValues({ pwm: [1500, 1500, 1500, 1500, 1500, 1500, 1500], j6_angle: 0, label: '' }, '');
+  const nameEl = document.getElementById('arm-preset-name');
+  if (nameEl) nameEl.disabled = false;
+  const title = document.getElementById('arm-preset-form-title');
+  if (title) title.textContent = 'Add preset';
+}
+
+function updateArmCurrentDisplay() {
+  const el = document.getElementById('arm-preset-current');
+  if (!el) return;
+  if (!_armLastPwm || !_armLastPwm.pwm) {
+    el.textContent = 'Current: -- (start arm_sender and move arm to record)';
+    return;
+  }
+  el.textContent = `Current: ${_armLastPwm.pwm.join(', ')} | J6 ${(_armLastPwm.j6_angle ?? 0).toFixed(1)}°`;
+}
+
+function recordArmCurrentIntoForm() {
+  if (!_armLastPwm || !_armLastPwm.pwm) {
+    toast('No current arm PWM — start arm_sender and move the arm first', 'err');
+    return;
+  }
+  const keepName = document.getElementById('arm-preset-name')?.value || '';
+  const keepLabel = document.getElementById('arm-preset-label')?.value || '';
+  setArmFormValues({
+    label: keepLabel,
+    pwm: _armLastPwm.pwm.slice(),
+    j6_angle: _armLastPwm.j6_angle ?? 0,
+  }, _armPresetEditing || keepName);
+  toast('Recorded current arm position', 'ok');
+}
+
+async function saveArmPresetFromForm() {
+  const v = getArmFormValues();
+  if (!v.name) {
+    toast('Enter a preset name', 'err');
+    return;
+  }
+  const r = await fetch('/api/arm_presets', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(v),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    toast(`Saved preset: ${d.name}`, 'ok');
+    await loadArmPresets();
+    setArmFormValues(d.preset, d.name);
+  } else {
+    toast(d.msg || 'Save failed', 'err');
+  }
+}
+
+async function deleteArmPreset(name) {
+  if (!confirm(`Delete preset "${name}"?`)) return;
+  const r = await fetch(`/api/arm_presets/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  const d = await r.json();
+  if (d.ok) {
+    toast(`Deleted: ${name}`, 'ok');
+    if (_armPresetEditing === name) resetArmPresetForm();
+    await loadArmPresets();
+  } else {
+    toast(d.msg || 'Delete failed', 'err');
+  }
+}
+
+function renderArmPresetList() {
+  const list = document.getElementById('arm-preset-list');
+  if (!list) return;
+  const names = Object.keys(_armPresets);
+  if (!names.length) {
+    list.innerHTML = '<div style="font-size:.78rem;color:var(--dim)">No presets yet.</div>';
+    return;
+  }
+  list.innerHTML = names.map(name => {
+    const p = _armPresets[name];
+    const meta = (p.pwm || []).join(', ') + ` | J6 ${(p.j6_angle ?? 0).toFixed(1)}°`;
+    const label = escapeHtml(p.label || name);
+    return `<div class="arm-preset-row">
+      <div class="arm-preset-row-name">${label}
+        <div class="arm-preset-row-meta">${escapeHtml(meta)}</div>
+      </div>
+      <div class="arm-preset-row-actions">
+        <button type="button" onclick="sendArmPreset('${name}')">Go</button>
+        <button type="button" onclick="editArmPreset('${name}')">Edit</button>
+        <button type="button" class="danger" onclick="deleteArmPreset('${name}')">Del</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function editArmPreset(name) {
+  const p = _armPresets[name];
+  if (!p) return;
+  setArmFormValues(p, name);
+}
+
+function showArmPresets() {
+  buildArmPwmGrid();
+  resetArmPresetForm();
+  loadArmPresets();
+  document.getElementById('arm-presets-modal').style.display = 'flex';
+}
+
+function hideArmPresets() {
+  document.getElementById('arm-presets-modal').style.display = 'none';
+}
+
+function hideArmPresetsOutside(e) {
+  if (e.target === document.getElementById('arm-presets-modal')) hideArmPresets();
+}
+
+async function toggleTelemetryRecord() {
+  const action = _telemetryRecording ? 'stop' : 'start';
+  const r = await fetch('/api/telemetry_record', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action }),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    _telemetryRecording = !!d.recording;
+    updateRecordButton();
+    toast(
+      d.recording ? `Recording → ${d.file}` : `Recording stopped (${d.file || 'none'})`,
+      d.recording ? 'ok' : ''
+    );
+  }
+}
+
+function updateRecordButton() {
+  const btn = document.getElementById('btn-record');
+  if (!btn) return;
+  btn.textContent = _telemetryRecording ? '⏹ REC' : '⏺ REC';
+  btn.classList.toggle('recording', _telemetryRecording);
+}
+
+async function takeSnapshot(camNum) {
+  const camNames = { 1: 'forward', 2: 'arm' };
+  try {
+    const r = await fetch(`/camera/${camNum}/snapshot?t=${Date.now()}`);
+    if (!r.ok) throw new Error(await r.text());
+    const blob = await r.blob();
+    const img = await createImageBitmap(blob);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+
+    const t = _tel;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const lines = [
+      `DreadYachet ROV — ${camNames[camNum] || camNum} cam`,
+      `Depth: ${fmtNum(t.depth_m, 2, 'm')}  Yaw: ${fmtNum(t.yaw_deg, 1, '°')}`,
+      `Roll: ${fmtNum(t.roll_deg, 1, '°')}  Pitch: ${fmtNum(t.pitch_deg, 1, '°')}`,
+      `Battery: ${fmtNum(t.battery_voltage_v, 2, 'V')}  ${fmtNum(t.battery_current_a, 1, 'A')}`,
+      `State: ${t.rx_state || '--'}  ${stamp}`,
+    ];
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, canvas.height - 28 * lines.length - 8, canvas.width, 28 * lines.length + 8);
+    ctx.fillStyle = '#00e08a';
+    ctx.font = '16px monospace';
+    lines.forEach((line, i) => {
+      ctx.fillText(line, 12, canvas.height - 28 * (lines.length - i) + 4);
+    });
+
+    canvas.toBlob((png) => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(png);
+      a.download = `rov_${camNames[camNum] || camNum}_${stamp}.png`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      toast(`Snapshot saved (${camNames[camNum]})`, 'ok');
+    }, 'image/png');
+  } catch (e) {
+    toast('Snapshot failed: ' + e.message, 'err');
+  }
+}
+
+async function refreshMissionStatus() {
+  try {
+    const r = await fetch('/api/mission_status');
+    const d = await r.json();
+    const colEl = document.getElementById('mission-colmap');
+    const crbEl = document.getElementById('mission-crabs');
+    if (colEl && d.colmap) {
+      const st = d.colmap.running ? 'RUNNING' : 'idle';
+      colEl.textContent = `COLMAP: ${st}`;
+      colEl.className = 'mission-item ' + (d.colmap.running ? 'running' : 'stopped');
+      colEl.title = d.colmap.last_line || '';
+    }
+    if (crbEl && d.crabs) {
+      const st = d.crabs.running ? 'RUNNING' : 'idle';
+      crbEl.textContent = `CRABS: ${st}`;
+      crbEl.className = 'mission-item ' + (d.crabs.running ? 'running' : 'stopped');
+      crbEl.title = d.crabs.last_line || '';
+    }
+  } catch (_) {}
+}
+
+function startMissionPoll() {
+  stopMissionPoll();
+  refreshMissionStatus();
+  _missionPollTimer = setInterval(refreshMissionStatus, 5000);
+}
+
+function stopMissionPoll() {
+  if (_missionPollTimer) { clearInterval(_missionPollTimer); _missionPollTimer = null; }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -454,6 +777,62 @@ function updateStatus() {
     ap.textContent = s.arm_running ? 'RUN' : 'STOP';
     ap.className   = 'tc-val ' + (s.arm_running ? 'good' : 'bad');
   }
+
+  if (typeof s.telemetry_recording !== 'undefined') {
+    _telemetryRecording = s.telemetry_recording;
+    updateRecordButton();
+  }
+
+  if (s.arm_last_pwm) {
+    _armLastPwm = s.arm_last_pwm;
+    updateArmCurrentDisplay();
+  }
+
+  updateLinkHealthPill(s.link_health);
+  updatePreDiveChecklist(s);
+}
+
+function updateLinkHealthPill(link) {
+  const pill = document.getElementById('pill-link');
+  if (!pill) return;
+  if (!link) {
+    pill.innerHTML = '<span class="status-dot"></span> LINK: --';
+    pill.className = 'status-pill';
+    return;
+  }
+  const label = link.level === 'ok' ? 'OK' : link.level.toUpperCase();
+  pill.innerHTML = `<span class="status-dot"></span> LINK: ${label}`;
+  pill.className = 'status-pill ' + (link.level === 'ok' ? 'ok' : link.level === 'warn' ? 'warn' : 'err');
+  pill.title = `${link.detail || ''} | tel ${link.telemetry_age_sec}s @ ${link.telemetry_rate_hz}Hz | ctrl ${link.ctrl_age_sec}s`;
+}
+
+function updatePreDiveChecklist(s) {
+  const gp = _getActiveGamepad();
+  const items = [
+    { id: 'chk-ssh', ok: s.ssh_connected },
+    { id: 'chk-mavproxy', ok: s.onboard_mavproxy },
+    { id: 'chk-stab', ok: s.onboard_stab },
+    { id: 'chk-arm-onboard', ok: s.onboard_arm },
+    { id: 'chk-cam', ok: s.onboard_cam },
+    { id: 'chk-arm-sender', ok: s.arm_running },
+    { id: 'chk-telem', ok: s.telemetry_listener_ok },
+    { id: 'chk-gamepad', ok: !!gp },
+  ];
+  items.forEach(({ id, ok }) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.className = ok ? 'ok' : '';
+    const icon = el.querySelector('.chk-icon');
+    if (icon) icon.textContent = ok ? '✓' : '○';
+  });
+}
+
+function _getActiveGamepad() {
+  const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+  for (let i = 0; i < gps.length; i++) {
+    if (gps[i]) return gps[i];
+  }
+  return null;
 }
 
 function setDot(id, running) {
@@ -508,6 +887,13 @@ function updateTelemetry() {
     stabEl.textContent = t.stabilize ? 'ON' : 'OFF';
     stabEl.className = t.stabilize ? 'val-hi' : '';
   }
+  const battCam = document.getElementById('cam-batt');
+  if (battCam) {
+    battCam.textContent = t.battery_voltage_v != null ? fmtNum(t.battery_voltage_v, 2) : '--';
+    battCam.className = _batteryClass(t.battery_voltage_v);
+  }
+
+  _checkBatteryAlerts(t.battery_voltage_v);
 
   // Telemetry bar
   const state = t.rx_state || '--';
@@ -527,6 +913,23 @@ function updateTelemetry() {
   setText('tel-vgrp',   fmtNum(t.v_group, 2));
   setText('tel-press',  t.pressure_hpa ? fmtNum(t.pressure_hpa, 0, 'hPa') : '--');
   setText('tel-temp',   t.temperature_c ? fmtNum(t.temperature_c, 1, '°C') : '--');
+
+  const battV = document.getElementById('tel-batt-v');
+  if (battV) {
+    battV.textContent = t.battery_voltage_v != null ? fmtNum(t.battery_voltage_v, 2, 'V') : '--';
+    battV.className = 'tc-val ' + _batteryTcClass(t.battery_voltage_v);
+  }
+  setText('tel-batt-a',   t.battery_current_a != null ? fmtNum(t.battery_current_a, 1, 'A') : '--');
+  setText('tel-batt-pct', t.battery_remaining_pct != null ? fmtNum(t.battery_remaining_pct, 0, '%') : '--');
+
+  const linkEl = document.getElementById('tel-link');
+  const lh = t.link_health || _status.link_health;
+  if (linkEl && lh) {
+    linkEl.textContent = lh.level === 'ok' ? 'OK' : lh.level.toUpperCase();
+    linkEl.className = 'tc-val ' + (lh.level === 'ok' ? 'good' : lh.level === 'warn' ? 'warn' : 'bad');
+    setText('tel-rate', fmtNum(lh.telemetry_rate_hz, 1, 'Hz'));
+    updateLinkHealthPill(lh);
+  }
 
   const dhEl = document.getElementById('tel-dh');
   if (dhEl) {
@@ -548,6 +951,38 @@ function updateCtrlCmdsFromTelemetry() {
 function setText(id, val) {
   const el = document.getElementById(id);
   if (el) el.textContent = val;
+}
+
+function _batteryClass(voltage) {
+  if (voltage == null) return '';
+  const warn = parseFloat(document.getElementById('cfg-battery_warn_v')?.value) || 12.0;
+  const crit = parseFloat(document.getElementById('cfg-battery_crit_v')?.value) || 11.0;
+  if (voltage <= crit) return 'val-warn';
+  if (voltage <= warn) return 'val-warn';
+  return 'val-hi';
+}
+
+function _batteryTcClass(voltage) {
+  if (voltage == null) return '';
+  const warn = parseFloat(document.getElementById('cfg-battery_warn_v')?.value) || 12.0;
+  const crit = parseFloat(document.getElementById('cfg-battery_crit_v')?.value) || 11.0;
+  if (voltage <= crit) return 'bad';
+  if (voltage <= warn) return 'warn';
+  return 'good';
+}
+
+function _checkBatteryAlerts(voltage) {
+  if (voltage == null) return;
+  const warn = parseFloat(document.getElementById('cfg-battery_warn_v')?.value) || 12.0;
+  const crit = parseFloat(document.getElementById('cfg-battery_crit_v')?.value) || 11.0;
+  let level = '';
+  if (voltage <= crit) level = 'crit';
+  else if (voltage <= warn) level = 'warn';
+  if (!level || level === _lastBatteryToast) return;
+  _lastBatteryToast = level;
+  if (level === 'crit') toast(`LOW BATTERY ${voltage.toFixed(2)}V — critical`, 'err');
+  else toast(`Battery low ${voltage.toFixed(2)}V`, 'warn');
+  if (voltage > warn) _lastBatteryToast = '';
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1215,6 +1650,20 @@ function setCameraView(mode) {
   });
 
   resizeHUDs();
+  requestAnimationFrame(() => {
+    const control = document.getElementById('control');
+    if (!control || !control.classList.contains('active')) return;
+    const showForward = mode !== 'arm';
+    const showArm = mode !== 'forward';
+    const cam1 = document.getElementById('cam1');
+    const cam2 = document.getElementById('cam2');
+    if (showForward && cam1 && cam1.style.display !== 'block') {
+      setupCamera('cam1', 'no-sig-1', 1);
+    }
+    if (showArm && cam2 && cam2.style.display !== 'block') {
+      setTimeout(() => setupCamera('cam2', 'no-sig-2', 2), 300);
+    }
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1222,43 +1671,140 @@ function setCameraView(mode) {
 // ─────────────────────────────────────────────────────────────
 // UI slot → config URL field (matches rov_ui.py _CAMERA_UI_URL_KEY)
 const _CAMERA_CFG_KEY = { 1: 'forward_camera_url', 2: 'arm_camera_url' };
+const _cameraState = {};
+let _camResizeBound = false;
+
+function cameraDirectUrl(camNum) {
+  const cfgKey = _CAMERA_CFG_KEY[camNum];
+  const el = cfgKey ? document.getElementById('cfg-' + cfgKey) : null;
+  return el ? el.value.trim() : '';
+}
+
+function stopCamera(camNum) {
+  const st = _cameraState[camNum];
+  if (!st) return;
+  st.active = false;
+  if (st.retryT) { clearTimeout(st.retryT); st.retryT = null; }
+  if (st.watchdogT) { clearTimeout(st.watchdogT); st.watchdogT = null; }
+  if (st.img) {
+    st.img.onload = null;
+    st.img.onerror = null;
+    st.img.removeAttribute('src');
+    st.img.style.display = 'none';
+  }
+  delete _cameraState[camNum];
+}
+
+function stopAllCameras() {
+  stopCamera(1);
+  stopCamera(2);
+}
 
 function setupCamera(imgId, noSigId, camNum) {
-  const img   = document.getElementById(imgId);
+  stopCamera(camNum);
+
+  const img = document.getElementById(imgId);
   const noSig = document.getElementById(noSigId);
-  let retryT  = null;
-  let failCount = 0;
+  if (!img || !noSig) return;
 
-  function directUrl() {
-    const cfgKey = _CAMERA_CFG_KEY[camNum];
-    const el = cfgKey ? document.getElementById('cfg-' + cfgKey) : null;
-    return el ? el.value.trim() : '';
-  }
-
-  function load() {
-    img.src = `/camera/${camNum}?t=${Date.now()}`;
-  }
-
-  img.onload = () => {
-    failCount = 0;
-    noSig.style.display = 'none';
-    img.style.display   = 'block';
+  const st = {
+    img, noSig, camNum,
+    retryT: null,
+    watchdogT: null,
+    failCount: 0,
+    active: true,
+    lastLoad: 0,
   };
+  _cameraState[camNum] = st;
 
-  img.onerror = () => {
-    failCount++;
+  function showNoSignal() {
     noSig.style.display = 'flex';
-    img.style.display   = 'none';
+    img.style.display = 'none';
     const nsText = noSig.querySelector('.ns-text');
     if (nsText) {
-      const upstream = directUrl() || 'not configured';
+      const upstream = cameraDirectUrl(camNum) || 'not configured';
       const camNames = { 1: 'Forward Camera', 2: 'Arm Camera' };
       const camLabel = camNames[camNum] || `Cam ${camNum}`;
       nsText.textContent = `No Signal — ${camLabel} (upstream ${upstream})`;
     }
-    if (!retryT) { retryT = setTimeout(() => { retryT = null; load(); }, 5000); }
-  };
-  load();
+  }
+
+  function onSuccess() {
+    if (!st.active) return;
+    st.failCount = 0;
+    if (st.watchdogT) { clearTimeout(st.watchdogT); st.watchdogT = null; }
+    noSig.style.display = 'none';
+    img.style.display = 'block';
+  }
+
+  function scheduleRetry() {
+    if (!st.active || st.retryT) return;
+    const delay = Math.min(8000, 800 + st.failCount * 700);
+    st.retryT = setTimeout(() => {
+      st.retryT = null;
+      loadStream(true);
+    }, delay);
+  }
+
+  function onFail() {
+    if (!st.active) return;
+    st.failCount++;
+    showNoSignal();
+    scheduleRetry();
+  }
+
+  function loadStream(forceReconnect) {
+    if (!st.active) return;
+    const control = document.getElementById('control');
+    if (!control || !control.classList.contains('active')) return;
+
+    st.lastLoad = Date.now();
+    if (forceReconnect) {
+      img.onload = null;
+      img.onerror = null;
+      img.removeAttribute('src');
+    }
+
+    const attach = () => {
+      if (!st.active) return;
+      img.onload = onSuccess;
+      img.onerror = onFail;
+      img.src = `/camera/${camNum}?t=${Date.now()}`;
+      if (st.watchdogT) clearTimeout(st.watchdogT);
+      st.watchdogT = setTimeout(() => {
+        st.watchdogT = null;
+        if (!st.active || img.style.display === 'block') return;
+        loadStream(true);
+      }, 12000);
+    };
+
+    if (forceReconnect && img.src) {
+      requestAnimationFrame(attach);
+    } else {
+      attach();
+    }
+  }
+
+  showNoSignal();
+  loadStream(false);
+}
+
+function startAllCameras() {
+  stopAllCameras();
+  setupCamera('cam1', 'no-sig-1', 1);
+  setTimeout(() => setupCamera('cam2', 'no-sig-2', 2), 450);
+}
+
+function bindCameraResize() {
+  if (_camResizeBound) return;
+  window.addEventListener('resize', resizeHUDs);
+  _camResizeBound = true;
+}
+
+function unbindCameraResize() {
+  if (!_camResizeBound) return;
+  window.removeEventListener('resize', resizeHUDs);
+  _camResizeBound = false;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1322,24 +1868,31 @@ async function openControl() {
   _doOpenControl();
 }
 
-function _doOpenControl() {
-  saveConfig();
+async function _doOpenControl() {
+  await saveConfig();
   activateGamepad();
   document.getElementById('launch').classList.remove('active');
   document.getElementById('control').classList.add('active');
-  setupCamera('cam1', 'no-sig-1', 1);
-  setupCamera('cam2', 'no-sig-2', 2);
+  bindCameraResize();
   setCameraView(_cameraView);
-  window.addEventListener('resize', resizeHUDs);
-  resizeHUDs();
   startHUDLoop();
   _updateGamepadPill();
+  loadArmPresets();
+  startMissionPoll();
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      startAllCameras();
+      resizeHUDs();
+    });
+  });
 }
 
 function showLaunch() {
+  stopAllCameras();
+  stopMissionPoll();
   document.getElementById('control').classList.remove('active');
   document.getElementById('launch').classList.add('active');
-  window.removeEventListener('resize', resizeHUDs);
+  unbindCameraResize();
 }
 
 function resizeHUDs() {
@@ -1378,7 +1931,10 @@ let _logOpen       = false;
 let _logRefreshTimer = null;
 
 // Map JS log name → API endpoint name for onboard (Pi-side) logs
-const _onboardLogNames = { onboard_stab: 'stab', onboard_arm: 'arm', onboard_cam: 'cam' };
+const _onboardLogNames = {
+  onboard_stab: 'stab', onboard_arm: 'arm', onboard_cam: 'cam',
+  colmap: 'colmap', crabs: 'crabs',
+};
 
 function toggleLog() {
   _logOpen = !_logOpen;
@@ -1393,7 +1949,10 @@ function toggleLog() {
 
 function switchLog(name) {
   _currentLog = name;
-  const tabMap = { arm: 'lt-arm', onboard_stab: 'lt-stab', onboard_arm: 'lt-arm2', onboard_cam: 'lt-cam' };
+  const tabMap = {
+    arm: 'lt-arm', onboard_stab: 'lt-stab', onboard_arm: 'lt-arm2',
+    onboard_cam: 'lt-cam', colmap: 'lt-colmap', crabs: 'lt-crabs',
+  };
   Object.entries(tabMap).forEach(([n, id]) => {
     const el = document.getElementById(id);
     if (el) el.classList.toggle('active', n === name);
@@ -1454,17 +2013,6 @@ function appendLogLine(line) {
   content.scrollTop = content.scrollHeight;
 }
 
-function appendLogLine(line) {
-  if (!_logOpen) return;
-  const content = document.getElementById('log-content');
-  const div = document.createElement('div');
-  div.className   = 'log-line';
-  div.textContent = line;
-  content.appendChild(div);
-  if (content.children.length > 300) content.removeChild(content.firstChild);
-  content.scrollTop = content.scrollHeight;
-}
-
 function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
@@ -1488,7 +2036,11 @@ function toast(msg, type='') {
 // ─────────────────────────────────────────────────────────────
 // INIT
 // ─────────────────────────────────────────────────────────────
-window.addEventListener('load', () => {
+window.addEventListener('load', async () => {
+  await loadConfig();
+  buildArmPwmGrid();
+  loadArmPresets();
+
   // Auto-detect Windows serial port default
   if (navigator.platform.includes('Win') || navigator.userAgent.includes('Windows')) {
     const sp = document.getElementById('cfg-serial_port');

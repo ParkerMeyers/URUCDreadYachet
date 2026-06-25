@@ -94,6 +94,28 @@ _ctrl_keepalive_seq = 0
 # DEFAULT CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
+ARM_JOINT_NAMES = ["J1", "J2", "J3", "J4", "J5", "J6", "Claw"]
+ARM_PWM_MIN = 500
+ARM_PWM_MAX = 2500
+
+DEFAULT_ARM_PRESETS = {
+    "stow": {
+        "label": "Stow",
+        "pwm": [1500, 1500, 1500, 1500, 1500, 1500, 1500],
+        "j6_angle": 0.0,
+    },
+    "sample": {
+        "label": "Sample",
+        "pwm": [1600, 1400, 1550, 1500, 1450, 1500, 1500],
+        "j6_angle": 15.0,
+    },
+    "deploy_claw": {
+        "label": "Claw",
+        "pwm": [1500, 1500, 1500, 1500, 1500, 1500, 2000],
+        "j6_angle": 0.0,
+    },
+}
+
 DEFAULT_CONFIG = {
     "pi_ip":               "192.168.69.100",
     "pi_user":             "uruc",
@@ -111,11 +133,21 @@ DEFAULT_CONFIG = {
     "mosfet_control_port": 5007,
     "colmap_command":      "python3 colmap_run.py",
     "crabs_command":       "python3 crabs.py",
+    "battery_warn_v":      12.0,
+    "battery_crit_v":      11.0,
     "mavproxy_bin":        "/home/uruc/mav_env/bin/mavproxy.py",
     "mavproxy_serial":     "/dev/ttyACM0",
     "mavproxy_baud":       "115200",
     "mavproxy_out1":       "udp:192.168.69.2:14550",
     "mavproxy_out2":       "tcpin:127.0.0.1:5762",  # onboard: stab + arm (TCP)
+    "arm_presets": {
+        k: {
+            "label": v["label"],
+            "pwm": list(v["pwm"]),
+            "j6_angle": float(v["j6_angle"]),
+        }
+        for k, v in DEFAULT_ARM_PRESETS.items()
+    },
 }
 
 # Must match onboard/mavlink_rc.py MAVLINK_ONBOARD tcp port.
@@ -145,13 +177,153 @@ def normalize_onboard_config():
     """Force the onboard MAVProxy output to TCP — scripts connect to tcp:127.0.0.1:5762."""
     global config
     normalize_camera_config()
+    normalize_arm_presets()
     out2 = str(config.get("mavproxy_out2", "")).strip()
     if "tcpin" not in out2.lower() or str(MAVPROXY_TCP_PORT) not in out2:
         config["mavproxy_out2"] = MAVPROXY_ONBOARD_OUT
 
 
+def _slug_preset_name(name: str) -> str:
+    slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(name).strip().lower())
+    slug = slug.strip("_")
+    return slug or "preset"
+
+
+def _clamp_arm_pwm(value) -> int:
+    return int(max(ARM_PWM_MIN, min(ARM_PWM_MAX, int(round(float(value))))))
+
+
+def _preset_to_csv(preset: dict) -> str:
+    pwms = [_clamp_arm_pwm(v) for v in preset["pwm"][:7]]
+    while len(pwms) < 7:
+        pwms.append(1500)
+    angle = float(preset.get("j6_angle", 0.0))
+    return ",".join(str(x) for x in pwms) + f",{angle:.2f}"
+
+
+def _normalize_preset_entry(raw) -> dict | None:
+    if isinstance(raw, str):
+        parts = raw.replace("PWM:", "").split(",")
+        if len(parts) < 7:
+            return None
+        try:
+            pwms = [_clamp_arm_pwm(x) for x in parts[:7]]
+            angle = float(parts[7]) if len(parts) >= 8 else 0.0
+            return {"label": "Preset", "pwm": pwms, "j6_angle": angle}
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    pwm_in = raw.get("pwm", [])
+    if not isinstance(pwm_in, (list, tuple)) or len(pwm_in) < 7:
+        return None
+    try:
+        pwms = [_clamp_arm_pwm(x) for x in pwm_in[:7]]
+        angle = float(raw.get("j6_angle", 0.0))
+    except (TypeError, ValueError):
+        return None
+    label = str(raw.get("label") or raw.get("name") or "Preset").strip() or "Preset"
+    return {"label": label, "pwm": pwms, "j6_angle": angle}
+
+
+def normalize_arm_presets():
+    """Ensure arm_presets in config is a valid name → preset dict map."""
+    global config
+    raw = config.get("arm_presets")
+    cleaned = {}
+    if isinstance(raw, dict):
+        for name, entry in raw.items():
+            slug = _slug_preset_name(name)
+            norm = _normalize_preset_entry(entry)
+            if norm:
+                if not norm["label"] or norm["label"] == "Preset":
+                    norm["label"] = slug.replace("_", " ").title()
+                cleaned[slug] = norm
+    if not cleaned:
+        cleaned = {
+            k: {
+                "label": v["label"],
+                "pwm": list(v["pwm"]),
+                "j6_angle": float(v["j6_angle"]),
+            }
+            for k, v in DEFAULT_ARM_PRESETS.items()
+        }
+    config["arm_presets"] = cleaned
+
+
+def _parse_arm_sent_line(line: str) -> dict | None:
+    text = line.strip()
+    if not text or text.startswith("BAD "):
+        return None
+    if "SENT:" in text:
+        text = text.split("SENT:", 1)[1].strip()
+    elif text.startswith("RAW:"):
+        return None
+    if text.startswith("PWM:"):
+        text = text[4:]
+    parts = text.split(",")
+    if len(parts) < 7:
+        return None
+    try:
+        pwms = [_clamp_arm_pwm(x) for x in parts[:7]]
+        angle = float(parts[7]) if len(parts) >= 8 else 0.0
+        return {"pwm": pwms, "j6_angle": angle}
+    except (TypeError, ValueError):
+        return None
+
+
+def _send_arm_csv(csv_line: str):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(
+            csv_line.encode("utf-8"),
+            (config["pi_ip"], int(config["arm_udp_port"])),
+        )
+    finally:
+        sock.close()
+
+
 config = DEFAULT_CONFIG.copy()
-normalize_camera_config()
+normalize_onboard_config()
+
+CONFIG_PATH = ROV_ROOT / "rov_config.json"
+
+TELEMETRY_CSV_FIELDS = [
+    "time", "state", "depth_m", "hold_depth_m", "yaw_deg", "roll_deg", "pitch_deg",
+    "battery_voltage_v", "battery_current_a", "battery_remaining_pct",
+    "pressure_hpa", "pressure_temperature_c", "stabilize",
+    "depth_hold_active", "yaw_hold_active", "gain_percent",
+    "control_timeout", "mavlink_link_dead",
+]
+
+
+def load_config_file():
+    """Load persisted config from disk if present."""
+    global config
+    if not CONFIG_PATH.is_file():
+        return
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        for k, v in data.items():
+            if k in config:
+                config[k] = v
+        normalize_onboard_config()
+    except Exception as e:
+        print(f"[WARN] Could not load {CONFIG_PATH}: {e}")
+
+
+def save_config_file():
+    """Persist current config to disk."""
+    try:
+        CONFIG_PATH.write_text(
+            json.dumps(config, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"[WARN] Could not save {CONFIG_PATH}: {e}")
+
+
+load_config_file()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,9 +343,14 @@ STATE = {
     "mosfet_on":           False,
     "last_telemetry_time": 0.0,
     "telemetry_packets":   0,
+    "telemetry_rate_hz":   0.0,
+    "last_ctrl_time":      0.0,
     "telemetry_listener_ok": False,
+    "telemetry_recording":   False,
+    "telemetry_record_file": "",
     "onboard_starting":      False,
     "onboard_progress":      [],
+    "arm_last_pwm":          None,
     "telemetry": {
         "rx_state":                "NO_TELEMETRY",
         "gain_percent":            100,
@@ -196,6 +373,16 @@ STATE = {
         "v_group":                 0.0,
         "pressure_hpa":            None,
         "temperature_c":           None,
+        "battery_voltage_v":       None,
+        "battery_current_a":       None,
+        "battery_remaining_pct":   None,
+        "battery_consumed_mah":    None,
+        "control_timeout":         False,
+        "attitude_stale":          False,
+        "depth_stale":             False,
+        "mavlink_link_dead":       False,
+        "mavlink_last_rx_age_sec": None,
+        "attitude_age_sec":        None,
         "depth_recapture_pending": False,
         "yaw_recapture_pending":   False,
     },
@@ -205,11 +392,16 @@ STATE = {
         "onboard_stab": [],
         "onboard_arm":  [],
         "onboard_cam":  [],
+        "colmap":       [],
+        "crabs":        [],
     },
 }
 
 _state_lock = threading.Lock()
+_telemetry_record_lock = threading.Lock()
+_telemetry_rate_counter = {"count": 0, "window_start": time.time()}
 MAX_LOG_LINES = 200
+LOGS_DIR = ROV_ROOT / "logs"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SSH MANAGER
@@ -766,6 +958,10 @@ def _drain_process_output(name: str, proc: subprocess.Popen):
             log_list.append(line)
             if len(log_list) > MAX_LOG_LINES:
                 del log_list[:-MAX_LOG_LINES]
+            if name == "arm":
+                parsed = _parse_arm_sent_line(line)
+                if parsed:
+                    STATE["arm_last_pwm"] = parsed
 
         socketio.emit("process_log", {"name": name, "line": line})
 
@@ -888,11 +1084,102 @@ def _update_telemetry_from_json(pkt: dict):
     tel["v_group"]                 = float(pkt.get("vertical_group", 0.0))
     tel["pressure_hpa"]            = pkt.get("pressure_hpa")
     tel["temperature_c"]           = pkt.get("pressure_temperature_c")
+    tel["battery_voltage_v"]       = pkt.get("battery_voltage_v")
+    tel["battery_current_a"]       = pkt.get("battery_current_a")
+    tel["battery_remaining_pct"]   = pkt.get("battery_remaining_pct")
+    tel["battery_consumed_mah"]    = pkt.get("battery_consumed_mah")
+    tel["control_timeout"]         = bool(pkt.get("control_timeout", False))
+    tel["attitude_stale"]          = bool(pkt.get("attitude_stale", False))
+    tel["depth_stale"]             = bool(pkt.get("depth_stale", False))
+    tel["mavlink_link_dead"]       = bool(pkt.get("mavlink_link_dead", False))
+    tel["mavlink_last_rx_age_sec"] = pkt.get("mavlink_last_rx_age_sec")
+    tel["attitude_age_sec"]        = pkt.get("attitude_age_sec")
     tel["depth_recapture_pending"] = bool(pkt.get("depth_recapture_pending", False))
     tel["yaw_recapture_pending"]   = bool(pkt.get("yaw_recapture_pending", False))
-    STATE["last_telemetry_time"]   = time.time()
-    STATE["telemetry_packets"]     = STATE.get("telemetry_packets", 0) + 1
-    socketio.emit("telemetry", dict(tel))
+
+    now = time.time()
+    STATE["last_telemetry_time"] = now
+    STATE["telemetry_packets"]   = STATE.get("telemetry_packets", 0) + 1
+
+    _telemetry_rate_counter["count"] += 1
+    elapsed = now - _telemetry_rate_counter["window_start"]
+    if elapsed >= 1.0:
+        STATE["telemetry_rate_hz"] = round(_telemetry_rate_counter["count"] / elapsed, 1)
+        _telemetry_rate_counter["count"] = 0
+        _telemetry_rate_counter["window_start"] = now
+
+    _append_telemetry_record(pkt)
+    payload = dict(tel)
+    payload["link_health"] = _compute_link_health()
+    socketio.emit("telemetry", payload)
+
+
+def _append_telemetry_record(pkt: dict):
+    """Append one telemetry row to the active CSV black-box file."""
+    if not STATE.get("telemetry_recording"):
+        return
+    path = STATE.get("telemetry_record_file")
+    if not path:
+        return
+    record = dict(pkt)
+    record.setdefault("gain_percent", STATE["telemetry"].get("gain_percent"))
+    row = []
+    for key in TELEMETRY_CSV_FIELDS:
+        val = record.get(key)
+        if val is None and key == "pressure_temperature_c":
+            val = record.get("pressure_temperature_c")
+        if val is None:
+            row.append("")
+        elif isinstance(val, bool):
+            row.append("1" if val else "0")
+        else:
+            row.append(str(val))
+    line = ",".join(row) + "\n"
+    try:
+        with _telemetry_record_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception as e:
+        print(f"[WARN] Telemetry record write failed: {e}")
+
+
+def _compute_link_health() -> dict:
+    """Composite link health from telemetry + control path."""
+    tel = STATE["telemetry"]
+    tel_age = time.time() - STATE["last_telemetry_time"]
+    ctrl_age = time.time() - STATE.get("last_ctrl_time", 0.0)
+
+    level = "ok"
+    detail_parts = []
+
+    if tel_age > 2.0 or tel.get("rx_state") == "NO_TELEMETRY":
+        level = "err"
+        detail_parts.append(f"telem {tel_age:.1f}s")
+    elif tel.get("control_timeout") or tel.get("rx_state") not in ("OK", None):
+        level = "warn" if level == "ok" else level
+        detail_parts.append(tel.get("rx_state", "fault"))
+
+    if tel.get("mavlink_link_dead"):
+        level = "err"
+        detail_parts.append("mavlink dead")
+    elif tel.get("attitude_stale") or tel.get("depth_stale"):
+        level = "warn" if level == "ok" else level
+        if tel.get("attitude_stale"):
+            detail_parts.append("IMU stale")
+        if tel.get("depth_stale"):
+            detail_parts.append("depth stale")
+
+    if ctrl_age > 1.5:
+        level = "warn" if level == "ok" else level
+        detail_parts.append(f"ctrl {ctrl_age:.1f}s")
+
+    return {
+        "level": level,
+        "detail": " · ".join(detail_parts) if detail_parts else "OK",
+        "telemetry_age_sec": round(tel_age, 2),
+        "ctrl_age_sec": round(ctrl_age, 2),
+        "telemetry_rate_hz": STATE.get("telemetry_rate_hz", 0.0),
+    }
 
 
 def _start_telemetry_listener():
@@ -990,11 +1277,13 @@ def _monitor_loop():
                 STATE["onboard_mavproxy"] = status["mavproxy"]
                 STATE["onboard_stab"]     = status["stab"]
                 STATE["onboard_arm"]      = status["arm"]
+                STATE["onboard_cam"]      = status["cam"]
             else:
                 STATE["ssh_connected"]    = False
                 STATE["onboard_mavproxy"] = False
                 STATE["onboard_stab"]     = False
                 STATE["onboard_arm"]      = False
+                STATE["onboard_cam"]      = False
                 # Auto-reconnect only if the user had a working session before.
                 if _ssh_was_connected:
                     _trigger_ssh_reconnect()
@@ -1009,6 +1298,7 @@ def _monitor_loop():
 def emit_status():
     with _state_lock:
         progress = list(STATE["onboard_progress"])
+    link = _compute_link_health()
     socketio.emit("status", {
         "thrust_running":        STATE["thrust_running"],
         "arm_running":           STATE["arm_running"],
@@ -1023,6 +1313,10 @@ def emit_status():
         "telemetry_listener_ok": STATE["telemetry_listener_ok"],
         "onboard_starting":      STATE["onboard_starting"],
         "onboard_progress":      progress,
+        "telemetry_recording":   STATE["telemetry_recording"],
+        "telemetry_record_file": STATE.get("telemetry_record_file", ""),
+        "link_health":           link,
+        "arm_last_pwm":          STATE.get("arm_last_pwm"),
     })
 
 
@@ -1066,6 +1360,28 @@ def camera_stream(cam_num):
     return Response(stream_with_context(_gen()), mimetype=content_type)
 
 
+@app.route("/camera/<int:cam_num>/snapshot")
+def camera_snapshot(cam_num):
+    if cam_num not in (1, 2):
+        return "", 404
+    if not HAVE_REQUESTS:
+        return jsonify({"ok": False, "msg": "requests not installed"}), 503
+
+    url_key = _CAMERA_UI_URL_KEY.get(cam_num, f"camera{cam_num}_url")
+    base = str(config.get(url_key, "")).rstrip("/")
+    if not base:
+        return "", 404
+
+    snap_url = f"{base}/snapshot"
+    try:
+        r = _requests.get(snap_url, timeout=5)
+        r.raise_for_status()
+        ctype = r.headers.get("Content-Type", "image/jpeg")
+        return Response(r.content, mimetype=ctype)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 502
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FLASK API ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1093,6 +1409,7 @@ def api_config():
             if k in config:
                 config[k] = v
         normalize_onboard_config()
+        save_config_file()
         return jsonify({"ok": True, "config": config})
     normalize_onboard_config()
     return jsonify(config)
@@ -1442,6 +1759,127 @@ def api_crabs():
     return jsonify({"ok": ok, "msg": msg})
 
 
+def _mission_script_status(name: str, cmd_fragment: str) -> dict:
+    """Check if a mission script process is running and return log tail."""
+    if not ssh.is_connected():
+        return {"running": False, "log_tail": "", "last_line": ""}
+    out, _, _ = ssh.exec(
+        f"pgrep -f '{cmd_fragment}' >/dev/null 2>&1 && echo running || echo stopped"
+    )
+    running = "running" in (out or "")
+    log_tail = ssh.get_onboard_log(name, lines=12)
+    lines = [ln for ln in (log_tail or "").splitlines() if ln.strip()]
+    return {
+        "running": running,
+        "log_tail": log_tail or "",
+        "last_line": lines[-1] if lines else "",
+    }
+
+
+@app.route("/api/mission_status")
+def api_mission_status():
+    colmap_cmd = Path(config.get("colmap_command", "colmap_run.py")).name
+    crabs_cmd = Path(config.get("crabs_command", "crabs.py")).name
+    return jsonify({
+        "colmap": _mission_script_status("colmap", colmap_cmd),
+        "crabs":  _mission_script_status("crabs", crabs_cmd),
+    })
+
+
+@app.route("/api/arm_presets", methods=["GET"])
+def api_arm_presets_list():
+    normalize_arm_presets()
+    with _state_lock:
+        current = STATE.get("arm_last_pwm")
+    return jsonify({
+        "ok": True,
+        "presets": config.get("arm_presets", {}),
+        "current": current,
+        "joint_names": ARM_JOINT_NAMES,
+    })
+
+
+@app.route("/api/arm_presets", methods=["POST"])
+def api_arm_presets_save():
+    data = request.get_json(force=True) or {}
+    name = _slug_preset_name(data.get("name", ""))
+    if not name:
+        return jsonify({"ok": False, "msg": "Preset name required"}), 400
+
+    pwm_in = data.get("pwm")
+    if not isinstance(pwm_in, (list, tuple)) or len(pwm_in) < 7:
+        return jsonify({"ok": False, "msg": "Need 7 PWM values (J1–Claw)"}), 400
+
+    try:
+        preset = {
+            "label": str(data.get("label") or name.replace("_", " ").title()).strip(),
+            "pwm": [_clamp_arm_pwm(x) for x in pwm_in[:7]],
+            "j6_angle": float(data.get("j6_angle", 0.0)),
+        }
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "Invalid PWM or J6 angle"}), 400
+
+    normalize_arm_presets()
+    config["arm_presets"][name] = preset
+    save_config_file()
+    return jsonify({"ok": True, "name": name, "preset": preset})
+
+
+@app.route("/api/arm_presets/<name>", methods=["DELETE"])
+def api_arm_presets_delete(name):
+    slug = _slug_preset_name(name)
+    normalize_arm_presets()
+    if slug not in config.get("arm_presets", {}):
+        return jsonify({"ok": False, "msg": f"Unknown preset: {name}"}), 404
+    del config["arm_presets"][slug]
+    save_config_file()
+    return jsonify({"ok": True, "name": slug})
+
+
+@app.route("/api/arm_preset/<name>", methods=["POST"])
+def api_arm_preset(name):
+    normalize_arm_presets()
+    preset = config.get("arm_presets", {}).get(_slug_preset_name(name))
+    if not preset:
+        return jsonify({"ok": False, "msg": f"Unknown preset: {name}"}), 404
+    try:
+        csv_line = _preset_to_csv(preset)
+        _send_arm_csv(csv_line)
+        return jsonify({
+            "ok": True,
+            "msg": f"Sent arm preset '{name}'",
+            "preset": name,
+            "csv": csv_line,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/telemetry_record", methods=["POST"])
+def api_telemetry_record():
+    data = request.get_json(force=True) or {}
+    action = data.get("action", "toggle")
+
+    if action == "start" or (action == "toggle" and not STATE["telemetry_recording"]):
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = LOGS_DIR / f"dive_{stamp}.csv"
+        header = ",".join(TELEMETRY_CSV_FIELDS) + "\n"
+        try:
+            path.write_text(header, encoding="utf-8")
+        except Exception as e:
+            return jsonify({"ok": False, "msg": str(e)}), 500
+        STATE["telemetry_recording"] = True
+        STATE["telemetry_record_file"] = str(path)
+        emit_status()
+        return jsonify({"ok": True, "recording": True, "file": str(path)})
+
+    STATE["telemetry_recording"] = False
+    prev = STATE.get("telemetry_record_file", "")
+    emit_status()
+    return jsonify({"ok": True, "recording": False, "file": prev})
+
+
 @app.route("/api/status")
 def api_status():
     with _state_lock:
@@ -1460,6 +1898,10 @@ def api_status():
         "onboard_starting":      STATE["onboard_starting"],
         "onboard_progress":      progress,
         "telemetry":             STATE["telemetry"],
+        "telemetry_recording":   STATE["telemetry_recording"],
+        "telemetry_record_file": STATE.get("telemetry_record_file", ""),
+        "link_health":           _compute_link_health(),
+        "arm_last_pwm":          STATE.get("arm_last_pwm"),
     })
 
 
@@ -1529,6 +1971,7 @@ def _apply_browser_ctrl(data: dict):
     with _ctrl_lock:
         _last_browser_ctrl = data
         _last_browser_ctrl_time = time.time()
+    STATE["last_ctrl_time"] = time.time()
     _forward_ctrl_to_pi(data)
 
 

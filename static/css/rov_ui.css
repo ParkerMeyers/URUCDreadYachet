@@ -127,6 +127,45 @@ html,body { height:100%; background:var(--bg); color:var(--text);
   filter:none; transform:none; border-color:var(--border2); color:var(--text);
 }
 
+/* ── pre-dive checklist ── */
+.checklist-panel {
+  width:100%; max-width:900px; margin:16px auto 0;
+  padding:14px 18px; background:var(--bg2); border:1px solid var(--border);
+  border-radius:10px;
+}
+.checklist-panel h3 {
+  font-size:0.85rem; color:var(--dim); margin-bottom:10px;
+  text-transform:uppercase; letter-spacing:0.8px;
+}
+.checklist { list-style:none; display:grid; grid-template-columns:1fr 1fr; gap:6px 20px; }
+.checklist li {
+  font-size:0.78rem; font-family:var(--mono); color:var(--dim);
+  display:flex; align-items:center; gap:8px;
+}
+.checklist li.ok { color:var(--green); }
+.checklist li.warn { color:var(--amber); }
+.checklist li .chk-icon { width:14px; text-align:center; }
+
+/* ── mission status bar ── */
+.mission-bar {
+  display:flex; align-items:center; gap:16px; padding:4px 12px;
+  background:var(--bg2); border-top:1px solid var(--border);
+  font-family:var(--mono); font-size:0.72rem; flex-shrink:0;
+}
+.mission-label { color:var(--dim); text-transform:uppercase; letter-spacing:0.6px; }
+.mission-item { color:var(--text); }
+.mission-item.running { color:var(--green); }
+.mission-item.stopped { color:var(--dim); }
+
+.action-btn.recording {
+  border-color:var(--red); color:var(--red);
+  animation:pulse-rec 1.2s ease-in-out infinite;
+}
+@keyframes pulse-rec {
+  0%, 100% { opacity:1; }
+  50% { opacity:0.55; }
+}
+
 /* ── ssh status pill ── */
 .ssh-badge {
   display:inline-flex; align-items:center; gap:6px;
@@ -415,6 +454,46 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 }
 .layout-btn.active { border-color:var(--accent); color:var(--accent); background:rgba(0,212,255,.1); }
 .layout-btn:hover  { border-color:var(--text); color:var(--text); }
+
+/* ── arm presets ── */
+.arm-preset-btns { display:flex; gap:4px; flex-wrap:wrap; max-width:280px; }
+.arm-presets-box { width:min(920px,96vw); }
+.arm-presets-layout {
+  display:grid; grid-template-columns:minmax(200px, 1fr) minmax(280px, 1.4fr);
+  gap:20px;
+}
+@media(max-width:760px){ .arm-presets-layout { grid-template-columns:1fr; } }
+.arm-presets-list-panel h3,
+.arm-presets-edit-panel h3 {
+  font-size:0.72rem; text-transform:uppercase; letter-spacing:1px;
+  color:var(--accent2); margin-bottom:10px;
+}
+.arm-preset-list { display:flex; flex-direction:column; gap:6px; max-height:360px; overflow-y:auto; }
+.arm-preset-row {
+  display:flex; align-items:center; gap:6px; padding:8px 10px;
+  background:var(--bg3); border:1px solid var(--border); border-radius:8px;
+}
+.arm-preset-row-name { flex:1; font-size:0.82rem; font-weight:600; }
+.arm-preset-row-meta { font-size:0.68rem; color:var(--dim); font-family:var(--mono); }
+.arm-preset-row-actions { display:flex; gap:4px; flex-shrink:0; }
+.arm-preset-row-actions button {
+  padding:3px 8px; font-size:0.68rem; border-radius:4px;
+  border:1px solid var(--border2); background:var(--bg2); color:var(--text); cursor:pointer;
+}
+.arm-preset-row-actions button:hover { border-color:var(--accent); color:var(--accent); }
+.arm-preset-row-actions button.danger:hover { border-color:var(--red); color:var(--red); }
+.arm-pwm-grid {
+  display:grid; grid-template-columns:repeat(4, 1fr); gap:8px; margin-bottom:10px;
+}
+@media(max-width:500px){ .arm-pwm-grid { grid-template-columns:repeat(2, 1fr); } }
+.arm-pwm-grid .field { margin:0; }
+.arm-pwm-grid .field label { font-size:0.65rem; margin-bottom:2px; }
+.arm-pwm-grid .field input { padding:6px 8px; font-size:0.8rem; }
+.arm-preset-current {
+  font-family:var(--mono); font-size:0.72rem; color:var(--dim);
+  margin:8px 0 12px; line-height:1.5;
+}
+.arm-preset-form-actions { display:flex; gap:8px; flex-wrap:wrap; }
 
 /* Gamepad diagram */
 .gp-diagram {

@@ -1,0 +1,53 @@
+{
+  "arm_camera_url": "http://192.168.69.100:8160",
+  "arm_presets": {
+    "sample": {
+      "j6_angle": 15.0,
+      "label": "Sample",
+      "pwm": [
+        1600,
+        1400,
+        1550,
+        1500,
+        1450,
+        1500,
+        1500
+      ]
+    },
+    "stow": {
+      "j6_angle": 0.0,
+      "label": "Stow",
+      "pwm": [
+        1500,
+        1500,
+        1500,
+        1500,
+        1500,
+        1500,
+        1500
+      ]
+    }
+  },
+  "arm_udp_port": "5006",
+  "battery_crit_v": "11.0",
+  "battery_warn_v": "12.0",
+  "camera0_device": "/dev/video0",
+  "camera1_device": "/dev/video2",
+  "colmap_command": "python3 colmap_run.py",
+  "crabs_command": "python3 crabs.py",
+  "forward_camera_url": "http://192.168.69.100:8161",
+  "mavproxy_baud": "115200",
+  "mavproxy_bin": "/home/uruc/mav_env/bin/mavproxy.py",
+  "mavproxy_out1": "udp:192.168.69.2:14550",
+  "mavproxy_out2": "tcpin:127.0.0.1:5762",
+  "mavproxy_serial": "/dev/ttyACM0",
+  "mosfet_control_port": "5007",
+  "pi_ip": "192.168.69.100",
+  "pi_password": "yahboom",
+  "pi_rov_path": "/home/uruc/URUCDreadYachet",
+  "pi_ssh_port": "22",
+  "pi_user": "uruc",
+  "serial_port": "COM3",
+  "telemetry_port": "5006",
+  "thrust_udp_port": "5005"
+}
