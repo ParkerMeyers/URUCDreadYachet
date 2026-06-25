@@ -1998,7 +1998,6 @@ let _localCmds = { forward: 0, lateral: 0, yaw: 0, vertical: 0 };
 let _btnPrev       = [];
 let _dpadUpPrev    = false;
 let _dpadDownPrev  = false;
-let _lastSendMs    = 0;
 
 function _applyDeadzone(x, dz) {
   return Math.abs(x) < dz ? 0.0 : x;
@@ -2140,26 +2139,22 @@ let _lastHttpCtrlSend = 0;
 
 function sendCtrlPacket(packet) {
   socketEmit('ctrl_packet', packet);
+  // HTTP fallback only when Socket.IO is down — previously also fired every 250 ms
+  // while connected, flooding Flask and delaying UDP forwarding.
+  if (socket && socket.connected) return;
   const nowMs = performance.now();
-  const useHttp = !socket || !socket.connected || (nowMs - _lastHttpCtrlSend > 250);
-  if (useHttp) {
-    _lastHttpCtrlSend = nowMs;
-    fetch('/api/ctrl', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(packet),
-    }).catch(() => {});
-  }
+  if (nowMs - _lastHttpCtrlSend < 250) return;
+  _lastHttpCtrlSend = nowMs;
+  fetch('/api/ctrl', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(packet),
+  }).catch(() => {});
 }
 
-// ── Main gamepad + control send loop ──
-function _gamepadControlLoop() {
-  requestAnimationFrame(_gamepadControlLoop);
-
+// ── Main gamepad + control send loop (fixed 50 Hz — not tied to rAF) ──
+function _gamepadControlTick() {
   const nowMs = performance.now();
-  const intervalMs = 1000 / CTRL_CFG.SEND_HZ;
-  if (nowMs - _lastSendMs < intervalMs) return;
-  _lastSendMs = nowMs;
 
   const onCtrl = document.getElementById('control')?.classList.contains('active');
   const gp = _findGamepad();
@@ -3191,8 +3186,8 @@ window.addEventListener('load', async () => {
     if (sp && sp.value.startsWith('/dev/')) sp.value = 'COM3';
   }
 
-  // Start gamepad control loop
-  requestAnimationFrame(_gamepadControlLoop);
+  // Fixed-rate gamepad loop — rAF drifts when HUD/camera work blocks the main thread.
+  setInterval(_gamepadControlTick, 1000 / CTRL_CFG.SEND_HZ);
   _updateGamepadPill();
 
   // Poll status every 2s as WebSocket fallback

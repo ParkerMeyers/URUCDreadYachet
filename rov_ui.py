@@ -90,11 +90,13 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 # UDP socket for sending control packets to Pi (replaces thrust_sender.py)
 _pi_ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-# Control keepalive — Pi only sends telemetry after it receives control UDP packets
+# Control sender — one fixed-rate UDP thread (Pi needs steady packets; duplicate
+# senders + bursty Socket.IO handling caused jitter / CONTROL_TIMEOUT flapping).
 _ctrl_lock = threading.Lock()
 _last_browser_ctrl: dict | None = None
 _last_browser_ctrl_time = 0.0
 _ctrl_keepalive_seq = 0
+CTRL_SEND_HZ = 50
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEFAULT CONFIGURATION
@@ -1297,14 +1299,22 @@ def _make_keepalive_packet() -> dict:
     return _get_active_ctrl_packet()
 
 
-def _start_control_keepalive():
-    """Send control UDP at 20 Hz so Pi always has a telemetry return address."""
-    def _loop():
-        while True:
-            time.sleep(0.05)
-            _forward_ctrl_to_pi(_get_active_ctrl_packet())
+def _start_control_sender():
+    """Send control UDP at a fixed 50 Hz — browser only updates the cached packet."""
+    interval = 1.0 / CTRL_SEND_HZ
 
-    threading.Thread(target=_loop, daemon=True, name="ctrl-keepalive").start()
+    def _loop():
+        next_t = time.time()
+        while True:
+            _forward_ctrl_to_pi(_get_active_ctrl_packet())
+            next_t += interval
+            delay = next_t - time.time()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_t = time.time()
+
+    threading.Thread(target=_loop, daemon=True, name="ctrl-sender").start()
 
 
 def _emit_onboard_progress(step: str, status: str, msg: str = ""):
@@ -1824,7 +1834,7 @@ def camera_stream(cam_num):
     # unreachable cameras return 502 (img.onerror) instead of 200 with an empty
     # body that leaves the UI stuck on "No Signal" until the client watchdog fires.
     try:
-        upstream = _requests.get(cam_url, stream=True, timeout=(5, 30))
+        upstream = _requests.get(cam_url, stream=True, timeout=(1, 30))
         upstream.raise_for_status()
     except Exception as exc:
         return Response(str(exc), status=502)
@@ -1887,6 +1897,7 @@ import shutil
 
 try:
     import cv2 as _cv2
+    import numpy as np
     HAVE_CV2 = True
 except ImportError:
     HAVE_CV2 = False
@@ -1991,58 +2002,57 @@ def _colmap_fit(frame):
                        interpolation=_cv2.INTER_AREA)
 
 
-def _colmap_loop(cam_url):
+def _colmap_loop(snap_url):
+    """Grab frames via snapshot proxy — avoids a second long-lived MJPEG pull from the Pi."""
     os.makedirs(COLMAP_STAGE, exist_ok=True)
-    cap = None
     period = 1.0 / COLMAP_FPS
     next_t = 0.0
     try:
         while _colmap["running"]:
-            if cap is None or not cap.isOpened():
-                if cap is not None:
-                    cap.release()
-                cap = _cv2.VideoCapture(cam_url)
-                cap.set(_cv2.CAP_PROP_BUFFERSIZE, 1)
-                if not cap.isOpened():
-                    time.sleep(1.0)
-                    continue
-            ok, frame = cap.read()              # blocks at stream fps — paces the loop
-            if not ok or frame is None:
-                cap.release()
-                cap = None
-                time.sleep(0.3)
-                continue
             now = time.time()
             if now < next_t:
-                time.sleep(0.005)               # drop frame to hit 10 fps (no busy-spin)
+                time.sleep(0.005)
                 continue
             next_t = now + period
+            try:
+                r = _requests.get(snap_url, timeout=3)
+                r.raise_for_status()
+                frame = _cv2.imdecode(
+                    np.frombuffer(r.content, dtype=np.uint8), _cv2.IMREAD_COLOR
+                )
+            except Exception:
+                time.sleep(0.3)
+                continue
+            if frame is None:
+                continue
             idx = _colmap["count"] + 1
             path = os.path.join(COLMAP_STAGE, f"frame_{idx:06d}.jpg")
             if _cv2.imwrite(path, _colmap_fit(frame)):
                 _colmap["count"] = idx
     finally:
-        if cap is not None:
-            cap.release()
+        pass
 
 
 @app.route("/api/colmap/toggle", methods=["POST"])
 def api_colmap_toggle():
     if not HAVE_CV2:
         return jsonify({"ok": False, "msg": "opencv not installed topside"}), 503
-    cam_url = config.get("arm_camera_url", "")
+    if not HAVE_REQUESTS:
+        return jsonify({"ok": False, "msg": "requests not installed"}), 503
+    arm_url = str(config.get("arm_camera_url", "")).strip()
+    if not arm_url:
+        return jsonify({"ok": False, "msg": "arm camera URL not set"}), 400
+    snap_url = request.host_url.rstrip("/") + "/camera/2/snapshot"
     with _colmap_lock:
         if _colmap["running"]:
             _colmap["running"] = False
             return jsonify({"ok": True, "recording": False, "staged": _colmap["count"]})
-        if not cam_url:
-            return jsonify({"ok": False, "msg": "arm camera URL not set"}), 400
         os.makedirs(COLMAP_STAGE, exist_ok=True)
         # Continue numbering from frames already staged — toggle on/off accumulates.
         existing = [f for f in os.listdir(COLMAP_STAGE) if f.endswith(".jpg")]
         _colmap["count"] = len(existing)
         _colmap["running"] = True
-        t = threading.Thread(target=_colmap_loop, args=(cam_url,),
+        t = threading.Thread(target=_colmap_loop, args=(snap_url,),
                              daemon=True, name="colmap-rec")
         _colmap["thread"] = t
         t.start()
@@ -2991,7 +3001,6 @@ def _apply_browser_ctrl(data: dict):
         _last_browser_ctrl = data
         _last_browser_ctrl_time = time.time()
     STATE["last_ctrl_time"] = time.time()
-    _forward_ctrl_to_pi(data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3015,7 +3024,7 @@ def main():
     _start_telemetry_listener()
     _start_arm_telemetry_listener()
     _start_arm_telemetry_subscribe_loop()
-    _start_control_keepalive()
+    _start_control_sender()
     _sync_arm_power()
     _apply_disarmed_arm_lockout()
     threading.Thread(target=_monitor_loop, daemon=True).start()
