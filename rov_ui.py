@@ -1814,44 +1814,44 @@ def camera_stream(cam_num):
         return "", 404
 
     url_key = _CAMERA_UI_URL_KEY.get(cam_num, f"camera{cam_num}_url")
-    cam_url = config.get(url_key, "")
+    cam_url = str(config.get(url_key, "")).strip()
+    if not HAVE_REQUESTS:
+        return Response("requests not installed", status=503)
+    if not cam_url:
+        return Response("camera URL not configured", status=503)
 
-    def _gen():
-        # One browser request == one upstream connection. If the upstream drops
-        # or errors, end the response and let the browser reconnect with a fresh
-        # request (the client already has watchdog/retry logic). The old
-        # `while True` retry looped forever server-side: when a browser aborted a
-        # feed (which happens constantly as views/streams reconnect), the
-        # generator kept sleeping and re-opening connections to the Pi, leaking
-        # threads that starved camera_stream.py — so the dashboard feeds died
-        # while a single direct-URL connection still worked.
-        if not HAVE_REQUESTS or not cam_url:
-            return
-        r = None
+    # One browser request == one upstream connection. Connect before streaming so
+    # unreachable cameras return 502 (img.onerror) instead of 200 with an empty
+    # body that leaves the UI stuck on "No Signal" until the client watchdog fires.
+    try:
+        upstream = _requests.get(cam_url, stream=True, timeout=(5, 30))
+        upstream.raise_for_status()
+    except Exception as exc:
+        return Response(str(exc), status=502)
+
+    content_type = upstream.headers.get(
+        "Content-Type", "multipart/x-mixed-replace; boundary=frame"
+    )
+
+    def _gen(resp=upstream):
+        # If the upstream drops, end the response and let the browser reconnect
+        # with a fresh request (client watchdog/retry). Do not loop server-side:
+        # aborted browser feeds used to leak threads and starve camera_stream.py.
         try:
-            r = _requests.get(cam_url, stream=True, timeout=(5, 30))
-            r.raise_for_status()
-            for chunk in r.iter_content(chunk_size=8192):
+            for chunk in resp.iter_content(chunk_size=8192):
                 if chunk:
                     yield chunk
-        except Exception:
-            return
         finally:
-            if r is not None:
-                try:
-                    r.close()
-                except Exception:
-                    pass
+            try:
+                resp.close()
+            except Exception:
+                pass
 
-    content_type = "multipart/x-mixed-replace; boundary=frame"
-    if HAVE_REQUESTS and cam_url:
-        try:
-            head_r = _requests.head(cam_url, timeout=2)
-            content_type = head_r.headers.get("Content-Type", content_type)
-        except Exception:
-            pass
-
-    return Response(stream_with_context(_gen()), mimetype=content_type)
+    return Response(
+        stream_with_context(_gen()),
+        mimetype=content_type,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @app.route("/camera/<int:cam_num>/snapshot")

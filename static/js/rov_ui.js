@@ -2802,6 +2802,7 @@ function stopCamera(camNum) {
   st.active = false;
   if (st.retryT) { clearTimeout(st.retryT); st.retryT = null; }
   if (st.watchdogT) { clearTimeout(st.watchdogT); st.watchdogT = null; }
+  if (st.framePoll) { clearInterval(st.framePoll); st.framePoll = null; }
   if (st.img) {
     st.img.onload = null;
     st.img.onerror = null;
@@ -2827,6 +2828,7 @@ function setupCamera(imgId, noSigId, camNum) {
     img, noSig, camNum,
     retryT: null,
     watchdogT: null,
+    framePoll: null,
     failCount: 0,
     active: true,
     lastLoad: 0,
@@ -2845,12 +2847,25 @@ function setupCamera(imgId, noSigId, camNum) {
     }
   }
 
+  function hasFrame() {
+    return img.naturalWidth > 0 && img.naturalHeight > 0;
+  }
+
   function onSuccess() {
     if (!st.active) return;
     st.failCount = 0;
     if (st.watchdogT) { clearTimeout(st.watchdogT); st.watchdogT = null; }
+    if (st.framePoll) { clearInterval(st.framePoll); st.framePoll = null; }
     noSig.style.display = 'none';
     img.style.display = 'block';
+  }
+
+  function startFramePoll() {
+    if (st.framePoll) clearInterval(st.framePoll);
+    st.framePoll = setInterval(() => {
+      if (!st.active) return;
+      if (hasFrame()) onSuccess();
+    }, 400);
   }
 
   function scheduleRetry() {
@@ -2885,14 +2900,17 @@ function setupCamera(imgId, noSigId, camNum) {
       if (!st.active) return;
       img.onload = onSuccess;
       img.onerror = onFail;
+      startFramePoll();
       const sub = (window._crabActive && camNum === 2) ? '/crab' : '';
       img.src = `/camera/${camNum}${sub}?t=${Date.now()}`;
       if (st.watchdogT) clearTimeout(st.watchdogT);
       st.watchdogT = setTimeout(() => {
         st.watchdogT = null;
-        if (!st.active || img.style.display === 'block') return;
+        if (!st.active) return;
+        if (hasFrame()) { onSuccess(); return; }
+        if (img.style.display === 'block') return;
         loadStream(true);
-      }, 12000);
+      }, 8000);
     };
 
     if (forceReconnect && img.src) {
