@@ -13,6 +13,7 @@ Commands at the prompt:
     1 1600      set motor 1 to 1600 µs  (forward)
     1 1400      set motor 1 to 1400 µs  (reverse)
     1 1500      set motor 1 back to neutral
+    all 1600    set all motors to 1600 µs  (also: a)
     neutral     all motors → 1500 µs  (also: n)
     status      print current PWM state
     q           neutral all then exit
@@ -80,7 +81,7 @@ def main():
     for n, name in MOTOR_NAMES.items():
         print(f"  {n}  {name}")
     print(f"\nPWM range: {MIN_US}–{MAX_US} µs   neutral = {NEUTRAL_US}")
-    print("Commands:  <motor> <pwm>  |  neutral (n)  |  status (s)  |  q\n")
+    print("Commands:  <motor> <pwm>  |  all <pwm> (a)  |  neutral (n)  |  status (s)  |  q\n")
 
     current = {ch: NEUTRAL_US for ch in range(1, NUM_CHANNELS + 1)}
 
@@ -98,6 +99,26 @@ def main():
             if line in ("q", "quit", "exit"):
                 break
 
+            # All motors to same PWM
+            parts = line.split()
+            if parts and parts[0] in ("all", "a") and len(parts) == 2:
+                try:
+                    us = int(parts[1])
+                except ValueError:
+                    print("  Bad input — expected: all <pwm 1100-1900>")
+                    continue
+
+                us = clamp(us, MIN_US, MAX_US)
+                if us != int(parts[1]):
+                    print(f"  (PWM clamped to {us})")
+
+                for ch in current:
+                    current[ch] = us
+                send(sock, pi, {"all_pwm": us})
+                print(f"  → All motors = {us} µs")
+                print_state(current)
+                continue
+
             # Neutral all
             if line in ("n", "neutral"):
                 for ch in current:
@@ -113,7 +134,6 @@ def main():
                 continue
 
             # Motor + PWM
-            parts = line.split()
             if len(parts) == 2:
                 try:
                     ch = int(parts[0])

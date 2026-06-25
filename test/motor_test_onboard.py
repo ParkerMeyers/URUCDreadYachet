@@ -218,6 +218,13 @@ def main():
                         print("[onboard] ALL NEUTRAL")
                         continue
 
+                    if "all_pwm" in cmd:
+                        us = clamp(int(cmd["all_pwm"]), MIN_US, MAX_US)
+                        for ch in pwm:
+                            pwm[ch] = us
+                        print(f"[onboard] ALL motors → {us} µs")
+                        continue
+
                     ch = int(cmd.get("motor", 0))
                     us = int(cmd.get("pwm", NEUTRAL_US))
                     if 1 <= ch <= NUM_CHANNELS:
