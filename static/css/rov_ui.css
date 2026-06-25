@@ -170,18 +170,20 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 @media(max-width:700px){ .cameras { grid-template-columns:1fr; } }
 .cam-wrap {
   position:relative; background:#000; overflow:hidden;
-  display:flex; align-items:center; justify-content:center;
 }
-.cam-img { width:100%; height:100%; object-fit:contain; display:block; }
+.cam-img {
+  position:absolute; inset:0; z-index:1;
+  width:100%; height:100%; object-fit:contain;
+}
 .cam-no-signal {
-  position:absolute; inset:0; display:flex; flex-direction:column;
+  position:absolute; inset:0; z-index:3; display:flex; flex-direction:column;
   align-items:center; justify-content:center; gap:8px;
   background:var(--bg); color:var(--dim);
 }
 .cam-no-signal .ns-icon { font-size:2.5rem; opacity:0.4; }
 .cam-no-signal .ns-text { font-size:0.75rem; letter-spacing:2px;
   text-transform:uppercase; opacity:0.5; }
-.cam-hud { position:absolute; inset:0; pointer-events:none; }
+.cam-hud { position:absolute; inset:0; z-index:2; pointer-events:none; }
 
 /* Disarmed overlay */
 .disarmed-banner {
@@ -194,18 +196,21 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 .disarmed-banner.hidden { display:none; }
 
 .cam-label {
-  position:absolute; top:8px; left:10px;
+  position:absolute; top:8px; left:10px; z-index:4;
   font-size:0.65rem; letter-spacing:1.5px; text-transform:uppercase;
   color:rgba(0,212,255,0.7); font-weight:700; pointer-events:none;
 }
 .cam-telemetry {
-  position:absolute; top:8px; right:10px;
+  position:absolute; top:8px; right:10px; z-index:4;
   font-family:var(--mono); font-size:0.68rem; line-height:1.8;
   color:rgba(220,230,255,0.8);
   text-shadow:0 1px 4px #000; pointer-events:none; text-align:right;
 }
 .cam-telemetry .val-hi  { color:rgba(0,224,138,0.9); }
 .cam-telemetry .val-warn{ color:rgba(255,179,32,0.9); }
+.cam-telemetry-unified { font-size:0.78rem; line-height:1.85; }
+.cam-telemetry-unified .tel-depth-line { font-size:0.92rem; line-height:1.7; }
+.cam-telemetry-unified .tel-depth-line .val-hi { font-size:1.08rem; font-weight:700; }
 
 /* ── control bar ── */
 .controlbar {

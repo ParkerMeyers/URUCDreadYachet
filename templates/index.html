@@ -46,7 +46,7 @@
         <input id="cfg-serial_port" type="text" value="COM3"/></div>
       <div class="field"><label>Camera 1 URL (MJPEG proxy target)</label>
         <input id="cfg-camera1_url" type="text" value="http://192.168.69.100:8160"/></div>
-      <div class="field"><label>Camera 2 URL (MJPEG proxy target)</label>
+      <div class="field"><label>Arm Camera URL (MJPEG proxy target)</label>
         <input id="cfg-camera2_url" type="text" value="http://192.168.69.100:8161"/></div>
       <div class="field"><label>Camera 0 Device on Pi (V4L2)</label>
         <input id="cfg-camera0_device" type="text" value="/dev/video0"/></div>
@@ -186,32 +186,28 @@
     <div class="cam-wrap">
       <div class="cam-no-signal" id="no-sig-1">
         <div class="ns-icon">📡</div>
-        <div class="ns-text">No Signal — Camera 1</div>
+        <div class="ns-text">No Signal — Forward Camera</div>
       </div>
-      <img id="cam1" class="cam-img" style="display:none" alt="Camera 1"/>
+      <img id="cam1" class="cam-img" style="display:none" alt="Forward Camera"/>
       <canvas id="hud1" class="cam-hud"></canvas>
       <div id="disarmed-banner" class="disarmed-banner hidden">⚠ DISARMED — select DRIVE/ARMED to move thrusters</div>
       <div class="cam-label">CAM 1 / FORWARD</div>
-      <div class="cam-telemetry" id="cam1-tel">
-        <div>DEPTH <span class="val-hi" id="c1-depth">--</span>m</div>
-        <div>HOLD  <span id="c1-hold-d">--</span>m</div>
-        <div>YAW   <span class="val-hi" id="c1-yaw">--</span>°</div>
+      <div class="cam-telemetry cam-telemetry-unified" id="cam-tel">
+        <div class="tel-depth-line">DEPTH <span class="val-hi" id="cam-depth">--</span>m</div>
+        <div>HOLD  <span id="cam-hold-d">--</span>m</div>
+        <div>YAW   <span class="val-hi" id="cam-yaw">--</span>°</div>
+        <div>ROLL  <span class="val-hi" id="cam-roll">--</span>°</div>
+        <div>PITCH <span class="val-hi" id="cam-pitch">--</span>°</div>
+        <div>STAB  <span id="cam-stab">--</span></div>
       </div>
     </div>
 
     <div class="cam-wrap">
       <div class="cam-no-signal" id="no-sig-2">
         <div class="ns-icon">📡</div>
-        <div class="ns-text">No Signal — Camera 2</div>
+        <div class="ns-text">No Signal — Arm Camera</div>
       </div>
-      <img id="cam2" class="cam-img" style="display:none" alt="Camera 2"/>
-      <canvas id="hud2" class="cam-hud"></canvas>
-      <div class="cam-label">CAM 2 / SIDE</div>
-      <div class="cam-telemetry" id="cam2-tel">
-        <div>ROLL  <span class="val-hi" id="c2-roll">--</span>°</div>
-        <div>PITCH <span class="val-hi" id="c2-pitch">--</span>°</div>
-        <div>STAB  <span id="c2-stab">--</span></div>
-      </div>
+      <img id="cam2" class="cam-img" style="display:none" alt="Arm Camera"/>
     </div>
 
   </div>

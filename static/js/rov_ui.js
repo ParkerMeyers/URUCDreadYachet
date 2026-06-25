@@ -497,14 +497,17 @@ function updateTelemetry() {
   // Gain
   document.getElementById('tb-gain').textContent = t.gain_percent ?? _ctrlState.gain_percent;
 
-  // Camera overlays
-  setText('c1-depth',  fmtNum(t.depth_m, 2));
-  setText('c1-hold-d', fmtNum(t.hold_depth_m, 2));
-  setText('c1-yaw',    fmtNum(t.yaw_deg, 1));
-  setText('c2-roll',   fmtNum(t.roll_deg, 1));
-  setText('c2-pitch',  fmtNum(t.pitch_deg, 1));
-  const stabEl = document.getElementById('c2-stab');
-  if (stabEl) { stabEl.textContent = t.stabilize ? 'ON' : 'OFF'; stabEl.className = t.stabilize ? 'val-hi' : ''; }
+  // Forward camera telemetry overlay
+  setText('cam-depth',  fmtNum(t.depth_m, 2));
+  setText('cam-hold-d', fmtNum(t.hold_depth_m, 2));
+  setText('cam-yaw',    fmtNum(t.yaw_deg, 1));
+  setText('cam-roll',   fmtNum(t.roll_deg, 1));
+  setText('cam-pitch',  fmtNum(t.pitch_deg, 1));
+  const stabEl = document.getElementById('cam-stab');
+  if (stabEl) {
+    stabEl.textContent = t.stabilize ? 'ON' : 'OFF';
+    stabEl.className = t.stabilize ? 'val-hi' : '';
+  }
 
   // Telemetry bar
   const state = t.rx_state || '--';
@@ -999,24 +1002,6 @@ function drawAttitudeOverlay(ctx, W, H, rollDeg, pitchDeg, yawDeg, live) {
   ctx.restore();
 
   drawYawTape(ctx, W, H, yawDeg, live);
-
-  const pad = 10;
-  ctx.fillStyle = 'rgba(0,0,0,0.68)';
-  ctx.fillRect(pad, pad, 126, 58);
-  ctx.strokeStyle = 'rgba(0,212,255,0.35)';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(pad, pad, 126, 58);
-
-  const fs = Math.max(11, H * 0.028);
-  ctx.font = `bold ${fs}px monospace`;
-  ctx.textAlign = 'left';
-  const valColor = live ? 'rgba(255,255,255,0.98)' : 'rgba(255,179,32,0.95)';
-  const rTxt = live ? `${rollDeg >= 0 ? '+' : ''}${rollDeg.toFixed(1)}` : '--';
-  const pTxt = live ? `${pitchDeg >= 0 ? '+' : ''}${pitchDeg.toFixed(1)}` : '--';
-  const yTxt = live ? normYaw360(yawDeg).toFixed(0).padStart(3, '0') : '---';
-  drawLegibleText(ctx, `R ${rTxt}°`, pad + 8, pad + 20, valColor);
-  drawLegibleText(ctx, `P ${pTxt}°`, pad + 8, pad + 38, valColor);
-  drawLegibleText(ctx, `Y ${yTxt}°`, pad + 8, pad + 56, valColor);
 }
 
 function drawYawTape(ctx, W, H, yawDeg, live) {
@@ -1237,7 +1222,9 @@ function setupCamera(imgId, noSigId, camNum) {
     const nsText = noSig.querySelector('.ns-text');
     if (nsText) {
       const upstream = directUrl() || 'not configured';
-      nsText.textContent = `No Signal — Cam ${camNum} (upstream ${upstream})`;
+      const camNames = { 1: 'Forward Camera', 2: 'Arm Camera' };
+      const camLabel = camNames[camNum] || `Cam ${camNum}`;
+      nsText.textContent = `No Signal — ${camLabel} (upstream ${upstream})`;
     }
     if (!retryT) { retryT = setTimeout(() => { retryT = null; load(); }, 5000); }
   };
@@ -1325,14 +1312,11 @@ function showLaunch() {
 }
 
 function resizeHUDs() {
-  ['hud1','hud2'].forEach(id => {
-    const c = document.getElementById(id);
-    if (!c) return;
-    c.width  = c.parentElement.clientWidth;
-    c.height = c.parentElement.clientHeight;
-  });
+  const c = document.getElementById('hud1');
+  if (!c) return;
+  c.width  = c.parentElement.clientWidth;
+  c.height = c.parentElement.clientHeight;
   drawHUD('hud1', _tel);
-  drawHUD('hud2', _tel);
 }
 
 let _hudLoop = null;
@@ -1340,7 +1324,6 @@ function startHUDLoop() {
   if (_hudLoop) return;
   _hudLoop = setInterval(() => {
     drawHUD('hud1', _tel);
-    drawHUD('hud2', _tel);
   }, 100);
 }
 

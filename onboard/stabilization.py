@@ -61,14 +61,15 @@ MAX_US = 1900
 MAX_PWM_DELTA_US = 400
 
 CONTROL_TIMEOUT_SEC = 0.80
-IMU_TIMEOUT_SEC = 1.00
-DEPTH_TIMEOUT_SEC = 1.50
+IMU_TIMEOUT_SEC = 2.00
+DEPTH_TIMEOUT_SEC = 2.50
 LOOP_HZ = 100
 
 MAVLINK_LINK_TIMEOUT_SEC = 3.0
 MAVLINK_RECONNECT_COOLDOWN_SEC = 5.0
 MAVLINK_MAX_MSGS_PER_POLL = 500
-MAVLINK_SENSOR_RESYNC_SEC = 3.0
+MAVLINK_SENSOR_RESYNC_SEC = 2.0
+MAVLINK_SENSOR_RECONNECT_SEC = 5.0
 
 INPUT_DEADZONE = 0.08
 
@@ -521,6 +522,25 @@ class MavlinkReader:
             return False
         return (time.time() - self.last_any_message) > MAVLINK_LINK_TIMEOUT_SEC
 
+    def attitude_age_sec(self):
+        if self.last_attitude_update <= 0.0:
+            return None
+        return time.time() - self.last_attitude_update
+
+    def sensor_stream_stalled(self):
+        """MAVLink traffic alive but ATTITUDE + depth both missing for a while."""
+        if self.last_any_message <= 0.0:
+            return False
+        if (time.time() - self.last_any_message) > MAVLINK_LINK_TIMEOUT_SEC:
+            return False
+        att_age = self.attitude_age_sec()
+        if att_age is None or att_age < MAVLINK_SENSOR_RECONNECT_SEC:
+            return False
+        if not self.have_depth:
+            return att_age >= MAVLINK_SENSOR_RECONNECT_SEC
+        depth_age = time.time() - self.last_depth_update
+        return depth_age >= MAVLINK_SENSOR_RECONNECT_SEC
+
     def sensors_stale(self):
         return self.attitude_stale() and self.depth_stale()
 
@@ -550,6 +570,7 @@ class MavlinkReader:
                 )
             else:
                 print("[mavlink] Reconnected (no heartbeat yet)")
+            self.last_rate_request = 0.0
             return True
         except Exception as e:
             print(f"[mavlink] Reconnect failed: {e}")
@@ -673,10 +694,76 @@ class MavlinkReader:
 
         print("PRESSURE DEBUG | " + " | ".join(parts))
 
+    def _process_message(self, msg):
+        """Handle one MAVLink message; return True if it updated sensor data."""
+        self.last_any_message = time.time()
+        msg_type = msg.get_type()
+
+        if msg_type == "ATTITUDE":
+            raw_roll = wrap_180(math.degrees(msg.roll) * IMU_ROLL_SIGN)
+            raw_pitch = wrap_180(math.degrees(msg.pitch) * IMU_PITCH_SIGN)
+            raw_yaw = wrap_180(math.degrees(msg.yaw) * IMU_YAW_SIGN)
+
+            self.roll_deg = raw_roll
+            self.pitch_deg = raw_pitch
+            self.yaw_deg = raw_yaw
+
+            if not self.have_attitude:
+                self.filtered_roll_deg = raw_roll
+                self.filtered_pitch_deg = raw_pitch
+                self.filtered_yaw_deg = raw_yaw
+                self.have_attitude = True
+            else:
+                self.filtered_roll_deg = angle_lowpass_deg(
+                    self.filtered_roll_deg,
+                    raw_roll,
+                    ATTITUDE_FILTER_ALPHA,
+                )
+                self.filtered_pitch_deg = angle_lowpass_deg(
+                    self.filtered_pitch_deg,
+                    raw_pitch,
+                    ATTITUDE_FILTER_ALPHA,
+                )
+                self.filtered_yaw_deg = angle_lowpass_deg(
+                    self.filtered_yaw_deg,
+                    raw_yaw,
+                    ATTITUDE_FILTER_ALPHA,
+                )
+
+            self.last_attitude_update = time.time()
+            return True
+
+        if msg_type in ["SCALED_PRESSURE", "SCALED_PRESSURE2", "SCALED_PRESSURE3"]:
+            temperature_raw = getattr(msg, "temperature", None)
+            self.update_pressure_source(
+                msg_type,
+                float(msg.press_abs),
+                temperature_raw,
+            )
+            return True
+
+        return False
+
     def poll(self):
         got_new = False
 
         self.request_message_rates()
+
+        # Priority pass — drain ATTITUDE / pressure before RC/heartbeat flood.
+        for _ in range(100):
+            msg = self.master.recv_match(
+                type=[
+                    "ATTITUDE",
+                    "SCALED_PRESSURE",
+                    "SCALED_PRESSURE2",
+                    "SCALED_PRESSURE3",
+                ],
+                blocking=False,
+            )
+            if msg is None:
+                break
+            if self._process_message(msg):
+                got_new = True
 
         msgs_read = 0
         while msgs_read < MAVLINK_MAX_MSGS_PER_POLL:
@@ -685,51 +772,7 @@ class MavlinkReader:
                 break
 
             msgs_read += 1
-            self.last_any_message = time.time()
-
-            msg_type = msg.get_type()
-
-            if msg_type == "ATTITUDE":
-                raw_roll = wrap_180(math.degrees(msg.roll) * IMU_ROLL_SIGN)
-                raw_pitch = wrap_180(math.degrees(msg.pitch) * IMU_PITCH_SIGN)
-                raw_yaw = wrap_180(math.degrees(msg.yaw) * IMU_YAW_SIGN)
-
-                self.roll_deg = raw_roll
-                self.pitch_deg = raw_pitch
-                self.yaw_deg = raw_yaw
-
-                if not self.have_attitude:
-                    self.filtered_roll_deg = raw_roll
-                    self.filtered_pitch_deg = raw_pitch
-                    self.filtered_yaw_deg = raw_yaw
-                    self.have_attitude = True
-                else:
-                    self.filtered_roll_deg = angle_lowpass_deg(
-                        self.filtered_roll_deg,
-                        raw_roll,
-                        ATTITUDE_FILTER_ALPHA,
-                    )
-                    self.filtered_pitch_deg = angle_lowpass_deg(
-                        self.filtered_pitch_deg,
-                        raw_pitch,
-                        ATTITUDE_FILTER_ALPHA,
-                    )
-                    self.filtered_yaw_deg = angle_lowpass_deg(
-                        self.filtered_yaw_deg,
-                        raw_yaw,
-                        ATTITUDE_FILTER_ALPHA,
-                    )
-
-                self.last_attitude_update = time.time()
-                got_new = True
-
-            elif msg_type in ["SCALED_PRESSURE", "SCALED_PRESSURE2", "SCALED_PRESSURE3"]:
-                temperature_raw = getattr(msg, "temperature", None)
-                self.update_pressure_source(
-                    msg_type,
-                    float(msg.press_abs),
-                    temperature_raw,
-                )
+            if self._process_message(msg):
                 got_new = True
 
         self.print_pressure_debug()
@@ -1112,10 +1155,10 @@ def main():
             mav.poll()
             control.poll()
 
-            if mav.link_dead():
+            if mav.link_dead() or mav.sensor_stream_stalled():
                 if mav.try_reconnect():
                     pixhawk.set_master(mav.master)
-            elif mav.sensors_stale():
+            elif mav.attitude_stale() or mav.depth_stale():
                 mav.resync_sensor_streams()
 
             control_timed_out = control.timed_out()
@@ -1465,6 +1508,10 @@ def main():
                     "mavlink_last_rx_age_sec": (
                         None if mav.last_any_message <= 0.0
                         else round(time.time() - mav.last_any_message, 2)
+                    ),
+                    "attitude_age_sec": (
+                        None if mav.attitude_age_sec() is None
+                        else round(mav.attitude_age_sec(), 2)
                     ),
 
                     "stabilize": stabilize_active,
