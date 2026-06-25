@@ -101,10 +101,10 @@ DEFAULT_CONFIG = {
     "pi_ssh_port":         22,
     "pi_rov_path":         "/home/uruc/URUCDreadYachet",
     "serial_port":         "COM3" if IS_WINDOWS else "/dev/ttyACM0",
-    "camera1_url":         "http://192.168.69.100:8160",
-    "camera2_url":         "http://192.168.69.100:8161",
-    "camera0_device":      "/dev/video0",
-    "camera1_device":      "/dev/video2",
+    "forward_camera_url":  "http://192.168.69.100:8161",
+    "arm_camera_url":      "http://192.168.69.100:8160",
+    "camera0_device":      "/dev/video0",   # Pi cam0 → port 8160 (arm USB)
+    "camera1_device":      "/dev/video2",   # Pi cam1 → port 8161 (forward USB)
     "thrust_udp_port":     5005,
     "telemetry_port":      5006,
     "arm_udp_port":        5006,
@@ -122,15 +122,36 @@ DEFAULT_CONFIG = {
 MAVPROXY_TCP_PORT = 5762
 MAVPROXY_ONBOARD_OUT = f"tcpin:127.0.0.1:{MAVPROXY_TCP_PORT}"
 
-config = DEFAULT_CONFIG.copy()
+
+def normalize_camera_config():
+    """Keep forward/arm URLs and Pi USB wiring consistent for this ROV."""
+    global config
+    c1 = str(config.get("camera1_url", "")).strip()
+    c2 = str(config.get("camera2_url", "")).strip()
+    if c1 and not str(config.get("arm_camera_url", "")).strip():
+        config["arm_camera_url"] = c1
+    if c2 and not str(config.get("forward_camera_url", "")).strip():
+        config["forward_camera_url"] = c2
+    if not str(config.get("forward_camera_url", "")).strip():
+        config["forward_camera_url"] = DEFAULT_CONFIG["forward_camera_url"]
+    if not str(config.get("arm_camera_url", "")).strip():
+        config["arm_camera_url"] = DEFAULT_CONFIG["arm_camera_url"]
+    # Fixed wiring — onboard restart must not swap streams on the Pi ports.
+    config["camera0_device"] = DEFAULT_CONFIG["camera0_device"]
+    config["camera1_device"] = DEFAULT_CONFIG["camera1_device"]
 
 
 def normalize_onboard_config():
     """Force the onboard MAVProxy output to TCP — scripts connect to tcp:127.0.0.1:5762."""
     global config
+    normalize_camera_config()
     out2 = str(config.get("mavproxy_out2", "")).strip()
     if "tcpin" not in out2.lower() or str(MAVPROXY_TCP_PORT) not in out2:
         config["mavproxy_out2"] = MAVPROXY_ONBOARD_OUT
+
+
+config = DEFAULT_CONFIG.copy()
+normalize_camera_config()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -443,8 +464,20 @@ class SSHManager:
             time.sleep(1.0)
         return False
 
+    # Log substrings that mean the FC link is actively passing MAVLink traffic.
+    _MAVPROXY_ALIVE_MARKERS = (
+        "detected vehicle", "online system", "got command_ack",
+        "vcc ", "ap:", "flight battery", "heartbeat", "fence present",
+        "manual>", "received ", "saved ", "parameters",
+    )
+
     def is_mavproxy_fc_connected(self):
-        """True only when recent MAVProxy log shows the FC is currently online."""
+        """True when MAVProxy log shows live FC traffic (not just one-time startup lines)."""
+        if not self.is_mavproxy_running():
+            return False
+        if self.mavproxy_recent_no_link():
+            return False
+
         out, _, _ = self.exec(
             "tail -n 30 /tmp/rov_mavproxy.log 2>/dev/null || true"
         )
@@ -453,6 +486,10 @@ class SSHManager:
             return False
 
         recent = lines[-15:]
+        recent_text = "\n".join(recent).lower()
+        if "unloading module" in recent_text:
+            return False
+
         trailing_no_link = 0
         for ln in reversed(recent):
             lower = ln.lower()
@@ -463,10 +500,9 @@ class SSHManager:
         if trailing_no_link >= 3:
             return False
 
-        return any(
-            "detected vehicle" in ln.lower() or "online system" in ln.lower()
-            for ln in recent
-        )
+        # Startup strings scroll out once stabilization requests message rates;
+        # any recent FC traffic (COMMAND_ACK, Vcc, AP:, etc.) means link is up.
+        return any(m in recent_text for m in self._MAVPROXY_ALIVE_MARKERS)
 
     def _device_exists(self, path: str) -> bool:
         out, _, _ = self.exec(f"test -e {shlex.quote(path)} && echo exists")
@@ -994,12 +1030,16 @@ def emit_status():
 # CAMERA PROXY
 # ─────────────────────────────────────────────────────────────────────────────
 
+# UI slot 1 = forward, slot 2 = arm
+_CAMERA_UI_URL_KEY = {1: "forward_camera_url", 2: "arm_camera_url"}
+
 @app.route("/camera/<int:cam_num>")
 def camera_stream(cam_num):
     if cam_num not in (1, 2):
         return "", 404
 
-    cam_url = config.get(f"camera{cam_num}_url", "")
+    url_key = _CAMERA_UI_URL_KEY.get(cam_num, f"camera{cam_num}_url")
+    cam_url = config.get(url_key, "")
 
     def _gen():
         if not HAVE_REQUESTS or not cam_url:
@@ -1045,6 +1085,10 @@ def api_config():
     global config
     if request.method == "POST":
         data = request.get_json(force=True) or {}
+        if "camera1_url" in data:
+            data["arm_camera_url"] = data["camera1_url"]
+        if "camera2_url" in data:
+            data["forward_camera_url"] = data["camera2_url"]
         for k, v in data.items():
             if k in config:
                 config[k] = v

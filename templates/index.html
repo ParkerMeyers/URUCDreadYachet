@@ -44,14 +44,14 @@
       <h3>Topside Hardware</h3>
       <div class="field"><label>Serial Port (Arm Controller)</label>
         <input id="cfg-serial_port" type="text" value="COM3"/></div>
-      <div class="field"><label>Camera 1 URL (MJPEG proxy target)</label>
-        <input id="cfg-camera1_url" type="text" value="http://192.168.69.100:8160"/></div>
-      <div class="field"><label>Arm Camera URL (MJPEG proxy target)</label>
-        <input id="cfg-camera2_url" type="text" value="http://192.168.69.100:8161"/></div>
-      <div class="field"><label>Camera 0 Device on Pi (V4L2)</label>
-        <input id="cfg-camera0_device" type="text" value="/dev/video0"/></div>
-      <div class="field"><label>Camera 1 Device on Pi (V4L2)</label>
-        <input id="cfg-camera1_device" type="text" value="/dev/video2"/></div>
+      <div class="field"><label>Forward Camera URL (Pi port 8161)</label>
+        <input id="cfg-forward_camera_url" type="text" value="http://192.168.69.100:8161"/></div>
+      <div class="field"><label>Arm Camera URL (Pi port 8160)</label>
+        <input id="cfg-arm_camera_url" type="text" value="http://192.168.69.100:8160"/></div>
+      <div class="field"><label>Camera 0 Device on Pi (arm, port 8160)</label>
+        <input id="cfg-camera0_device" type="text" value="/dev/video0" readonly/></div>
+      <div class="field"><label>Camera 1 Device on Pi (forward, port 8161)</label>
+        <input id="cfg-camera1_device" type="text" value="/dev/video2" readonly/></div>
     </div>
 
     <div class="config-group">
@@ -167,6 +167,18 @@
 
     <span class="topbar-spacer"></span>
 
+    <span class="topbar-view-label">View</span>
+    <div class="cam-view-btns" id="cam-view-btns">
+      <button type="button" class="cam-view-btn active" data-view="split"
+              onclick="setCameraView('split')" title="Side by side">Split</button>
+      <button type="button" class="cam-view-btn" data-view="pip"
+              onclick="setCameraView('pip')" title="Forward large, arm in corner">PiP</button>
+      <button type="button" class="cam-view-btn" data-view="forward"
+              onclick="setCameraView('forward')" title="Forward camera only">Fwd</button>
+      <button type="button" class="cam-view-btn" data-view="arm"
+              onclick="setCameraView('arm')" title="Arm camera only">Arm</button>
+    </div>
+
     <span style="font-family:var(--mono);font-size:.75rem;color:var(--dim);white-space:nowrap;flex-shrink:0">
       GAIN: <span id="tb-gain" style="color:var(--accent)">100</span>%
     </span>
@@ -181,9 +193,9 @@
   </div>
 
   <!-- Camera feeds -->
-  <div class="cameras">
+  <div class="cameras view-split" id="cameras">
 
-    <div class="cam-wrap">
+    <div class="cam-wrap cam-forward" id="cam-wrap-1">
       <div class="cam-no-signal" id="no-sig-1">
         <div class="ns-icon">📡</div>
         <div class="ns-text">No Signal — Forward Camera</div>
@@ -202,12 +214,13 @@
       </div>
     </div>
 
-    <div class="cam-wrap">
+    <div class="cam-wrap cam-arm" id="cam-wrap-2">
       <div class="cam-no-signal" id="no-sig-2">
         <div class="ns-icon">📡</div>
         <div class="ns-text">No Signal — Arm Camera</div>
       </div>
       <img id="cam2" class="cam-img" style="display:none" alt="Arm Camera"/>
+      <div class="cam-label">CAM 2 / ARM</div>
     </div>
 
   </div>

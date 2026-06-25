@@ -144,7 +144,7 @@ function stopOnboardPoll() {
 // ─────────────────────────────────────────────────────────────
 function getCfg() {
   const keys = ['pi_ip','pi_user','pi_password','pi_ssh_port','pi_rov_path',
-                 'serial_port','camera1_url','camera2_url',
+                 'serial_port','forward_camera_url','arm_camera_url',
                  'camera0_device','camera1_device',
                  'thrust_udp_port','telemetry_port','arm_udp_port',
                  'mosfet_control_port','colmap_command','crabs_command',
@@ -1192,8 +1192,37 @@ function drawArrow(ctx, x1, y1, x2, y2, color, opacity) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// CAMERA VIEW MODES
+// ─────────────────────────────────────────────────────────────
+let _cameraView = 'split';
+
+const _CAMERA_VIEW_LABELS = {
+  split:   'Side by side',
+  pip:     'Forward + arm (PiP)',
+  forward: 'Forward only',
+  arm:     'Arm only',
+};
+
+function setCameraView(mode) {
+  if (!_CAMERA_VIEW_LABELS[mode]) return;
+  _cameraView = mode;
+
+  const el = document.getElementById('cameras');
+  if (el) el.className = 'cameras view-' + mode;
+
+  document.querySelectorAll('.cam-view-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.view === mode);
+  });
+
+  resizeHUDs();
+}
+
+// ─────────────────────────────────────────────────────────────
 // CAMERA SETUP
 // ─────────────────────────────────────────────────────────────
+// UI slot → config URL field (matches rov_ui.py _CAMERA_UI_URL_KEY)
+const _CAMERA_CFG_KEY = { 1: 'forward_camera_url', 2: 'arm_camera_url' };
+
 function setupCamera(imgId, noSigId, camNum) {
   const img   = document.getElementById(imgId);
   const noSig = document.getElementById(noSigId);
@@ -1201,7 +1230,8 @@ function setupCamera(imgId, noSigId, camNum) {
   let failCount = 0;
 
   function directUrl() {
-    const el = document.getElementById('cfg-camera' + camNum + '_url');
+    const cfgKey = _CAMERA_CFG_KEY[camNum];
+    const el = cfgKey ? document.getElementById('cfg-' + cfgKey) : null;
     return el ? el.value.trim() : '';
   }
 
@@ -1299,6 +1329,7 @@ function _doOpenControl() {
   document.getElementById('control').classList.add('active');
   setupCamera('cam1', 'no-sig-1', 1);
   setupCamera('cam2', 'no-sig-2', 2);
+  setCameraView(_cameraView);
   window.addEventListener('resize', resizeHUDs);
   resizeHUDs();
   startHUDLoop();

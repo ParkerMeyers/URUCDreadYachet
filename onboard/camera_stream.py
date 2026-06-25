@@ -7,12 +7,11 @@ Serves two USB camera feeds as MJPEG HTTP streams.
   Camera 0 → http://0.0.0.0:8160/
   Camera 1 → http://0.0.0.0:8161/
 
-The Flask topside (rov_ui.py) proxies these at /camera/1 and /camera/2.
+The Flask topside (rov_ui.py) proxies forward at /camera/1 and arm at /camera/2.
 
-USB cameras on Raspberry Pi typically enumerate as:
-  /dev/video0  — USB camera 0 (video)
-  /dev/video2  — USB camera 1 (video)
-  (Each UVC camera creates two V4L2 nodes: one video, one metadata)
+ROV wiring (do not swap):
+  /dev/video0 → Pi cam0 / port 8160 → arm
+  /dev/video2 → Pi cam1 / port 8161 → forward
 
 Install dependency on the Pi:
   pip install opencv-python-headless
