@@ -7,13 +7,13 @@ them to the Pixhawk 6 AUX outputs via MAVLink RC_CHANNELS_OVERRIDE
 through MAVProxy.
 
 Confirmed AUX wiring:
-    AUX1 (RC ch 9)  → J4
-    AUX2 (RC ch 10) → J1
-    AUX3 (RC ch 11) → J3
-    AUX4 (RC ch 12) → J6  (continuous rotation)
-    AUX5 (RC ch 13) → J5
-    AUX6 (RC ch 14) → J2
-    AUX7 (RC ch 15) → Claw
+    AUX1 (RC ch 9)  → J5
+    AUX2 (RC ch 10) → J2
+    AUX3 (RC ch 11) → J6  (continuous rotation, center 1500 µs)
+    AUX4 (RC ch 12) → J1
+    AUX5 (RC ch 13) → J3
+    AUX6 (RC ch 14) → J4
+    AUX7 (RC ch 15) → Claw (continuous rotation, center 1515 µs)
     AUX8 (RC ch 16) → spare (always 1500)
 
 Incoming UDP packet (from arm_sender.py), comma-separated:
@@ -24,6 +24,12 @@ Incoming UDP packet (from arm_sender.py), comma-separated:
 Optional hardware (degrades gracefully if absent):
     BNO055 IMU  — J6 auto-level stabilization when stick is centered
     lgpio/GPIO17 MOSFET — servo power rail switch controlled from web UI
+
+Manual AUX PWM (web UI, JSON on UDP port 5007):
+    {"cmd": "manual_pwm", "enabled": true}   — override arm_sender UDP
+    {"cmd": "manual_pwm", "enabled": false}
+    {"cmd": "manual_pwm", "aux": 6, "pwm": 1500}  — AUX1–7, 500–2500 µs
+    {"cmd": "manual_pwm", "center": true}
 """
 
 import json
@@ -59,24 +65,29 @@ TIMEOUT_SEC = 0.75    # center all joints if no UDP packet received for this lon
 # Maps incoming CSV joint index → RC channel number (AUX1=ch9, AUX2=ch10 …)
 # Incoming order: J1(0), J2(1), J3(2), J4(3), J5(4), J6_PWM(5), Claw(6)
 JOINT_TO_RC_CH = {
-    0: 10,   # J1   → AUX2
-    1: 14,   # J2   → AUX6
-    2: 11,   # J3   → AUX3
-    3:  9,   # J4   → AUX1
-    4: 13,   # J5   → AUX5
-    5: 12,   # J6   → AUX4  (continuous rotation — computed separately)
+    0: 12,   # J1   → AUX4
+    1: 10,   # J2   → AUX2
+    2: 13,   # J3   → AUX5
+    3: 14,   # J4   → AUX6
+    4:  9,   # J5   → AUX1
+    5: 11,   # J6   → AUX3  (continuous rotation — computed separately)
     6: 15,   # Claw → AUX7
 }
-J6_RC_CH    = 12   # AUX4
-SPARE_RC_CH = 16   # AUX8 — always CENTER_US
+J6_RC_CH      = 11   # AUX3
+CLAW_RC_CH    = 15   # AUX7
+CLAW_JOINT_IDX = 6
+SPARE_RC_CH   = 16   # AUX8 — always CENTER_US
 
-# J6 BNO055 stabilization (same constants as original new_ar.py)
+# J6 continuous rotation (center 1500 µs)
 J6_IN_DEADBAND  = 10      # ±µs from 1500 that counts as "centered"
 J6_OUT_MIN      = 1350
 J6_OUT_CENTER   = 1500
 J6_OUT_MAX      = 1650
 J6_KP           = -2.0
 J6_DEADBAND_DEG = 3.0
+
+# Claw continuous rotation (center 1515 µs)
+CLAW_CENTER_US  = 1515
 _LEVEL_NORMAL_RAW = [0.0180, -0.9993, 0.0337]
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -180,13 +191,62 @@ def _compute_j6_pwm(j6_input_us, j6_target_angle_deg):
     return J6_OUT_CENTER
 
 
+def _claw_output_pwm(claw_input_us):
+    """Claw continuous rotation — centered stick/input → 1515 µs stop."""
+    us = _clamp_us(claw_input_us)
+    if abs(us - CENTER_US) <= J6_IN_DEADBAND:
+        return CLAW_CENTER_US
+    return us
+
+
+def _default_joint_us():
+    vals = [CENTER_US] * 7
+    vals[CLAW_JOINT_IDX] = CLAW_CENTER_US
+    return vals
+
+
+def _default_manual_aux_pwm():
+    """Neutral PWM for AUX1–7 in manual mode (AUX7 claw = 1515)."""
+    return [CENTER_US, CENTER_US, J6_OUT_CENTER, CENTER_US, CENTER_US, CENTER_US, CLAW_CENTER_US]
+
+
+def _neutral_pwm_for_rc_ch(rc_ch: int) -> int:
+    if rc_ch == J6_RC_CH:
+        return J6_OUT_CENTER
+    if rc_ch == CLAW_RC_CH:
+        return CLAW_CENTER_US
+    return CENTER_US
+
+
+def _fill_rc_neutral(rc: list) -> None:
+    for rc_ch in JOINT_TO_RC_CH.values():
+        rc[rc_ch - 1] = _neutral_pwm_for_rc_ch(rc_ch)
+    rc[SPARE_RC_CH - 1] = CENTER_US
+
+
+# AUX1–AUX7 labels for manual override (web UI types AUX channel number)
+AUX_LABELS = ("J5", "J2", "J6", "J1", "J3", "J4", "Claw")
+
+# Joint name / index → AUX port (for "J1 1500" style commands)
+JOINT_TO_AUX = {
+    1: 4,   # J1 → AUX4
+    2: 2,   # J2 → AUX2
+    3: 5,   # J3 → AUX5
+    4: 6,   # J4 → AUX6
+    5: 1,   # J5 → AUX1
+    6: 3,   # J6 → AUX3
+    7: 7,   # Claw → AUX7
+}
+
 # ── Shared state (protected by _lock) ────────────────────────────────────────
 _lock = threading.Lock()
-_joint_us      = [CENTER_US] * 7   # [J1, J2, J3, J4, J5, J6_manual, Claw]
+_joint_us      = _default_joint_us()
 _j6_target_deg = 0.0
 _last_pkt_time = 0.0
 _rx_count      = 0
 _mosfet_on     = False
+_manual_mode   = False
+_manual_aux_pwm = _default_manual_aux_pwm()
 
 
 # ── MOSFET control ────────────────────────────────────────────────────────────
@@ -197,15 +257,59 @@ def _set_mosfet(on: bool):
         _lgpio.gpio_write(_gpio_h, MOSFET_GPIO, 1 if on else 0)
 
 
-def _mosfet_listener():
-    """Background thread: accept MOSFET on/off JSON commands from the web UI."""
+def _apply_manual_pwm_cmd(cmd: dict) -> None:
+    """Handle manual AUX PWM commands from the web UI (overrides arm_sender UDP)."""
+    global _manual_mode, _manual_aux_pwm
+
+    if cmd.get("center"):
+        with _lock:
+            _manual_mode = True
+            _manual_aux_pwm = _default_manual_aux_pwm()
+        print("[arm] Manual AUX: all centered (AUX7 claw → 1515 µs)", flush=True)
+        return
+
+    if "enabled" in cmd and cmd.get("aux") is None and cmd.get("joint") is None:
+        enabled = bool(cmd.get("enabled"))
+        with _lock:
+            _manual_mode = enabled
+            if enabled:
+                _manual_aux_pwm = _default_manual_aux_pwm()
+        print(f"[arm] Manual AUX mode {'ON — ignoring arm_sender UDP' if enabled else 'OFF'}",
+              flush=True)
+        return
+
+    aux = cmd.get("aux")
+    if aux is None and cmd.get("joint") is not None:
+        try:
+            aux = JOINT_TO_AUX.get(int(cmd.get("joint")))
+        except (TypeError, ValueError):
+            aux = None
+    pwm = cmd.get("pwm")
+    if aux is None or pwm is None:
+        return
+    try:
+        aux_i = int(aux)
+        pwm_i = _clamp_us(pwm)
+    except (TypeError, ValueError):
+        return
+    if not (1 <= aux_i <= 7):
+        return
+    with _lock:
+        _manual_mode = True
+        _manual_aux_pwm[aux_i - 1] = pwm_i
+    label = AUX_LABELS[aux_i - 1]
+    print(f"[arm] Manual AUX{aux_i} ({label}) → {pwm_i} µs [override ON]", flush=True)
+
+
+def _arm_control_listener():
+    """Background thread: MOSFET + manual AUX PWM JSON commands from the web UI."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", MOSFET_PORT))
         s.settimeout(1.0)
     except Exception as e:
-        print(f"[arm] MOSFET listener bind failed: {e}")
+        print(f"[arm] Control listener bind failed: {e}")
         return
     while True:
         try:
@@ -214,10 +318,14 @@ def _mosfet_listener():
             if cmd.get("cmd") == "mosfet":
                 _set_mosfet(bool(cmd.get("state", False)))
                 print(f"[arm] MOSFET {'ON' if _mosfet_on else 'OFF'} (web UI)")
+            elif cmd.get("cmd") == "manual_pwm":
+                _apply_manual_pwm_cmd(cmd)
         except socket.timeout:
             pass
-        except Exception:
-            pass
+        except json.JSONDecodeError as e:
+            print(f"[arm] Control listener bad JSON: {e}", flush=True)
+        except Exception as e:
+            print(f"[arm] Control listener error: {e}", flush=True)
 
 
 # ── MAVLink helpers ───────────────────────────────────────────────────────────
@@ -225,8 +333,27 @@ def _send_rc_override(master, rc):
     send_rc_channels_override(master, rc, ignore=IGNORE)
 
 
+def _build_rc_manual(aux_vals=None):
+    """Build RC override from manual AUX1–7 PWM values (web UI manual mode)."""
+    rc = [IGNORE] * 18
+    if aux_vals is None:
+        with _lock:
+            aux_vals = list(_manual_aux_pwm)
+    for aux_i in range(1, 8):
+        rc[8 + aux_i - 1] = _clamp_us(aux_vals[aux_i - 1])
+    rc[SPARE_RC_CH - 1] = CENTER_US
+    return rc
+
+
 def _build_rc_array():
     """Build the 18-element RC array to send, computing J6 fresh each call."""
+    with _lock:
+        manual = _manual_mode
+        if manual:
+            aux_vals = list(_manual_aux_pwm)
+    if manual:
+        return _build_rc_manual(aux_vals)
+
     rc = [IGNORE] * 18
     with _lock:
         joint_us_snap  = list(_joint_us)
@@ -236,16 +363,17 @@ def _build_rc_array():
     timed_out = (time.time() - last_pkt_snap > TIMEOUT_SEC) and (last_pkt_snap > 0)
 
     if timed_out:
-        # Safety: stop all joints
-        for ch in list(JOINT_TO_RC_CH.values()) + [SPARE_RC_CH]:
-            rc[ch - 1] = CENTER_US
+        # Safety: stop all joints at neutral PWM
+        _fill_rc_neutral(rc)
         return rc
 
     for joint_idx, rc_ch in JOINT_TO_RC_CH.items():
         if rc_ch == J6_RC_CH:
-            # J6 computed separately below
             continue
-        rc[rc_ch - 1] = _clamp_us(joint_us_snap[joint_idx])
+        if joint_idx == CLAW_JOINT_IDX:
+            rc[rc_ch - 1] = _claw_output_pwm(joint_us_snap[joint_idx])
+        else:
+            rc[rc_ch - 1] = _clamp_us(joint_us_snap[joint_idx])
 
     # J6 continuous rotation (index 5 = J6_manual input)
     rc[J6_RC_CH - 1] = _compute_j6_pwm(
@@ -295,10 +423,11 @@ def main():
     sock.bind(("0.0.0.0", UDP_PORT))
     sock.settimeout(0.001)
 
-    threading.Thread(target=_mosfet_listener, daemon=True).start()
+    threading.Thread(target=_arm_control_listener, daemon=True).start()
 
     print(f"[arm] Listening on UDP {UDP_PORT}", flush=True)
-    print(f"[arm] AUX1=J4  AUX2=J1  AUX3=J3  AUX4=J6  AUX5=J5  AUX6=J2  AUX7=Claw", flush=True)
+    print(f"[arm] Manual AUX PWM on UDP {MOSFET_PORT} (cmd=manual_pwm)", flush=True)
+    print(f"[arm] AUX1=J5  AUX2=J2  AUX3=J6  AUX4=J1  AUX5=J3  AUX6=J4  AUX7=Claw", flush=True)
     print(f"[arm] BNO055={'yes' if HAVE_BNO else 'no'}  MOSFET={'yes' if HAVE_GPIO else 'no'}", flush=True)
 
     last_send      = 0.0
@@ -317,12 +446,15 @@ def main():
                     line = line[4:]
                 parts = line.split(",")
                 if len(parts) >= 7:
-                    vals = [float(x) for x in parts]
                     with _lock:
-                        _joint_us      = [_clamp_us(vals[i]) for i in range(7)]
-                        _j6_target_deg = float(vals[7]) if len(vals) >= 8 else 0.0
-                        _last_pkt_time = now
-                        _rx_count     += 1
+                        if _manual_mode:
+                            pass  # web manual override active — ignore arm_sender
+                        else:
+                            vals = [float(x) for x in parts]
+                            _joint_us      = [_clamp_us(vals[i]) for i in range(7)]
+                            _j6_target_deg = float(vals[7]) if len(vals) >= 8 else 0.0
+                            _last_pkt_time = now
+                            _rx_count     += 1
             except socket.timeout:
                 pass
             except (ValueError, IndexError):
@@ -342,18 +474,29 @@ def main():
             if now - last_print >= 1.0 / PRINT_HZ:
                 last_print = now
                 with _lock:
-                    rx   = _rx_count
-                    j6t  = _j6_target_deg
-                    lpt  = _last_pkt_time
-                    jus  = list(_joint_us)
-                timed_out = (now - lpt > TIMEOUT_SEC) and (lpt > 0)
-                j6_pwm = _compute_j6_pwm(_clamp_us(jus[5]), j6t) if not timed_out else CENTER_US
-                print(
-                    f"[arm] rx={rx} timeout={timed_out} mosfet={_mosfet_on} | "
-                    f"J1={jus[0]} J2={jus[1]} J3={jus[2]} J4={jus[3]} "
-                    f"J5={jus[4]} J6={j6_pwm}(in={jus[5]},tgt={j6t:.1f}) "
-                    f"Claw={jus[6]}"
-                )
+                    rx      = _rx_count
+                    j6t     = _j6_target_deg
+                    lpt     = _last_pkt_time
+                    jus     = list(_joint_us)
+                    manual  = _manual_mode
+                    aux_pwm = list(_manual_aux_pwm)
+                if manual:
+                    aux_str = " ".join(
+                        f"A{i+1}={aux_pwm[i]}" for i in range(7)
+                    )
+                    print(
+                        f"[arm] MANUAL mosfet={_mosfet_on} | {aux_str}",
+                        flush=True,
+                    )
+                else:
+                    timed_out = (now - lpt > TIMEOUT_SEC) and (lpt > 0)
+                    j6_pwm = _compute_j6_pwm(_clamp_us(jus[5]), j6t) if not timed_out else CENTER_US
+                    print(
+                        f"[arm] rx={rx} timeout={timed_out} mosfet={_mosfet_on} | "
+                        f"J1={jus[0]} J2={jus[1]} J3={jus[2]} J4={jus[3]} "
+                        f"J5={jus[4]} J6={j6_pwm}(in={jus[5]},tgt={j6t:.1f}) "
+                        f"Claw={jus[6]}"
+                    )
 
             time.sleep(0.002)
 
@@ -361,10 +504,9 @@ def main():
         print("\n[arm] Stopping — centering all AUX channels.")
 
     finally:
-        # Send CENTER on all AUX channels before exiting
+        # Send neutral on all AUX channels before exiting
         rc = [IGNORE] * 18
-        for ch in list(JOINT_TO_RC_CH.values()) + [SPARE_RC_CH]:
-            rc[ch - 1] = CENTER_US
+        _fill_rc_neutral(rc)
         _send_rc_override(master, rc)
         time.sleep(0.2)
 

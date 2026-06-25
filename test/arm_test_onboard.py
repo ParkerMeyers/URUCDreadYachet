@@ -50,13 +50,13 @@ AUX_CHANNELS = 8      # number of AUX ports in use
 AUX_RC_OFFSET = 9     # AUX1 = RC channel 9, AUX2 = channel 10, etc.
 
 JOINT_NAMES = {
-    1: "J4",          # AUX1 → RC ch 9
-    2: "J1",          # AUX2 → RC ch 10
-    3: "J3",          # AUX3 → RC ch 11
-    4: "J6_cont",     # AUX4 → RC ch 12  (continuous rotation)
-    5: "J5_check",    # AUX5 → RC ch 13  (holding torque — verify wiring)
-    6: "J2",          # AUX6 → RC ch 14
-    7: "J7_check",    # AUX7 → RC ch 15  (holding torque — verify wiring)
+    1: "J5",          # AUX1 → RC ch 9
+    2: "J2",          # AUX2 → RC ch 10
+    3: "J6_cont",     # AUX3 → RC ch 11  (continuous rotation, center 1500)
+    4: "J1",          # AUX4 → RC ch 12
+    5: "J3",          # AUX5 → RC ch 13
+    6: "J4",          # AUX6 → RC ch 14
+    7: "Claw",        # AUX7 → RC ch 15  (continuous rotation, center 1515)
     8: "spare",       # AUX8 → RC ch 16  (unused)
 }
 IGNORE = 65535

@@ -73,6 +73,12 @@ try:
 except ImportError:
     HAVE_REQUESTS = False
 
+try:
+    import serial as _serial  # pyserial — required by topside/arm_sender.py
+    HAVE_PYSERIAL = True
+except ImportError:
+    HAVE_PYSERIAL = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FLASK + SOCKETIO SETUP
 # ─────────────────────────────────────────────────────────────────────────────
@@ -98,6 +104,13 @@ ARM_JOINT_NAMES = ["J1", "J2", "J3", "J4", "J5", "J6", "Claw"]
 ARM_PWM_MIN = 500
 ARM_PWM_MAX = 2500
 
+# Pix6 AUX1–7 joint labels (matches onboard/new_ar.py AUX_LABELS)
+MANUAL_AUX_LABELS = ["J5", "J2", "J6", "J1", "J3", "J4", "Claw"]
+MANUAL_AUX_DEFAULTS = [1500, 1500, 1500, 1500, 1500, 1500, 1515]  # AUX7 claw stop
+# Joint index 1–7 (J1..J6, Claw) → AUX port on Pix6
+JOINT_TO_AUX = {1: 4, 2: 2, 3: 5, 4: 6, 5: 1, 6: 3, 7: 7}
+AUX_TO_JOINT = {v: k for k, v in JOINT_TO_AUX.items()}
+
 DEFAULT_ARM_PRESETS = {
     "stow": {
         "label": "Stow",
@@ -122,7 +135,7 @@ DEFAULT_CONFIG = {
     "pi_password":         "yahboom",
     "pi_ssh_port":         22,
     "pi_rov_path":         "/home/uruc/URUCDreadYachet",
-    "serial_port":         "COM3" if IS_WINDOWS else "/dev/ttyACM0",
+    "serial_port":         "auto" if IS_WINDOWS else "/dev/ttyACM0",
     "forward_camera_url":  "http://192.168.69.100:8161",
     "arm_camera_url":      "http://192.168.69.100:8160",
     "camera0_device":      "/dev/video0",   # Pi cam0 → port 8160 (arm USB)
@@ -283,6 +296,56 @@ def _send_arm_csv(csv_line: str):
         sock.close()
 
 
+def _send_pi_arm_control(payload: dict) -> tuple[bool, str]:
+    """Send JSON control command to new_ar.py (MOSFET port, manual AUX PWM)."""
+    load_config_file()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.sendto(
+                json.dumps(payload).encode("utf-8"),
+                (config["pi_ip"], int(config["mosfet_control_port"])),
+            )
+        finally:
+            sock.close()
+        return True, f"sent → {config['pi_ip']}:{config['mosfet_control_port']}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _parse_manual_pwm_line(line: str) -> tuple[int, int, str] | None:
+    """Parse '6 1500', 'J1 1500', or 'claw 1600' → (aux, pwm, label)."""
+    line = (line or "").strip()
+    if not line:
+        return None
+    parts = line.split()
+    if len(parts) != 2:
+        return None
+    try:
+        pwm = _clamp_arm_pwm(parts[1])
+    except (TypeError, ValueError):
+        return None
+
+    token = parts[0].strip().lower()
+    if token == "claw":
+        return 7, pwm, "Claw"
+    if token.startswith("j") and token[1:].isdigit():
+        joint_i = int(token[1:])
+        if joint_i not in JOINT_TO_AUX:
+            return None
+        aux = JOINT_TO_AUX[joint_i]
+        label = f"J{joint_i}" if joint_i < 7 else "Claw"
+        return aux, pwm, label
+    try:
+        aux = int(parts[0])
+    except (TypeError, ValueError):
+        return None
+    if not (1 <= aux <= 7):
+        return None
+    label = f"AUX{aux} ({MANUAL_AUX_LABELS[aux - 1]})"
+    return aux, pwm, label
+
+
 config = DEFAULT_CONFIG.copy()
 normalize_onboard_config()
 
@@ -351,6 +414,8 @@ STATE = {
     "onboard_starting":      False,
     "onboard_progress":      [],
     "arm_last_pwm":          None,
+    "manual_pwm_enabled":    False,
+    "manual_aux_pwm":        list(MANUAL_AUX_DEFAULTS),
     "telemetry": {
         "rx_state":                "NO_TELEMETRY",
         "gain_percent":            100,
@@ -1317,6 +1382,8 @@ def emit_status():
         "telemetry_record_file": STATE.get("telemetry_record_file", ""),
         "link_health":           link,
         "arm_last_pwm":          STATE.get("arm_last_pwm"),
+        "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
+        "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS)),
     })
 
 
@@ -1687,6 +1754,19 @@ def api_start_topside():
     results = {}
 
     if not is_local_running("arm"):
+        if not HAVE_PYSERIAL:
+            pip_cmd = f'"{PYTHON}" -m pip install pyserial'
+            results["arm_sender"] = {
+                "ok": False,
+                "msg": (
+                    f"pyserial not installed for {PYTHON}. "
+                    f"Run in a terminal: {pip_cmd}"
+                ),
+            }
+            STATE["arm_running"] = False
+            emit_status()
+            return jsonify({"ok": False, "results": results})
+
         cmd = [
             PYTHON, str(ROV_ROOT / "topside" / "arm_sender.py"),
             "--ip",   config["pi_ip"],
@@ -1730,6 +1810,94 @@ def api_mosfet():
     STATE["mosfet_on"] = state
     emit_status()
     return jsonify({"ok": ok, "msg": msg, "mosfet_on": state})
+
+
+@app.route("/api/manual_pwm", methods=["GET"])
+def api_manual_pwm_get():
+    return jsonify({
+        "ok": True,
+        "enabled": bool(STATE.get("manual_pwm_enabled")),
+        "aux_pwm": list(STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS))),
+        "aux_labels": MANUAL_AUX_LABELS,
+    })
+
+
+@app.route("/api/manual_pwm", methods=["POST"])
+def api_manual_pwm():
+    data = request.get_json(force=True) or {}
+    action = (data.get("action") or "").strip().lower()
+
+    if action == "toggle":
+        enabled = bool(data.get("enabled"))
+        ok, msg = _send_pi_arm_control({"cmd": "manual_pwm", "enabled": enabled})
+        if ok:
+            STATE["manual_pwm_enabled"] = enabled
+            if enabled:
+                STATE["manual_aux_pwm"] = list(MANUAL_AUX_DEFAULTS)
+        emit_status()
+        return jsonify({
+            "ok": ok,
+            "msg": msg,
+            "enabled": STATE.get("manual_pwm_enabled", False),
+            "aux_pwm": list(STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS))),
+        })
+
+    if action == "center":
+        ok, msg = _send_pi_arm_control({"cmd": "manual_pwm", "center": True, "enabled": True})
+        if ok:
+            STATE["manual_pwm_enabled"] = True
+            STATE["manual_aux_pwm"] = list(MANUAL_AUX_DEFAULTS)
+        emit_status()
+        return jsonify({
+            "ok": ok,
+            "msg": msg,
+            "enabled": STATE.get("manual_pwm_enabled", False),
+            "aux_pwm": list(STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS))),
+        })
+
+    if action == "set":
+        aux = data.get("aux")
+        pwm = data.get("pwm")
+        parsed = None
+        if aux is not None and pwm is not None:
+            try:
+                parsed = (int(aux), _clamp_arm_pwm(pwm))
+            except (TypeError, ValueError):
+                parsed = None
+        elif data.get("line"):
+            parsed = _parse_manual_pwm_line(str(data.get("line")))
+
+        if not parsed:
+            return jsonify({
+                "ok": False,
+                "msg": "Use AUX 1–7 or J1–J6/claw plus PWM (e.g. 'J1 1500', '4 1500', 'claw 1600')",
+            })
+        aux_i, pwm_i, label = parsed
+        ok, msg = _send_pi_arm_control({
+            "cmd": "manual_pwm",
+            "enabled": True,
+            "aux": aux_i,
+            "pwm": pwm_i,
+        })
+        if ok:
+            STATE["manual_pwm_enabled"] = True
+            aux_list = list(STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS)))
+            while len(aux_list) < 7:
+                aux_list.append(1500)
+            aux_list[aux_i - 1] = pwm_i
+            STATE["manual_aux_pwm"] = aux_list
+        emit_status()
+        return jsonify({
+            "ok": ok,
+            "msg": msg,
+            "aux": aux_i,
+            "pwm": pwm_i,
+            "label": label,
+            "enabled": STATE.get("manual_pwm_enabled", False),
+            "aux_pwm": list(STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS))),
+        })
+
+    return jsonify({"ok": False, "msg": "action must be toggle, set, or center"})
 
 
 @app.route("/api/mode", methods=["POST"])
@@ -1902,6 +2070,8 @@ def api_status():
         "telemetry_record_file": STATE.get("telemetry_record_file", ""),
         "link_health":           _compute_link_health(),
         "arm_last_pwm":          STATE.get("arm_last_pwm"),
+        "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
+        "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(MANUAL_AUX_DEFAULTS)),
     })
 
 

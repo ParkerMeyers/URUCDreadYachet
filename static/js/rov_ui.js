@@ -555,6 +555,140 @@ function hideArmPresetsOutside(e) {
   if (e.target === document.getElementById('arm-presets-modal')) hideArmPresets();
 }
 
+// ── Manual AUX PWM (direct Pix6 AUX override on Pi) ───────────
+const MANUAL_AUX_LABELS = ['J5', 'J2', 'J6', 'J1', 'J3', 'J4', 'Claw'];
+const MANUAL_AUX_DEFAULTS = [1500, 1500, 1500, 1500, 1500, 1500, 1515];
+let _manualPwmEnabled = false;
+let _manualAuxPwm = MANUAL_AUX_DEFAULTS.slice();
+
+function buildManualPwmGrid() {
+  const grid = document.getElementById('manual-pwm-grid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  for (let i = 0; i < 7; i++) {
+    const cell = document.createElement('div');
+    cell.className = 'manual-pwm-cell';
+    cell.id = 'manual-pwm-cell-' + (i + 1);
+    cell.innerHTML =
+      `<span class="aux-name">AUX${i + 1} ${MANUAL_AUX_LABELS[i]}</span>` +
+      `<span class="aux-val">${_manualAuxPwm[i]}</span>`;
+    grid.appendChild(cell);
+  }
+}
+
+function updateManualPwmUI() {
+  const status = document.getElementById('manual-pwm-status');
+  const barBtn = document.getElementById('btn-manual-pwm');
+  const onBtn = document.getElementById('btn-manual-pwm-on');
+  const offBtn = document.getElementById('btn-manual-pwm-off');
+  if (status) {
+    status.textContent = 'Manual mode: ' + (_manualPwmEnabled ? 'ON' : 'OFF');
+    status.className = 'manual-pwm-status' + (_manualPwmEnabled ? ' on' : '');
+  }
+  if (barBtn) barBtn.classList.toggle('manual-active', _manualPwmEnabled);
+  if (onBtn) onBtn.disabled = _manualPwmEnabled;
+  if (offBtn) offBtn.disabled = !_manualPwmEnabled;
+  for (let i = 0; i < 7; i++) {
+    const cell = document.getElementById('manual-pwm-cell-' + (i + 1));
+    if (cell) {
+      const valEl = cell.querySelector('.aux-val');
+      if (valEl) valEl.textContent = _manualAuxPwm[i];
+    }
+  }
+}
+
+async function loadManualPwmState() {
+  try {
+    const r = await fetch('/api/manual_pwm');
+    const d = await r.json();
+    if (d.ok) {
+      _manualPwmEnabled = !!d.enabled;
+      if (Array.isArray(d.aux_pwm) && d.aux_pwm.length >= 7) {
+        _manualAuxPwm = d.aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
+      }
+      updateManualPwmUI();
+    }
+  } catch (_) {}
+}
+
+function showManualPwm() {
+  buildManualPwmGrid();
+  loadManualPwmState();
+  document.getElementById('manual-pwm-modal').style.display = 'flex';
+  const inp = document.getElementById('manual-pwm-input');
+  if (inp) setTimeout(() => inp.focus(), 100);
+}
+
+function hideManualPwm() {
+  document.getElementById('manual-pwm-modal').style.display = 'none';
+}
+
+function hideManualPwmOutside(e) {
+  if (e.target === document.getElementById('manual-pwm-modal')) hideManualPwm();
+}
+
+async function setManualPwmEnabled(enabled) {
+  await saveConfig();
+  const r = await fetch('/api/manual_pwm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'toggle', enabled: !!enabled }),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    _manualPwmEnabled = !!d.enabled;
+    if (Array.isArray(d.aux_pwm)) _manualAuxPwm = d.aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
+    updateManualPwmUI();
+    toast(
+      _manualPwmEnabled ? 'Manual AUX ON — arm_sender ignored on Pi' : 'Manual AUX OFF',
+      _manualPwmEnabled ? 'warn' : ''
+    );
+  } else {
+    toast(d.msg || 'Manual mode toggle failed', 'err');
+  }
+}
+
+async function sendManualPwmLine() {
+  await saveConfig();
+  const inp = document.getElementById('manual-pwm-input');
+  const line = inp ? inp.value.trim() : '';
+  if (!line) return;
+  const r = await fetch('/api/manual_pwm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'set', line }),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    _manualPwmEnabled = !!d.enabled;
+    if (Array.isArray(d.aux_pwm)) _manualAuxPwm = d.aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
+    updateManualPwmUI();
+    const who = d.label || `AUX${d.aux} (${MANUAL_AUX_LABELS[d.aux - 1]})`;
+    toast(`${who} → ${d.pwm} µs`, 'ok');
+    if (inp) inp.value = '';
+  } else {
+    toast(d.msg || 'Invalid command — use: 6 1500', 'err');
+  }
+}
+
+async function centerManualPwm() {
+  await saveConfig();
+  const r = await fetch('/api/manual_pwm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'center' }),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    _manualPwmEnabled = !!d.enabled;
+    _manualAuxPwm = MANUAL_AUX_DEFAULTS.slice();
+    updateManualPwmUI();
+    toast('All joints centered (claw → 1515 µs)', 'ok');
+  } else {
+    toast(d.msg || 'Center failed', 'err');
+  }
+}
+
 async function toggleTelemetryRecord() {
   const action = _telemetryRecording ? 'stop' : 'start';
   const r = await fetch('/api/telemetry_record', {
@@ -787,6 +921,14 @@ function updateStatus() {
     _armLastPwm = s.arm_last_pwm;
     updateArmCurrentDisplay();
   }
+
+  if (typeof s.manual_pwm_enabled !== 'undefined') {
+    _manualPwmEnabled = !!s.manual_pwm_enabled;
+  }
+  if (Array.isArray(s.manual_aux_pwm) && s.manual_aux_pwm.length >= 7) {
+    _manualAuxPwm = s.manual_aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
+  }
+  updateManualPwmUI();
 
   updateLinkHealthPill(s.link_health);
   updatePreDiveChecklist(s);

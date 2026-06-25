@@ -495,6 +495,45 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 }
 .arm-preset-form-actions { display:flex; gap:8px; flex-wrap:wrap; }
 
+/* ── manual AUX PWM ── */
+.manual-pwm-box { width:min(640px,96vw); }
+.manual-pwm-desc {
+  font-size:0.82rem; color:var(--dim); line-height:1.5; margin-bottom:14px;
+}
+.manual-pwm-desc code { color:var(--accent2); font-size:0.78rem; }
+.manual-pwm-toggle-row {
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:16px;
+}
+.manual-pwm-status {
+  font-family:var(--mono); font-size:0.78rem; font-weight:600;
+  padding:6px 12px; border-radius:6px; background:var(--bg3); border:1px solid var(--border);
+}
+.manual-pwm-status.on { color:var(--green); border-color:var(--green); }
+.manual-pwm-cmd-row {
+  display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:14px;
+}
+.manual-pwm-cmd-row label { font-size:0.72rem; color:var(--dim); min-width:4rem; }
+.manual-pwm-cmd-row input {
+  flex:1; min-width:160px; padding:8px 10px; font-family:var(--mono);
+  background:var(--bg3); border:1px solid var(--border); border-radius:6px; color:var(--text);
+}
+.manual-pwm-grid {
+  display:grid; grid-template-columns:repeat(2, 1fr); gap:8px; margin-bottom:10px;
+}
+@media(min-width:520px){ .manual-pwm-grid { grid-template-columns:repeat(4, 1fr); } }
+.manual-pwm-cell {
+  padding:8px 10px; background:var(--bg3); border:1px solid var(--border);
+  border-radius:8px; font-family:var(--mono); font-size:0.75rem;
+}
+.manual-pwm-cell .aux-name { color:var(--accent2); font-size:0.68rem; display:block; }
+.manual-pwm-cell .aux-val { font-size:0.9rem; font-weight:700; color:var(--text); }
+.manual-pwm-hint {
+  font-size:0.68rem; color:var(--dim); font-family:var(--mono); margin:0;
+}
+#btn-manual-pwm.manual-active {
+  border-color:var(--green); color:var(--green); background:rgba(0,224,138,.12);
+}
+
 /* Gamepad diagram */
 .gp-diagram {
   background:var(--bg3); border:1px solid var(--border); border-radius:10px;

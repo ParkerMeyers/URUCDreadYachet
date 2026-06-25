@@ -43,7 +43,7 @@
     <div class="config-group">
       <h3>Topside Hardware</h3>
       <div class="field"><label>Serial Port (Arm Controller)</label>
-        <input id="cfg-serial_port" type="text" value="COM3"/></div>
+        <input id="cfg-serial_port" type="text" value="auto" placeholder="auto or COM3"/></div>
       <div class="field"><label>Forward Camera URL (Pi port 8161)</label>
         <input id="cfg-forward_camera_url" type="text" value="http://192.168.69.100:8161"/></div>
       <div class="field"><label>Arm Camera URL (Pi port 8160)</label>
@@ -288,6 +288,7 @@
 
     <span class="control-label">Arm</span>
     <span id="arm-preset-btns" class="arm-preset-btns"></span>
+    <button class="action-btn" id="btn-manual-pwm" onclick="showManualPwm()">⌨ Manual AUX</button>
     <button class="action-btn" onclick="showArmPresets()">⚙ Presets</button>
 
   </div>
@@ -553,6 +554,41 @@
           </div>
         </div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════
+     MANUAL AUX PWM MODAL
+     ══════════════════════════════════════════════════ -->
+<div id="manual-pwm-modal" class="modal-overlay" style="display:none" onclick="hideManualPwmOutside(event)">
+  <div class="modal-box manual-pwm-box">
+    <div class="modal-header">
+      <h2>⌨ Manual AUX PWM</h2>
+      <button class="btn btn-secondary" style="padding:4px 12px;font-size:.8rem"
+              onclick="hideManualPwm()">Close ✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="manual-pwm-desc">
+        Direct PWM to Pix6 AUX outputs (500–2500 µs). When enabled, overrides
+        <code>arm_sender.py</code> / <code>new_ar.py</code> UDP commands.
+      </p>
+      <div class="manual-pwm-toggle-row">
+        <button class="btn btn-danger" id="btn-manual-pwm-off" onclick="setManualPwmEnabled(false)">Manual OFF</button>
+        <button class="btn btn-success" id="btn-manual-pwm-on" onclick="setManualPwmEnabled(true)">Manual ON</button>
+        <span id="manual-pwm-status" class="manual-pwm-status">Manual mode: OFF</span>
+      </div>
+      <div class="manual-pwm-cmd-row">
+        <label for="manual-pwm-input">Command</label>
+        <input id="manual-pwm-input" type="text" placeholder="J1 1500  or  4 1500  or  claw 1600"
+               onkeydown="if(event.key==='Enter')sendManualPwmLine()"/>
+        <button class="btn btn-primary" onclick="sendManualPwmLine()">Send</button>
+        <button class="btn btn-secondary" onclick="centerManualPwm()">Center all</button>
+      </div>
+      <div class="manual-pwm-grid" id="manual-pwm-grid"></div>
+      <p class="manual-pwm-hint">
+        By joint: J1→AUX4 · J2→AUX2 · J3→AUX5 · J4→AUX6 · J5→AUX1 · J6→AUX3 · Claw→AUX7 (1515 µs stop)
+      </p>
     </div>
   </div>
 </div>

@@ -4,37 +4,128 @@ import socket
 import serial
 import time
 import argparse
+from serial.tools import list_ports
 
 # ── Argument parsing (allows web UI to pass config at launch) ────────────────
 _parser = argparse.ArgumentParser(description="ROV Arm Sender")
 _parser.add_argument("--ip",   type=str, default="192.168.69.100",
                      help="Pi IP address (default 192.168.69.100)")
-_parser.add_argument("--port", type=str, default="/dev/ttyACM0",
-                     help="Serial port (default /dev/ttyACM0, Windows: COM3)")
+_parser.add_argument("--port", type=str, default="auto",
+                     help="Serial port, or 'auto' to scan (Windows: COM*, Linux: ttyACM*)")
 _parser.add_argument("--udp-port", type=int, default=5006,
                      help="UDP destination port on Pi (default 5006)")
+_parser.add_argument("--scan-timeout", type=float, default=2.0,
+                     help="Seconds to listen on each port while scanning (default 2.0)")
 _args = _parser.parse_args()
 # ─────────────────────────────────────────────────────────────────────────────
 
-SERIAL_PORT = _args.port
 BAUD = 115200
-
 PI_IP = _args.ip
 UDP_PORT = _args.udp_port
-
 PRINT_EVERY = 0.1
+PROBE_TIMEOUT_SEC = max(0.5, float(_args.scan_timeout))
 
 J6_TARGET_MIN_DEG = -90.0
 J6_TARGET_MAX_DEG = 90.0
 
+
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
+
 
 def clamp_pwm(x):
     return max(500, min(2500, int(round(float(x)))))
 
+
 def clamp_angle(x):
     return clamp(float(x), J6_TARGET_MIN_DEG, J6_TARGET_MAX_DEG)
+
+
+def _looks_like_arm_line(raw: str) -> bool:
+    """True when a serial line matches arm controller PWM CSV output."""
+    line = raw.strip()
+    if not line:
+        return False
+    if line.startswith("PWM:"):
+        line = line[4:]
+    parts = line.split(",")
+    if len(parts) < 8:
+        return False
+    try:
+        for part in parts[:8]:
+            float(part.strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _port_description(port_name: str) -> str:
+    for info in list_ports.comports():
+        if info.device == port_name:
+            bits = [info.description or ""]
+            if info.manufacturer:
+                bits.append(info.manufacturer)
+            if info.vid is not None:
+                bits.append(f"VID:PID={info.vid:04X}:{info.pid:04X}")
+            return " | ".join(x for x in bits if x)
+    return ""
+
+
+def _probe_port(port_name: str) -> bool:
+    """Open port briefly and look for arm-controller PWM lines."""
+    try:
+        ser = serial.Serial(port_name, BAUD, timeout=0.15)
+    except (serial.SerialException, PermissionError, OSError) as e:
+        print(f"  skip {port_name}: {e}")
+        return False
+    try:
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            pass
+        deadline = time.time() + PROBE_TIMEOUT_SEC
+        while time.time() < deadline:
+            raw = ser.readline().decode(errors="ignore").strip()
+            if _looks_like_arm_line(raw):
+                return True
+        print(f"  skip {port_name}: no arm PWM data in {PROBE_TIMEOUT_SEC:.1f}s")
+        return False
+    finally:
+        ser.close()
+
+
+def resolve_serial_port(requested: str) -> str:
+    """Find the arm controller on a serial port (preferred first, then scan all)."""
+    available = [p.device for p in list_ports.comports()]
+    req = (requested or "auto").strip()
+
+    if req.lower() in ("auto", ""):
+        candidates = list(available)
+    else:
+        candidates = [req] + [p for p in available if p != req]
+
+    if not candidates:
+        raise SystemExit(
+            "No serial ports found. Plug in the arm controller USB and try again."
+        )
+
+    print(f"Scanning {len(candidates)} serial port(s) for arm controller...")
+    for port in candidates:
+        desc = _port_description(port)
+        label = f"{port} ({desc})" if desc else port
+        print(f"  trying {label} ...")
+        if _probe_port(port):
+            print(f"Arm controller found on {port}")
+            return port
+
+    listed = ", ".join(candidates)
+    raise SystemExit(
+        f"No arm controller found. Tried: {listed}\n"
+        "Check USB cable, power, and that no other program has the port open."
+    )
+
+
+SERIAL_PORT = resolve_serial_port(_args.port)
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -42,7 +133,6 @@ try:
     ser = serial.Serial(SERIAL_PORT, BAUD, timeout=0.1)
 except Exception as e:
     print(f"ERROR: Could not open serial port {SERIAL_PORT}: {e}")
-    print("Check that the arm controller is connected and the port is correct.")
     raise SystemExit(1)
 
 print(f"Reading serial: {SERIAL_PORT} @ {BAUD}")

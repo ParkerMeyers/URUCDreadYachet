@@ -18,13 +18,13 @@ Commands at the prompt:
     q           center all then exit
 
 Joint map (AUX1-8 → Pix6 AUX outputs, RC channels 9-16):
-    1  J4         (AUX1 → RC ch 9  → SERVO9)
-    2  J1         (AUX2 → RC ch 10 → SERVO10)
-    3  J3         (AUX3 → RC ch 11 → SERVO11)
-    4  J6_cont    (AUX4 → RC ch 12 → SERVO12)  continuous rotation
-    5  J5_check   (AUX5 → RC ch 13 → SERVO13)  holding torque — verify wiring
-    6  J2         (AUX6 → RC ch 14 → SERVO14)
-    7  J7_check   (AUX7 → RC ch 15 → SERVO15)  holding torque — verify wiring
+    1  J5         (AUX1 → RC ch 9  → SERVO9)
+    2  J2         (AUX2 → RC ch 10 → SERVO10)
+    3  J6_cont    (AUX3 → RC ch 11 → SERVO11)  continuous rotation, center 1500
+    4  J1         (AUX4 → RC ch 12 → SERVO12)
+    5  J3         (AUX5 → RC ch 13 → SERVO13)
+    6  J4         (AUX6 → RC ch 14 → SERVO14)
+    7  Claw       (AUX7 → RC ch 15 → SERVO15)  continuous rotation, center 1515
     8  spare      (AUX8 → RC ch 16 → SERVO16)  unused
 
 Mission Planner parameters required (set once, write params):
@@ -49,13 +49,13 @@ AUX_CHANNELS  = 8
 # ─────────────────────────────────────────────────────────────────────────────
 
 JOINT_NAMES = {
-    1: "J4",          # AUX1 → RC ch 9
-    2: "J1",          # AUX2 → RC ch 10
-    3: "J3",          # AUX3 → RC ch 11
-    4: "J6_cont",     # AUX4 → RC ch 12  (continuous rotation)
-    5: "J5_check",    # AUX5 → RC ch 13  (holding torque — verify wiring)
-    6: "J2",          # AUX6 → RC ch 14
-    7: "J7_check",    # AUX7 → RC ch 15  (holding torque — verify wiring)
+    1: "J5",          # AUX1 → RC ch 9
+    2: "J2",          # AUX2 → RC ch 10
+    3: "J6_cont",     # AUX3 → RC ch 11  (continuous rotation, center 1500)
+    4: "J1",          # AUX4 → RC ch 12
+    5: "J3",          # AUX5 → RC ch 13
+    6: "J4",          # AUX6 → RC ch 14
+    7: "Claw",        # AUX7 → RC ch 15  (continuous rotation, center 1515)
     8: "spare",       # AUX8 → RC ch 16  (unused)
 }
 
