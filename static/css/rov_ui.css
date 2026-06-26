@@ -308,6 +308,32 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 }
 .disarmed-banner.hidden { display:none; }
 
+/* Arm grip active overlay (GRIP_ON) */
+.grip-status-banner {
+  position:absolute; top:50%; left:50%; transform:translate(-50%, -50%);
+  background:rgba(0, 32, 20, 0.88); color:var(--green);
+  padding:14px 36px; border-radius:12px;
+  font-weight:800; font-size:1.35rem; letter-spacing:3px;
+  z-index:6; pointer-events:none;
+  border:2px solid var(--green);
+  text-shadow:0 0 12px var(--green), 0 0 24px rgba(0, 224, 138, 0.6);
+  box-shadow:0 0 20px rgba(0, 224, 138, 0.5), 0 4px 24px rgba(0, 0, 0, 0.6);
+  animation:grip-glow-flash 0.85s ease-in-out infinite;
+}
+.grip-status-banner.hidden { display:none; }
+@keyframes grip-glow-flash {
+  0%, 100% {
+    opacity:1;
+    box-shadow:0 0 28px rgba(0, 224, 138, 0.85), 0 0 48px rgba(0, 224, 138, 0.45), 0 4px 24px rgba(0, 0, 0, 0.6);
+    text-shadow:0 0 16px var(--green), 0 0 32px rgba(0, 224, 138, 0.7);
+  }
+  50% {
+    opacity:0.55;
+    box-shadow:0 0 8px rgba(0, 224, 138, 0.35), 0 4px 16px rgba(0, 0, 0, 0.5);
+    text-shadow:0 0 6px rgba(0, 224, 138, 0.4);
+  }
+}
+
 .cam-label {
   position:absolute; top:8px; left:10px; z-index:4;
   font-size:0.65rem; letter-spacing:1.5px; text-transform:uppercase;
@@ -484,6 +510,12 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 
 /* ── arm presets ── */
 .arm-preset-btns { display:flex; gap:4px; flex-wrap:wrap; max-width:280px; }
+.action-btn.preset-active,
+.arm-preset-row-actions button.preset-active {
+  border-color: var(--accent); color: var(--accent);
+  background: rgba(0, 180, 255, .14);
+  box-shadow: 0 0 0 1px rgba(0, 180, 255, .25);
+}
 .arm-presets-box { width:min(920px,96vw); }
 .arm-presets-layout {
   display:grid; grid-template-columns:minmax(200px, 1fr) minmax(280px, 1.4fr);

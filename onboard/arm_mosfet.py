@@ -29,8 +29,13 @@ def _ensure() -> bool:
     try:
         _handle = lgpio.gpiochip_open(0)
         lgpio.gpio_claim_output(_handle, PIN, 0)
-    except OSError as e:
+    except (OSError, lgpio.error) as e:
         _warn_once(f"GPIO init failed: {e}")
+        if _handle is not None:
+            try:
+                lgpio.gpiochip_close(_handle)
+            except (OSError, lgpio.error):
+                pass
         _handle = None
         return False
     return True
@@ -48,7 +53,11 @@ def set_enabled(enabled: bool) -> None:
     import lgpio
 
     level = 1 if enabled else 0
-    lgpio.gpio_write(_handle, PIN, level)
+    try:
+        lgpio.gpio_write(_handle, PIN, level)
+    except (OSError, lgpio.error) as e:
+        _warn_once(f"GPIO write failed: {e}")
+        return
     _enabled = enabled
     print(f"[arm-mosfet] GPIO {PIN} {'ON' if enabled else 'OFF'}", flush=True)
 
@@ -66,7 +75,7 @@ def shutdown() -> None:
     try:
         lgpio.gpio_write(_handle, PIN, 0)
         lgpio.gpiochip_close(_handle)
-    except OSError:
+    except (OSError, lgpio.error):
         pass
     _handle = None
 

@@ -42,6 +42,7 @@ from arm_joints import (
     build_rc_override,
     clamp_joint_pwm,
     default_joint_pwm,
+    joint_center_us,
     joint_pwm_to_csv_list,
     joint_to_rc_ch,
     parse_arm_controller_csv,
@@ -59,8 +60,15 @@ ARM_TELEM_PORT = 5006
 TIMEOUT_SEC = 0.75
 PRESET_MOTION_TIMEOUT_SEC = 45.0
 
+# Output slew — smooths preset moves and filters manual / arm_sender jitter (µs per second).
+SLEW_US_PER_SEC_PRESET = 4500.0
+SLEW_US_PER_SEC_ARM = 2200.0
+SLEW_US_PER_SEC_MANUAL = 850.0
+SLEW_SNAP_US = 2
+
 _lock = threading.Lock()
-_pwm = default_joint_pwm()
+_pwm_cmd = default_joint_pwm()
+_pwm_out = default_joint_pwm()
 _claw_stop = CLAW_STOP_US_DEFAULT
 _last_pkt_time = 0.0
 _rx_count = 0
@@ -68,6 +76,7 @@ _arm_enabled = False
 _manual_mode = False
 _preset_motion = False
 _preset_motion_since = 0.0
+_preset_hold = False
 _fc_rc: dict[int, int] = {}
 _fc_srv: dict[int, int] = {}
 _mavlink_ok = False
@@ -109,7 +118,7 @@ def _hold_neutral(last_pkt: float) -> bool:
 def _snapshot() -> tuple[dict[int, int], float, int, bool, bool, bool, bool, int]:
     with _lock:
         return (
-            dict(_pwm),
+            dict(_pwm_out),
             _last_pkt_time,
             _rx_count,
             _arm_enabled,
@@ -120,32 +129,73 @@ def _snapshot() -> tuple[dict[int, int], float, int, bool, bool, bool, bool, int
         )
 
 
-def _effective_pwm() -> dict[int, int]:
-    pwm, last_pkt, _, armed, manual, preset, _, claw = _snapshot()
+def _desired_pwm() -> dict[int, int]:
+    with _lock:
+        cmd = dict(_pwm_cmd)
+        last_pkt = _last_pkt_time
+        armed = _arm_enabled
+        manual = _manual_mode
+        preset = _preset_motion
+        claw = int(_claw_stop)
     if not armed:
         return default_joint_pwm(claw_stop=claw)
     if manual or preset:
-        return pwm
+        return cmd
     if _hold_neutral(last_pkt):
         return default_joint_pwm(claw_stop=claw)
-    return pwm
+    return cmd
+
+
+def _slew_rate_us_per_sec() -> float:
+    with _lock:
+        if _preset_motion:
+            return SLEW_US_PER_SEC_PRESET
+        if _manual_mode:
+            return SLEW_US_PER_SEC_MANUAL
+    return SLEW_US_PER_SEC_ARM
+
+
+def _slew_step(dt: float) -> None:
+    desired = _desired_pwm()
+    rate = _slew_rate_us_per_sec()
+    max_step = max(1.0, rate * max(dt, 1.0 / OVERRIDE_HZ))
+    with _lock:
+        claw = int(_claw_stop)
+        for joint in range(1, NUM_JOINTS + 1):
+            target = clamp_joint_pwm(
+                joint,
+                desired.get(joint, joint_center_us(joint, claw_stop=claw if joint == 4 else None)),
+                claw_stop=claw,
+            )
+            current = _pwm_out[joint]
+            delta = target - current
+            if abs(delta) <= SLEW_SNAP_US:
+                _pwm_out[joint] = target
+            else:
+                step = max(-max_step, min(max_step, delta))
+                _pwm_out[joint] = int(round(current + step))
+
+
+def _effective_pwm() -> dict[int, int]:
+    with _lock:
+        return dict(_pwm_out)
 
 
 def _apply_pwm(updates: dict[int, int], *, from_csv: bool = False) -> None:
-    global _pwm, _last_pkt_time, _rx_count
+    global _pwm_cmd, _last_pkt_time, _rx_count
     with _lock:
         for joint, us in updates.items():
             if 1 <= joint <= NUM_JOINTS:
-                _pwm[joint] = clamp_joint_pwm(joint, us, claw_stop=_claw_stop)
+                _pwm_cmd[joint] = clamp_joint_pwm(joint, us, claw_stop=_claw_stop)
         _last_pkt_time = time.time()
         if from_csv:
             _rx_count += 1
 
 
 def _center_all() -> None:
-    global _pwm, _last_pkt_time
+    global _pwm_cmd, _last_pkt_time
     with _lock:
-        _pwm = default_joint_pwm(claw_stop=int(_claw_stop))
+        _pwm_cmd = default_joint_pwm(claw_stop=int(_claw_stop))
         _last_pkt_time = time.time()
 
 
@@ -166,6 +216,7 @@ def _poll_mavlink(master) -> None:
 
 
 def _send_override(master) -> None:
+    _slew_step(1.0 / OVERRIDE_HZ)
     send_rc_channels_override(master, build_rc_override(_effective_pwm()), ignore=RC_IGNORE)
 
 
@@ -314,15 +365,17 @@ def _handle_csv_line(line: str) -> None:
 
 
 def _apply_arm_enable(cmd: dict) -> None:
-    global _arm_enabled, _manual_mode, _preset_motion, _last_pkt_time
+    global _arm_enabled, _manual_mode, _preset_motion, _preset_hold, _last_pkt_time
     enabled = bool(cmd.get("enabled", False))
     with _lock:
         _arm_enabled = enabled
         if not enabled:
             _manual_mode = False
             _preset_motion = False
+            _preset_hold = False
         else:
             _preset_motion = False
+            _preset_hold = False
             _last_pkt_time = time.time()
     mosfet_set_enabled(enabled)
     print(f"[arm] Arm {'ENABLED' if enabled else 'DISABLED'}", flush=True)
@@ -343,7 +396,7 @@ def _apply_arm_claw_stop(cmd: dict) -> None:
 
 
 def _apply_preset_motion(cmd: dict) -> None:
-    global _preset_motion, _manual_mode, _preset_motion_since, _last_pkt_time
+    global _preset_motion, _manual_mode, _preset_motion_since, _preset_hold, _last_pkt_time, _pwm_cmd
     enabled = bool(cmd.get("enabled", False))
     with _lock:
         if not _arm_enabled and enabled:
@@ -353,7 +406,14 @@ def _apply_preset_motion(cmd: dict) -> None:
         if enabled:
             _manual_mode = False
             _last_pkt_time = time.time()
-    print(f"[arm] Preset motion {'ON' if enabled else 'OFF'}", flush=True)
+            _pwm_cmd = dict(_pwm_out)
+            if "hold" in cmd:
+                _preset_hold = bool(cmd.get("hold"))
+        else:
+            _preset_hold = False
+            _pwm_cmd = dict(_pwm_out)
+    hold_tag = " (hold)" if enabled and _preset_hold else ""
+    print(f"[arm] Preset motion {'ON' if enabled else 'OFF'}{hold_tag}", flush=True)
 
 
 def _apply_preset_step(cmd: dict) -> None:
@@ -386,6 +446,7 @@ def _apply_manual_pwm(cmd: dict) -> None:
     if "enabled" in cmd and cmd.get("aux") is None and cmd.get("joint") is None:
         with _lock:
             _manual_mode = bool(cmd.get("enabled"))
+            _pwm_cmd = dict(_pwm_out)
         print(f"[arm] Manual mode {'ON' if cmd.get('enabled') else 'OFF'}", flush=True)
         return
 
@@ -451,14 +512,15 @@ def _handle_json(cmd: dict, addr: tuple[str, int] | None) -> None:
 
 
 def _maybe_clear_stale_preset(now: float) -> None:
-    global _preset_motion, _preset_motion_since
+    global _preset_motion, _preset_motion_since, _preset_hold
     with _lock:
-        if not _preset_motion or _preset_motion_since <= 0:
+        if not _preset_motion or _preset_motion_since <= 0 or _preset_hold:
             return
         if (now - _preset_motion_since) < PRESET_MOTION_TIMEOUT_SEC:
             return
         _preset_motion = False
         _preset_motion_since = 0.0
+        _preset_hold = False
     print("[arm] Preset motion timeout — resuming arm_sender", flush=True)
 
 

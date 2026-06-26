@@ -50,8 +50,9 @@ ARM_DEFAULT_PWM = joint_pwm_to_csv_list(default_joint_pwm())
 JOINT_NEUTRAL_PWM = {j: joint_center_us(j) for j in range(1, 5)}
 
 ARM_PRESET_JOINT_ORDER = (5, 4, 0, 6)  # J3→J2→J1→Claw (CSV indices)
-ARM_PRESET_DELAY_MIN_SEC = 0.45
-ARM_PRESET_DELAY_MAX_SEC = 4.0
+ARM_PRESET_SLEW_US_PER_SEC = 4500  # match onboard/new_ar.py preset slew rate
+ARM_PRESET_DELAY_MIN_SEC = 0.06
+ARM_PRESET_DELAY_MAX_SEC = 0.55
 
 MANUAL_AUX_LABELS = ["J2", "—", "J3", "—", "J1", "—", "Claw"]
 MANUAL_AUX_DEFAULTS = joint_pwm_to_csv_list(default_joint_pwm())

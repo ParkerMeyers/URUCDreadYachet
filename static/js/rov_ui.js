@@ -20,6 +20,7 @@ let _videoRecording = false;
 let _videoRecordSession = '';
 let _videoRecordMode = '';
 let _missionPollTimer = null;
+let _wasOnboardCam = false;
 let socket = null;
 
 function socketEmit(event, data) {
@@ -114,6 +115,19 @@ function handleOnboardProgress({ step, status, msg, time }) {
     if (btn) btn.disabled = false;
     stopOnboardPoll();
   }
+
+  if ((step === 'camera' || step === 'complete') && status === 'done') {
+    _restartCamerasIfControlOpen();
+  }
+}
+
+function _controlPanelActive() {
+  const control = document.getElementById('control');
+  return !!(control && control.classList.contains('active'));
+}
+
+function _restartCamerasIfControlOpen() {
+  if (_controlPanelActive()) startAllCameras();
 }
 
 function startOnboardPoll() {
@@ -301,18 +315,21 @@ let _pendingConfirm = {
   manualSince: 0,
 };
 
-function _playToneSequence(enabled, count) {
+function _beepSequenceDurationMs(count, offsetSec = 0) {
+  const tone = 0.08;
+  const gap = 0.035;
+  return Math.ceil((offsetSec + count * tone + Math.max(0, count - 1) * gap) * 1000) + 50;
+}
+
+function _playFreqSequence(freqs, offsetSec = 0) {
   const ctx = _getAudioCtx();
-  if (!ctx) return;
-  const freqs = count === 3
-    ? (enabled ? [440, 554, 698] : [698, 554, 440])
-    : (enabled ? [880, 1175] : [349, 262]);
+  if (!ctx || !freqs.length) return;
   const tone = 0.08;
   const gap = 0.035;
   const vol = 1.1;
   const attack = 0.005;
   const release = 0.022;
-  const t0 = ctx.currentTime;
+  const t0 = ctx.currentTime + offsetSec;
   freqs.forEach((freq, i) => {
     const start = t0 + i * (tone + gap);
     const end = start + tone;
@@ -331,6 +348,13 @@ function _playToneSequence(enabled, count) {
   });
 }
 
+function _playToneSequence(enabled, count) {
+  const freqs = count === 3
+    ? (enabled ? [440, 554, 698] : [698, 554, 440])
+    : (enabled ? [880, 1175] : [349, 262]);
+  _playFreqSequence(freqs);
+}
+
 /** Three short tones — pitch rises when enabling, falls when disabling. */
 function playEnableDisableSound(enabled) {
   _playToneSequence(enabled, 3);
@@ -341,53 +365,40 @@ function playConfirmSound(enabled) {
   _playToneSequence(enabled, 2);
 }
 
-/** Filtered noise burst — unique to STABILIZE mode. */
-function playStabilizeNoise(short) {
-  const ctx = _getAudioCtx();
-  if (!ctx) return;
-  const duration = short ? 0.1 : 0.18;
-  const vol = short ? 0.9 : 1.1;
-  const bufferSize = Math.ceil(ctx.sampleRate * duration);
-  const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
-  const data = buffer.getChannelData(0);
-  for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
-
-  const source = ctx.createBufferSource();
-  source.buffer = buffer;
-  const filter = ctx.createBiquadFilter();
-  filter.type = 'bandpass';
-  filter.frequency.value = short ? 1400 : 900;
-  filter.Q.value = 0.7;
-  const gain = ctx.createGain();
-  const t0 = ctx.currentTime;
-  const attack = 0.006;
-  const release = short ? 0.02 : 0.03;
-  gain.gain.setValueAtTime(0.001, t0);
-  gain.gain.exponentialRampToValueAtTime(vol, t0 + attack);
-  gain.gain.setValueAtTime(vol, t0 + duration - release);
-  gain.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
-  source.connect(filter);
-  filter.connect(gain);
-  gain.connect(ctx.destination);
-  source.start(t0);
-  source.stop(t0 + duration + 0.01);
+/** Distinct rising beeps for STABILIZE mode. */
+function playStabilizeBeep(short, offsetSec = 0) {
+  const freqs = short ? [784, 988] : [587, 740, 932];
+  _playFreqSequence(freqs, offsetSec);
+  return _beepSequenceDurationMs(freqs.length, offsetSec);
 }
 
 function _playModeSound(mode, prevMode) {
+  let speechDelay = 0;
   if (mode === 'disarmed') {
     playEnableDisableSound(false);
+    speechDelay = _beepSequenceDurationMs(3);
   } else if (mode === 'stabilize') {
-    if (prevMode === 'disarmed') playEnableDisableSound(true);
-    playStabilizeNoise(false);
+    let offset = 0;
+    if (prevMode === 'disarmed') {
+      playEnableDisableSound(true);
+      offset = 3 * 0.08 + 2 * 0.035 + 0.04;
+    }
+    speechDelay = playStabilizeBeep(false, offset);
   } else {
     playEnableDisableSound(true);
+    speechDelay = _beepSequenceDurationMs(3);
   }
-  speakModeStatus(mode, _initialBeepDurationMs(mode, prevMode));
+  speakStatus(_modeSpeechLabel(mode), speechDelay);
+}
+
+function playActionFeedback(enabled, speech) {
+  playEnableDisableSound(enabled);
+  speakStatus(speech, _beepSequenceDurationMs(3));
 }
 
 // ── Offline TTS (browser system voices via Web Speech API) ──
 let _ttsVoice = null;
-let _modeSpeakTimer = null;
+let _speakTimer = null;
 
 function _initTtsVoices() {
   if (!window.speechSynthesis) return;
@@ -424,29 +435,11 @@ function _modeSpeechLabel(mode) {
   return '';
 }
 
-function _initialBeepDurationMs(mode, prevMode) {
-  const tone = 0.08;
-  const gap = 0.035;
-  const threeToneSec = 3 * tone + 2 * gap;
-  const noiseSec = 0.18;
-  let sec = 0;
-  if (mode === 'disarmed') {
-    sec = threeToneSec;
-  } else if (mode === 'stabilize') {
-    sec = Math.max(prevMode === 'disarmed' ? threeToneSec : 0, noiseSec);
-  } else {
-    sec = threeToneSec;
-  }
-  return Math.ceil(sec * 1000) + 50;
-}
-
-function speakModeStatus(mode, delayMs) {
-  if (!window.speechSynthesis) return;
-  const text = _modeSpeechLabel(mode);
-  if (!text) return;
-  if (_modeSpeakTimer) clearTimeout(_modeSpeakTimer);
-  _modeSpeakTimer = setTimeout(() => {
-    _modeSpeakTimer = null;
+function speakStatus(text, delayMs = 0) {
+  if (!window.speechSynthesis || !text) return;
+  if (_speakTimer) clearTimeout(_speakTimer);
+  _speakTimer = setTimeout(() => {
+    _speakTimer = null;
     speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text);
     u.volume = 1;
@@ -482,7 +475,7 @@ function checkPendingConfirmSounds(t) {
         const pendingMode = _pendingConfirm.mode;
         _clearPendingConfirm('mode');
         if (pendingMode === 'stabilize') {
-          playStabilizeNoise(true);
+          playStabilizeBeep(true);
         } else {
           playConfirmSound(wantEnabled);
         }
@@ -525,6 +518,7 @@ function isRobotArmed() {
 
 function updateArmControlsUI() {
   const armed = isRobotArmed();
+  const presetHasControl = _presetRunning || !!_activePresetName;
   const presetsLocked = !armed || _presetRunning;
   document.querySelectorAll('#arm-preset-btns .action-btn').forEach(btn => {
     btn.disabled = presetsLocked;
@@ -532,8 +526,8 @@ function updateArmControlsUI() {
   });
   const manualBtn = document.getElementById('btn-manual-pwm');
   if (manualBtn) {
-    manualBtn.disabled = !armed || _presetRunning;
-    manualBtn.classList.toggle('disabled', !armed || _presetRunning);
+    manualBtn.disabled = !armed || presetHasControl;
+    manualBtn.classList.toggle('disabled', !armed || presetHasControl);
   }
 }
 
@@ -554,7 +548,7 @@ async function setArmMosfet(enabled) {
     _armMosfetEnabled = !!d.enabled;
     updateMosfetUI();
     _setPendingConfirm('mosfet', !!d.enabled);
-    playEnableDisableSound(!!d.enabled);
+    playActionFeedback(!!d.enabled, d.enabled ? 'Arm power on' : 'Arm power off');
     toast(d.msg || (`Motor power ${d.enabled ? 'ON' : 'OFF'}`), 'ok');
   } else {
     toast(d.msg || 'MOSFET command failed', 'err');
@@ -596,17 +590,21 @@ function handlePresetProgress(data) {
   if (!data) return;
   if (data.status === 'running') {
     _presetRunning = true;
+    if (data.preset) _activePresetName = data.preset;
     const joint = data.joint || '?';
     const step = data.step || '?';
     const total = data.total || '?';
     toast(`Preset ${data.label || data.preset}: ${joint} (${step}/${total})`, '');
   } else if (data.status === 'done') {
     _presetRunning = false;
-    toast(data.msg || `Preset ${data.label || data.preset} complete`, 'ok');
+    if (data.preset) _activePresetName = data.preset;
+    toast(data.msg || `Preset ${data.label || data.preset} active`, 'ok');
   } else if (data.status === 'error') {
     _presetRunning = false;
+    _activePresetName = '';
     toast(data.msg || 'Preset failed', 'err');
   }
+  renderArmPresetButtons();
   updateArmControlsUI();
 }
 
@@ -634,6 +632,7 @@ async function setMode(mode) {
       _ctrlState.depth_hold = false;
       _ctrlState.yaw_hold   = false;
       _manualPwmEnabled = false;
+      _activePresetName = '';
       updateManualPwmUI();
     } else if (mode === 'stabilize') {
       // Stabilize mode enables stabilization automatically
@@ -720,12 +719,24 @@ async function sendArmPreset(name) {
   const r = await fetch(`/api/arm_preset/${encodeURIComponent(name)}`, { method: 'POST' });
   const d = await r.json();
   const label = (_armPresets[name] && _armPresets[name].label) || name;
+  if (d.released) {
+    _activePresetName = '';
+    renderArmPresetButtons();
+    updateArmControlsUI();
+    playActionFeedback(false, 'Preset off');
+    toast(d.msg || `Released ${label} — arm control restored`, 'ok');
+    return;
+  }
   if (d.ok && d.sequential) {
     _presetRunning = true;
+    _activePresetName = name;
+    renderArmPresetButtons();
     updateArmControlsUI();
+    playActionFeedback(true, `Preset ${label}`);
     toast(d.msg || `Moving to ${label} (J3→J2→J1→Claw)…`, 'ok');
   } else {
     toast(d.ok ? `Arm preset: ${label}` : d.msg, d.ok ? 'ok' : 'err');
+    if (d.ok) playActionFeedback(true, `Preset ${label}`);
   }
 }
 
@@ -745,6 +756,7 @@ let _armPresets = {};
 let _armLastPwm = null;
 let _armPresetEditing = null;
 let _presetRunning = false;
+let _activePresetName = '';
 
 async function loadArmPresets() {
   try {
@@ -769,7 +781,12 @@ function renderArmPresetButtons() {
   }
   wrap.innerHTML = names.map(name => {
     const label = (_armPresets[name] && _armPresets[name].label) || name;
-    return `<button type="button" class="action-btn" onclick="sendArmPreset('${name}')" title="${name}">${escapeHtml(label)}</button>`;
+    const isActive = name === _activePresetName;
+    const title = isActive
+      ? `${name} — click to release arm control`
+      : name;
+    const cls = 'action-btn' + (isActive ? ' preset-active' : '');
+    return `<button type="button" class="${cls}" onclick="sendArmPreset('${name}')" title="${title}">${escapeHtml(label)}</button>`;
   }).join('');
   updateArmControlsUI();
 }
@@ -903,12 +920,14 @@ function renderArmPresetList() {
     const p = _armPresets[name];
     const meta = ARM_JOINT_NAMES.map((jn, i) => `${jn}=${(p.pwm || [])[ARM_CSV_INDICES[i]] ?? ARM_JOINT_LIMITS[i].neutral}`).join(' ');
     const label = escapeHtml(p.label || name);
+    const isActive = name === _activePresetName;
+    const goLabel = isActive ? 'Release' : 'Go';
     return `<div class="arm-preset-row">
       <div class="arm-preset-row-name">${label}
         <div class="arm-preset-row-meta">${escapeHtml(meta)}</div>
       </div>
       <div class="arm-preset-row-actions">
-        <button type="button" onclick="sendArmPreset('${name}')">Go</button>
+        <button type="button" class="${isActive ? 'preset-active' : ''}" onclick="sendArmPreset('${name}')">${goLabel}</button>
         <button type="button" onclick="editArmPreset('${name}')">Edit</button>
         <button type="button" class="danger" onclick="deleteArmPreset('${name}')">Del</button>
       </div>
@@ -1086,7 +1105,10 @@ async function setManualPwmEnabled(enabled) {
     applyManualPwmPayload(d);
     updateManualPwmUI();
     _setPendingConfirm('manual', _manualPwmEnabled);
-    playEnableDisableSound(_manualPwmEnabled);
+    playActionFeedback(
+      _manualPwmEnabled,
+      _manualPwmEnabled ? 'Manual mode on' : 'Manual mode off'
+    );
     toast(
       _manualPwmEnabled ? 'Manual mode ON — gamepad/arm_sender ignored on Pi' : 'Manual mode OFF',
       _manualPwmEnabled ? 'warn' : ''
@@ -1783,6 +1805,7 @@ function toggleDepthHold() {
   if (_currentMode === 'disarmed') { toast('Switch to ARMED or STABILIZE mode first', 'warn'); return; }
   _ctrlState.depth_hold = !_ctrlState.depth_hold;
   updateFlagUI();
+  playActionFeedback(_ctrlState.depth_hold, _ctrlState.depth_hold ? 'Depth hold on' : 'Depth hold off');
   toast(`Depth Hold: ${_ctrlState.depth_hold ? 'ON' : 'OFF'}`, _ctrlState.depth_hold ? 'ok' : '');
 }
 
@@ -1790,6 +1813,7 @@ function toggleYawHold() {
   if (_currentMode === 'disarmed') { toast('Switch to ARMED or STABILIZE mode first', 'warn'); return; }
   _ctrlState.yaw_hold = !_ctrlState.yaw_hold;
   updateFlagUI();
+  playActionFeedback(_ctrlState.yaw_hold, _ctrlState.yaw_hold ? 'Yaw hold on' : 'Yaw hold off');
   toast(`Yaw Hold: ${_ctrlState.yaw_hold ? 'ON' : 'OFF'}`, _ctrlState.yaw_hold ? 'ok' : '');
 }
 
@@ -1908,6 +1932,12 @@ function updateArmPipelineTelemetry(t) {
     _armMosfetEnabled = t.arm_mosfet_enabled;
     updateMosfetUI();
   }
+
+  const gripBanner = document.getElementById('grip-status-banner');
+  if (gripBanner) {
+    const gripping = t.arm_grip_on === true || t.arm_grip_on === 1;
+    gripBanner.classList.toggle('hidden', !gripping);
+  }
 }
 
 function updateStatus() {
@@ -1918,6 +1948,10 @@ function updateStatus() {
   setDot('dot-arm',      s.onboard_arm);
   setDot('dot-cam',      s.onboard_cam);
   setDot('dot-armlocal', s.arm_running);
+  if (s.onboard_cam && !_wasOnboardCam && _controlPanelActive()) {
+    startAllCameras();
+  }
+  _wasOnboardCam = !!s.onboard_cam;
   updateOpenControlButton(s);
 
   // Telemetry listener status on launch screen
@@ -1964,6 +1998,10 @@ function updateStatus() {
   if (typeof s.preset_running === 'boolean') {
     _presetRunning = s.preset_running;
   }
+  if (typeof s.preset_active_name === 'string') {
+    _activePresetName = s.preset_active_name || '';
+  }
+  renderArmPresetButtons();
   updateArmControlsUI();
 
   const ap = document.getElementById('tel-arm-proc');
@@ -2986,7 +3024,6 @@ function setupCamera(imgId, noSigId, camNum) {
     if (st.noSigT) { clearTimeout(st.noSigT); st.noSigT = null; }
     noSig.style.display = 'none';
     img.style.display = 'block';
-    if (camNum === 1) _maybeStartCam2();
   }
 
   function armWatchdog() {
@@ -3110,25 +3147,13 @@ function setupCamera(imgId, noSigId, camNum) {
   loadStream(false);
 }
 
-let _cam2StartT = null;
-
-function _maybeStartCam2() {
-  if (_cameraState[2] || _cam2StartT) return;
-  _cam2StartT = setTimeout(() => {
-    _cam2StartT = null;
-    if (!_cameraState[2]) setupCamera('cam2', 'no-sig-2', 2);
-  }, 400);
-}
-
 function startAllCameras() {
   stopAllCameras();
-  if (_cam2StartT) { clearTimeout(_cam2StartT); _cam2StartT = null; }
-  setupCamera('cam1', 'no-sig-1', 1);
-  // Arm cam waits for forward first frame (or timeout) — dual USB open often flakes.
-  _cam2StartT = setTimeout(() => {
-    _cam2StartT = null;
-    if (!_cameraState[2]) setupCamera('cam2', 'no-sig-2', 2);
-  }, 4000);
+  // Arm cam first — USB cam0 / Pi :8160. Forward (:8161) is staggered so dual-USB
+  // Pis avoid V4L2 open races; starting forward first used to restart arm via
+  // _maybeStartCam2 and left arm stuck on "No Signal".
+  setupCamera('cam2', 'no-sig-2', 2);
+  setTimeout(() => setupCamera('cam1', 'no-sig-1', 1), 800);
 }
 
 function bindCameraResize() {

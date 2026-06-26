@@ -193,7 +193,9 @@ def _status_service(name: str, svc: dict) -> dict:
 
 
 def cmd_start(name: str, extra_args: str = "") -> dict:
-    mosfet_init()
+    # new_ar.py owns GPIO 27 once arm is running — do not reclaim for cam.
+    if name != "cam":
+        mosfet_init()
     svc = SERVICES[name]
     pid = _start_service(svc, extra_args)
     return {"ok": True, "name": name, "pid": pid}

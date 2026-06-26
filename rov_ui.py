@@ -160,15 +160,12 @@ def _current_arm_pose() -> list[int]:
 
 
 def _joint_move_delay_sec(from_us: int, to_us: int) -> float:
-    """Wait time proportional to PWM travel (full span ≈ max delay)."""
+    """Wait for onboard slew to finish one joint step before moving the next."""
     delta = abs(_clamp_arm_pwm(to_us) - _clamp_arm_pwm(from_us))
     if delta < 12:
-        return 0.0
-    span = float(ARM_PWM_MAX - ARM_PWM_MIN)
-    travel = delta / span
-    delay = ARM_PRESET_DELAY_MIN_SEC + travel * (
-        ARM_PRESET_DELAY_MAX_SEC - ARM_PRESET_DELAY_MIN_SEC
-    )
+        return ARM_PRESET_DELAY_MIN_SEC
+    move_sec = delta / float(ARM_PRESET_SLEW_US_PER_SEC)
+    delay = move_sec + 0.04
     return round(min(ARM_PRESET_DELAY_MAX_SEC, max(ARM_PRESET_DELAY_MIN_SEC, delay)), 3)
 
 
@@ -181,6 +178,7 @@ def _run_preset_sequence(preset_name: str, preset: dict) -> None:
     """Move joints one at a time J3→J2→J1→Claw with distance-based pauses."""
     label = str(preset.get("label") or preset_name)
     target_pwms = clamp_arm_pwm_list(preset["pwm"])
+    success = False
 
     try:
         _send_pi_arm_control({"cmd": "preset_motion", "enabled": True})
@@ -226,11 +224,12 @@ def _run_preset_sequence(preset_name: str, preset: dict) -> None:
             if delay > 0:
                 time.sleep(delay)
 
+        success = True
         _emit_preset_progress({
             "status": "done",
             "preset": preset_name,
             "label": label,
-            "msg": f"Preset '{label}' complete",
+            "msg": f"Preset '{label}' active — click again to release arm control",
         })
     except Exception as e:
         _emit_preset_progress({
@@ -240,10 +239,14 @@ def _run_preset_sequence(preset_name: str, preset: dict) -> None:
             "msg": str(e),
         })
     finally:
-        _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
         with _state_lock:
             STATE["preset_running"] = False
-            STATE["preset_active_name"] = ""
+        if success:
+            _send_pi_arm_control({"cmd": "preset_motion", "enabled": True, "hold": True})
+        else:
+            _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
+            with _state_lock:
+                STATE["preset_active_name"] = ""
         emit_status()
 
 
@@ -422,10 +425,22 @@ def _apply_disarmed_arm_lockout():
     _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
 
 
+def _release_preset_control() -> None:
+    """Return arm joint control to arm_sender / gamepad."""
+    _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
+    with _state_lock:
+        STATE["preset_active_name"] = ""
+    emit_status()
+
+
 def _sync_arm_unlock():
-    """Allow arm motion on the Pi (clears stale preset lock)."""
+    """Allow arm motion on the Pi (re-sync preset hold if latched)."""
     _send_pi_arm_control({"cmd": "arm_enable", "enabled": True})
-    if not STATE.get("preset_running"):
+    if STATE.get("preset_running"):
+        return
+    if STATE.get("preset_active_name"):
+        _send_pi_arm_control({"cmd": "preset_motion", "enabled": True, "hold": True})
+    else:
         _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
 
 
@@ -1776,7 +1791,7 @@ def api_start_onboard():
             service_specs = [
                 ("stabilization", "stab", "onboard_stab", 75.0, ""),
                 ("arm_ctrl", "arm", "onboard_arm", 45.0, ""),
-                ("camera", "cam", "onboard_cam", 30.0, cam_args),
+                ("camera", "cam", "onboard_cam", 45.0, cam_args),
             ]
             service_labels = {
                 "stabilization": "stabilization.py",
@@ -2294,17 +2309,27 @@ def api_arm_preset(name):
     if not _robot_armed():
         return jsonify({"ok": False, "msg": "Arm presets disabled while DISARMED"}), 403
     normalize_arm_presets()
-    preset = config.get("arm_presets", {}).get(_slug_preset_name(name))
+    slug = _slug_preset_name(name)
+    preset = config.get("arm_presets", {}).get(slug)
     if not preset:
         return jsonify({"ok": False, "msg": f"Unknown preset: {name}"}), 404
+    label = str(preset.get("label") or slug)
+    if STATE.get("preset_active_name") == slug and not STATE.get("preset_running"):
+        _release_preset_control()
+        return jsonify({
+            "ok": True,
+            "msg": f"Preset '{label}' released — arm control restored",
+            "released": True,
+            "preset": slug,
+        })
     try:
-        ok, msg = _start_preset_sequence(_slug_preset_name(name), preset)
+        ok, msg = _start_preset_sequence(slug, preset)
         if not ok:
             return jsonify({"ok": False, "msg": msg}), 409
         return jsonify({
             "ok": True,
             "msg": msg,
-            "preset": name,
+            "preset": slug,
             "sequential": True,
         })
     except Exception as e:

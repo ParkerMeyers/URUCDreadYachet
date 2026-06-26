@@ -152,6 +152,10 @@ def list_capture_devices(*, usb_only: bool = False) -> list[str]:
     return [dev for _, dev in devices]
 
 
+def _device_node_exists(device: str) -> bool:
+    return Path(device).exists()
+
+
 def resolve_camera_device(requested: str, used: set[str]) -> str:
     """
     Pick a capture-capable V4L2 node.
@@ -580,16 +584,19 @@ def main() -> None:
         cam1_dev, args.width, args.height, args.fps, args.quality,
     )
 
+    cam1_present = _device_node_exists(cam1_dev)
+
     if HAVE_CV2:
-        _v4l2_prepare_all([cam0_dev, cam1_dev], args.width, args.height)
-        _log("[cam] Starting both capture threads in parallel")
+        prepare_devs = [cam0_dev]
+        if cam1_present:
+            prepare_devs.append(cam1_dev)
+        else:
+            _log(f"[cam] {cam1_dev} not found — forward feed will use placeholders")
+        _v4l2_prepare_all(prepare_devs, args.width, args.height)
+        _log("[cam] Starting capture thread(s)")
         stream0.start()
-        stream1.start()
-        _log("[cam] Waiting for first frames...")
-        r0 = stream0.wait_ready(20.0)
-        r1 = stream1.wait_ready(20.0)
-        if not r0 or not r1:
-            _log(f"[cam] WARNING: capture slow — cam0={r0} cam1={r1} (serving placeholders until ready)")
+        if cam1_present:
+            stream1.start()
 
     t0 = threading.Thread(
         target=_serve_camera, args=(stream0, args.port0),
@@ -607,6 +614,21 @@ def main() -> None:
 
     t0.start()
     t1.start()
+
+    if HAVE_CV2:
+        def _wait_first_frames() -> None:
+            _log("[cam] Waiting for first frames...")
+            r0 = stream0.wait_ready(12.0)
+            r1 = stream1.wait_ready(3.0) if cam1_present else False
+            if not r0 or (cam1_present and not r1):
+                _log(
+                    f"[cam] WARNING: capture slow — cam0={r0} cam1={r1} "
+                    "(serving placeholders until ready)"
+                )
+
+        threading.Thread(
+            target=_wait_first_frames, daemon=True, name="cam-warmup",
+        ).start()
 
     try:
         while True:
