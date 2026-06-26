@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
+"""Forward arm-controller serial PWM (motor-native µs) to the Pi over UDP."""
 
 import socket
 import serial
 import time
 import argparse
+from pathlib import Path
 from serial.tools import list_ports
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from topside.util import clamp_arm_pwm_list
 
 # ── Argument parsing (allows web UI to pass config at launch) ────────────────
 _parser = argparse.ArgumentParser(description="ROV Arm Sender")
@@ -33,10 +39,6 @@ def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 
-def clamp_pwm(x):
-    return max(500, min(2500, int(round(float(x)))))
-
-
 def clamp_angle(x):
     return clamp(float(x), J6_TARGET_MIN_DEG, J6_TARGET_MAX_DEG)
 
@@ -49,10 +51,10 @@ def _looks_like_arm_line(raw: str) -> bool:
     if line.startswith("PWM:"):
         line = line[4:]
     parts = line.split(",")
-    if len(parts) < 8:
+    if len(parts) < 7:
         return False
     try:
-        for part in parts[:8]:
+        for part in parts[:7]:
             float(part.strip())
         return True
     except ValueError:
@@ -137,8 +139,9 @@ except Exception as e:
 
 print(f"Reading serial: {SERIAL_PORT} @ {BAUD}")
 print(f"Sending UDP to: {PI_IP}:{UDP_PORT}")
-print("Output format: PWM1,PWM2,PWM3,PWM4,PWM5,J6_PWM,PWM7,J6_TARGET_ANGLE")
-print("Example: 1500,1500,1500,1500,1500,1500,1500,-12.35")
+print("Output format: J1,J2,J3,J4,J5,J2,J3,Claw [, angle]  (motor-native µs)")
+print("Active fields: idx0=J1/M13, idx4=J2/M9, idx5=J3/M11, idx6=Claw/M15")
+print("Example: 1400,1500,1500,1500,1600,1500,1425,-12.35")
 
 last_print = 0
 
@@ -155,22 +158,26 @@ while True:
 
     parts = line.split(",")
 
-    if len(parts) < 8:
-        print(f"BAD SHORT LINE, need 8 values: {raw}")
+    if len(parts) < 7:
+        print(f"BAD SHORT LINE, need 7+ PWM values: {raw}")
         continue
 
     try:
-        pwms = [clamp_pwm(x) for x in parts[:7]]
-
-        # 8th serial value from controller becomes J6 target angle
-        j6_target_angle = clamp_angle(parts[7])
-        j6_target_angle_text = f"{j6_target_angle:.2f}"
-
-    except ValueError:
+        pwms = clamp_arm_pwm_list(parts[:7])
+    except (ValueError, TypeError):
         print(f"BAD NUMBER LINE: {raw}")
         continue
 
-    send_line = ",".join(str(x) for x in pwms) + f",{j6_target_angle_text}"
+    # Pi new_ar.py uses 7 joint PWM fields; 8th serial field (angle) is optional.
+    if len(parts) >= 8:
+        try:
+            angle = clamp_angle(parts[7])
+            send_line = ",".join(str(x) for x in pwms) + f",{angle:.2f}"
+        except ValueError:
+            send_line = ",".join(str(x) for x in pwms)
+    else:
+        send_line = ",".join(str(x) for x in pwms)
+
     sock.sendto(send_line.encode(), (PI_IP, UDP_PORT))
 
     now = time.time()

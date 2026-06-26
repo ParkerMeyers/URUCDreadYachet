@@ -73,6 +73,7 @@ MAVLINK_RECONNECT_COOLDOWN_SEC = 5.0
 MAVLINK_MAX_MSGS_PER_POLL = 500
 MAVLINK_SENSOR_RESYNC_SEC = 2.0
 MAVLINK_SENSOR_RECONNECT_SEC = 5.0
+MAVLINK_SILENT_LINK_SEC = 8.0
 
 DEPTH_HOLD_VERTICAL_DEADZONE = 0.08
 DEPTH_RECAPTURE_DELAY_SEC = 0.75
@@ -570,6 +571,7 @@ class MavlinkReader:
         self.last_rate_request = 0.0
         self.last_pressure_debug_print = 0.0
         self._connected_at = 0.0
+        self._logged_fc_fallback = False
 
         self._connect()
 
@@ -588,21 +590,48 @@ class MavlinkReader:
         self.last_depth_update = 0.0
         self.last_any_message = 0.0
         self._connected_at = time.time()
+        self._logged_fc_fallback = False
+
+    def _note_heartbeat(self, msg) -> None:
+        """Adopt FC system/component from a vehicle HEARTBEAT."""
+        try:
+            mav_type = int(getattr(msg, "type", -1))
+        except (TypeError, ValueError):
+            mav_type = -1
+        if mav_type == mavutil.mavlink.MAV_TYPE_GCS:
+            return
+        src_sys = int(msg.get_srcSystem() or 0)
+        if src_sys <= 0:
+            return
+        self.master.target_system = src_sys
+        src_comp = int(msg.get_srcComponent() or 0)
+        self.master.target_component = (
+            src_comp if src_comp > 0 else mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1
+        )
+        self._logged_fc_fallback = False
 
     def _fc_targets(self):
-        """Return (system, component) once heartbeat has identified the FC."""
+        """Return MAVLink target system/component for the FC."""
         target_system = int(getattr(self.master, "target_system", 0) or 0)
         target_component = int(getattr(self.master, "target_component", 0) or 0)
         if target_system == 0:
-            return None
+            # Single Pixhawk on MAVProxy — match mavlink_rc RC override default.
+            if not self._logged_fc_fallback:
+                self._logged_fc_fallback = True
+                print(
+                    "[mavlink] No FC heartbeat yet — using default target system 1 "
+                    "(will update when HEARTBEAT arrives)"
+                )
+            return 1, mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1
         if target_component == 0:
             target_component = mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1
         return target_system, target_component
 
     def link_dead(self):
+        now = time.time()
         if self.last_any_message <= 0.0:
-            return False
-        return (time.time() - self.last_any_message) > MAVLINK_LINK_TIMEOUT_SEC
+            return (now - self._connected_at) > MAVLINK_SILENT_LINK_SEC
+        return (now - self.last_any_message) > MAVLINK_LINK_TIMEOUT_SEC
 
     def attitude_age_sec(self):
         if self.last_attitude_update <= 0.0:
@@ -611,9 +640,10 @@ class MavlinkReader:
 
     def sensor_stream_stalled(self):
         """MAVLink traffic alive but ATTITUDE + depth both missing for a while."""
+        now = time.time()
         if self.last_any_message <= 0.0:
-            return False
-        if (time.time() - self.last_any_message) > MAVLINK_LINK_TIMEOUT_SEC:
+            return (now - self._connected_at) >= MAVLINK_SENSOR_RECONNECT_SEC
+        if (now - self.last_any_message) > MAVLINK_LINK_TIMEOUT_SEC:
             return False
 
         att_age = self.attitude_age_sec()
@@ -689,10 +719,6 @@ class MavlinkReader:
         self.last_rate_request = now
 
         targets = self._fc_targets()
-        if targets is None:
-            print("[mavlink] Skipping rate request — no FC heartbeat yet")
-            return
-
         target_system, target_component = targets
 
         interval_requests = [
@@ -853,6 +879,10 @@ class MavlinkReader:
         self.last_any_message = time.time()
         msg_type = msg.get_type()
 
+        if msg_type == "HEARTBEAT":
+            self._note_heartbeat(msg)
+            return False
+
         if msg_type == "ATTITUDE":
             raw_roll = wrap_180(math.degrees(msg.roll) * IMU_ROLL_SIGN)
             raw_pitch = wrap_180(math.degrees(msg.pitch) * IMU_PITCH_SIGN)
@@ -903,10 +933,11 @@ class MavlinkReader:
 
         self.request_message_rates()
 
-        # Priority pass — drain ATTITUDE / pressure before RC/heartbeat flood.
+        # Priority pass — drain HEARTBEAT / ATTITUDE / pressure before RC flood.
         for _ in range(100):
             msg = self.master.recv_match(
                 type=[
+                    "HEARTBEAT",
                     "ATTITUDE",
                     "SCALED_PRESSURE",
                     "SCALED_PRESSURE2",

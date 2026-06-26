@@ -116,7 +116,15 @@ from topside.state import (
     manual_aux_defaults,
     manual_thr_defaults,
 )
-from topside.util import clamp_arm_pwm, clamp_arm_pwm_list, clamp_claw_pwm, clamp_joint_pwm_aux, clamp_thr_pwm
+from topside.util import (
+    clamp_arm_pwm,
+    clamp_arm_pwm_list,
+    clamp_claw_pwm,
+    clamp_joint_pwm_aux,
+    clamp_thr_pwm,
+    local_ip_for_peer,
+    topside_return_ip,
+)
 from topside.ssh_manager import ssh
 
 _manual_aux_defaults = manual_aux_defaults
@@ -307,15 +315,22 @@ def _send_pi_arm_control(payload: dict) -> tuple[bool, str]:
     load_config_file()
     try:
         body = json.dumps(payload).encode("utf-8")
+        pi_ip = str(config.get("pi_ip", "")).strip()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
+            local_ip = local_ip_for_peer(pi_ip)
+            if local_ip:
+                try:
+                    sock.bind((local_ip, 0))
+                except OSError:
+                    pass
             sent_ports = []
             for port in _arm_control_ports():
-                sock.sendto(body, (config["pi_ip"], port))
+                sock.sendto(body, (pi_ip, port))
                 sent_ports.append(str(port))
         finally:
             sock.close()
-        return True, f"sent → {config['pi_ip']}:{','.join(sent_ports)}"
+        return True, f"sent → {pi_ip}:{','.join(sent_ports)}"
     except Exception as e:
         return False, str(e)
 
@@ -362,6 +377,18 @@ def _sync_arm_unlock():
     _send_pi_arm_control({"cmd": "arm_enable", "enabled": True})
     if not STATE.get("preset_running"):
         _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
+
+
+def _push_arm_state_to_pi() -> None:
+    """Push topside arm mode (DRIVE/ARMED, manual AUX) to new_ar.py on the Pi."""
+    if _robot_armed():
+        _sync_arm_unlock()
+        _sync_arm_claw_stop()
+        if STATE.get("manual_pwm_enabled"):
+            _send_pi_arm_manual({"cmd": "manual_pwm", "enabled": True})
+        _subscribe_arm_telemetry()
+    else:
+        _apply_disarmed_arm_lockout()
 
 
 def _send_arm_csv(csv_line: str):
@@ -442,6 +469,23 @@ def _parse_manual_pwm_line(line: str) -> tuple[str, int, int, str] | None:
             return None
         label = ARM_JOINT_NAMES[joint_i - 1] if joint_i <= len(ARM_JOINT_NAMES) else "Claw"
         return "aux", aux, pwm, label
+    if token.isdigit():
+        n = int(token)
+        if n in JOINT_TO_AUX:
+            aux = JOINT_TO_AUX[n]
+            pwm = _parse_aux_pwm(aux, pwm_raw)
+            if pwm is None:
+                return None
+            label = ARM_JOINT_NAMES[n - 1]
+            return "aux", aux, pwm, label
+        if 1 <= n <= 7:
+            aux = n
+            pwm = _parse_aux_pwm(aux, pwm_raw)
+            if pwm is None:
+                return None
+            label = f"AUX{aux} ({MANUAL_AUX_LABELS[aux - 1]})"
+            return "aux", aux, pwm, label
+        return None
     try:
         aux = int(parts[0])
     except (TypeError, ValueError):
@@ -675,9 +719,7 @@ def _reset_onboard_telemetry_state() -> None:
 def _on_onboard_stack_ready() -> None:
     """Re-subscribe topside listeners after Pi processes restart."""
     _reset_onboard_telemetry_state()
-    _subscribe_arm_telemetry()
-    _sync_arm_claw_stop()
-    _apply_disarmed_arm_lockout()
+    _push_arm_state_to_pi()
     socketio.emit("telemetry", _telemetry_emit_payload())
     emit_status()
 
@@ -686,9 +728,7 @@ def _on_onboard_stack_ready() -> None:
             time.sleep(delay)
             if not STATE.get("onboard_arm"):
                 continue
-            _subscribe_arm_telemetry()
-            _sync_arm_claw_stop()
-            _sync_arm_enable()
+            _push_arm_state_to_pi()
 
     socketio.start_background_task(_resync_arm_after_restart)
 
@@ -768,6 +808,9 @@ def _update_arm_telemetry_from_json(pkt: dict):
     if pkt.get("arm_claw_stop_us") is not None:
         tel["arm_claw_stop_us"] = int(pkt["arm_claw_stop_us"])
     STATE["last_arm_telemetry_time"] = time.time()
+    if not STATE.get("_arm_telemetry_rx_logged"):
+        STATE["_arm_telemetry_rx_logged"] = True
+        print("[INFO] Arm telemetry receiving from Pi")
     socketio.emit("telemetry", _telemetry_emit_payload())
 
 
@@ -778,41 +821,72 @@ def _sync_arm_claw_stop():
         "stop_us": int(config.get("arm_claw_stop_us", CLAW_STOP_US_DEFAULT)),
     })
 
-def _subscribe_arm_telemetry():
-    """Ask new_ar.py on the Pi to push arm telemetry to our UDP listener."""
+_subscribe_arm_host_logged: str | None = None
+
+
+def _arm_telemetry_port() -> int:
+    """UDP port on this PC where new_ar.py sends arm JSON telemetry."""
     try:
-        payload = json.dumps({
+        return int(config.get("arm_telemetry_port", config.get("telemetry_port", 5006)))
+    except (TypeError, ValueError):
+        return int(config.get("telemetry_port", 5006))
+
+
+def _subscribe_arm_telemetry() -> str | None:
+    """Ask new_ar.py on the Pi to push arm telemetry to our UDP listener."""
+    global _subscribe_arm_host_logged
+    try:
+        pi_ip = str(config.get("pi_ip", "")).strip()
+        if not pi_ip:
+            return None
+        tel_port = _arm_telemetry_port()
+        payload = {
             "cmd": "arm_telemetry",
             "subscribe": True,
-            "port": int(config.get("arm_telemetry_port", 5008)),
-        }).encode("utf-8")
+            "port": tel_port,
+        }
+        body = json.dumps(payload).encode("utf-8")
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            body = payload
+            local_ip = local_ip_for_peer(pi_ip)
+            if local_ip:
+                try:
+                    s.bind((local_ip, 0))
+                except OSError:
+                    pass
             for port in _arm_control_ports():
-                s.sendto(body, (config["pi_ip"], port))
+                s.sendto(body, (pi_ip, port))
         finally:
             s.close()
+        log_dest = (
+            f"{local_ip}:{tel_port}"
+            if local_ip
+            else f"<your PC IP>:{tel_port}"
+        )
+        if log_dest != _subscribe_arm_host_logged:
+            _subscribe_arm_host_logged = log_dest
+            print(f"[INFO] Arm telemetry subscribe → Pi will reply to {log_dest}")
+        return local_ip
     except Exception as e:
         print(f"[WARN] Arm telemetry subscribe failed: {e}")
-
-
-def _start_arm_telemetry_subscribe_loop():
-    """Re-subscribe periodically so new_ar picks us up after restarts."""
-    def _loop():
-        while True:
-            _subscribe_arm_telemetry()
-            # Do not re-send arm_enable / claw_stop here — that fights Pi CLI
-            # bench testing and repeats disarm lockout every 5 s while UI is disarmed.
-            time.sleep(5.0)
-
-    threading.Thread(target=_loop, daemon=True, name="arm-tel-sub").start()
+        return None
 
 
 def _start_arm_telemetry_listener():
-    """Listen for JSON arm telemetry from new_ar.py on arm_telemetry_port."""
+    """Listen for JSON arm telemetry from new_ar.py (or share thrust telemetry port)."""
+    tel_port = _arm_telemetry_port()
+    thrust_port = int(config.get("telemetry_port", 5006))
+
+    if tel_port == thrust_port:
+        STATE["arm_telemetry_listener_ok"] = STATE.get("telemetry_listener_ok", True)
+        print(
+            f"[INFO] Arm telemetry shares UDP port {tel_port} with thrust telemetry"
+        )
+        _subscribe_arm_telemetry()
+        return
+
     def _listen():
-        port = int(config.get("arm_telemetry_port", 5008))
+        port = _arm_telemetry_port()
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -822,8 +896,10 @@ def _start_arm_telemetry_listener():
             print(
                 f"[ERROR] Arm telemetry listener bind failed on port {port}: {e}"
             )
+            STATE["arm_telemetry_listener_ok"] = False
             return
 
+        STATE["arm_telemetry_listener_ok"] = True
         print(f"[INFO] Arm telemetry listener active on UDP port {port}")
         _subscribe_arm_telemetry()
         if _robot_armed():
@@ -844,6 +920,19 @@ def _start_arm_telemetry_listener():
                 pass
 
     threading.Thread(target=_listen, daemon=True, name="arm-tel-listen").start()
+
+
+def _start_arm_telemetry_subscribe_loop():
+    """Re-subscribe periodically so new_ar picks us up after restarts."""
+    def _loop():
+        while True:
+            if _robot_armed():
+                _push_arm_state_to_pi()
+            else:
+                _subscribe_arm_telemetry()
+            time.sleep(5.0)
+
+    threading.Thread(target=_loop, daemon=True, name="arm-tel-sub").start()
 
 
 def _append_telemetry_record(pkt: dict):
@@ -1706,6 +1795,8 @@ def api_start_topside():
     else:
         results["arm_sender"] = {"ok": True, "msg": "already running"}
 
+    _push_arm_state_to_pi()
+
     emit_status()
     return jsonify({"ok": True, "results": results})
 
@@ -1720,6 +1811,33 @@ def api_stop_topside():
     return jsonify({"ok": True})
 
 
+@app.route("/api/arm/sync", methods=["POST"])
+def api_arm_sync():
+    """Re-push DRIVE/ARMED + manual mode state to the Pi (after onboard restart, etc.)."""
+    _push_arm_state_to_pi()
+    tel = STATE.get("telemetry", {})
+    return jsonify({
+        "ok": True,
+        "mode": STATE.get("mode"),
+        "armed": _robot_armed(),
+        "manual_pwm_enabled": bool(STATE.get("manual_pwm_enabled")),
+        "arm_pi_enabled": tel.get("arm_enabled"),
+        "arm_manual_mode": tel.get("arm_manual_mode"),
+    })
+
+
+@app.route("/api/arm_telemetry/subscribe", methods=["POST"])
+def api_arm_telemetry_subscribe():
+    """Re-register topside as arm telemetry destination on the Pi."""
+    _push_arm_state_to_pi()
+    host = _subscribe_arm_host_logged
+    return jsonify({
+        "ok": True,
+        "host": host,
+        "port": _arm_telemetry_port(),
+    })
+
+
 @app.route("/api/arm_diagnostic", methods=["GET"])
 def api_arm_diagnostic():
     tel = STATE.get("telemetry", {})
@@ -1727,6 +1845,12 @@ def api_arm_diagnostic():
     arm_age = _arm_telemetry_age_sec()
     arm_tel_stale = arm_age is None or arm_age > 5.0
     hold_neutral = tel.get("arm_hold_neutral")
+    manual_on = bool(
+        STATE.get("manual_pwm_enabled") or tel.get("arm_manual_mode")
+    )
+    tel_port = _arm_telemetry_port()
+    tel_host = topside_return_ip(config) or "this PC"
+    age_txt = "never" if arm_age is None else f"{arm_age}s"
     checks = [
         {
             "name": "ROV mode (DRIVE/ARMED or STABILIZE)",
@@ -1735,8 +1859,16 @@ def api_arm_diagnostic():
         },
         {
             "name": "arm_sender running (topside)",
-            "ok": bool(STATE.get("arm_running")),
-            "detail": "Start via Open Control" if not STATE.get("arm_running") else "OK",
+            "ok": bool(STATE.get("arm_running")) or manual_on,
+            "detail": (
+                "Optional — Manual AUX is ON (no USB arm controller needed)"
+                if manual_on and not STATE.get("arm_running")
+                else (
+                    "Not running — OK if using Manual AUX only"
+                    if not STATE.get("arm_running")
+                    else "OK"
+                )
+            ),
         },
         {
             "name": "Onboard arm (new_ar.py on Pi)",
@@ -1754,24 +1886,46 @@ def api_arm_diagnostic():
             "detail": "Switch to DRIVE/ARMED" if not tel.get("arm_enabled") else "OK",
         },
         {
-            "name": "UDP from arm_sender (Pi rx count)",
-            "ok": not arm_tel_stale and rx is not None and int(rx) > 0,
+            "name": f"Arm telemetry from Pi (UDP {tel_port})",
+            "ok": not arm_tel_stale,
             "detail": (
-                "Waiting for arm telemetry from Pi"
+                f"No telemetry ({age_txt}) — start Onboard (new_ar.py) and allow inbound "
+                f"UDP {tel_port} on {tel_host}"
                 if arm_tel_stale
-                else f"rx={rx if rx is not None else '?'} — plug in arm USB if 0"
+                else f"OK (age {arm_age}s)"
+            ),
+        },
+        {
+            "name": "UDP from arm_sender (Pi rx count)",
+            "ok": not arm_tel_stale and (manual_on or (rx is not None and int(rx) > 0)),
+            "detail": (
+                "Need arm telemetry first"
+                if arm_tel_stale
+                else (
+                    "Manual AUX ON — arm_sender USB not required"
+                    if manual_on and not (rx and int(rx) > 0)
+                    else (
+                        f"rx={rx} — arm USB controller sending to Pi"
+                        if rx and int(rx) > 0
+                        else "rx=0 — use Manual AUX or plug arm USB + arm_sender"
+                    )
+                )
             ),
         },
         {
             "name": "Not stuck in hold-neutral",
-            "ok": not arm_tel_stale and hold_neutral is False,
+            "ok": not arm_tel_stale and (manual_on or hold_neutral is False),
             "detail": (
-                f"Arm telemetry stale ({arm_age}s) — restart onboard or check UDP 5008"
+                "Unknown — no Pi telemetry"
                 if arm_tel_stale
                 else (
-                    "Waiting for arm_sender packets"
-                    if hold_neutral
-                    else "OK"
+                    "Manual AUX ON — not using arm_sender hold logic"
+                    if manual_on
+                    else (
+                        "Hold-neutral (no arm_sender UDP yet)"
+                        if hold_neutral
+                        else "OK"
+                    )
                 )
             ),
         },
@@ -1970,12 +2124,16 @@ def api_manual_pwm():
 
         kind, idx, pwm_i, label = parsed
         if kind == "aux":
-            ok, msg = _send_pi_arm_manual({
+            payload = {
                 "cmd": "manual_pwm",
                 "enabled": True,
                 "aux": idx,
                 "pwm": pwm_i,
-            })
+            }
+            joint_i = AUX_TO_JOINT.get(idx)
+            if joint_i is not None:
+                payload["joint"] = joint_i
+            ok, msg = _send_pi_arm_manual(payload)
             if ok:
                 STATE["manual_pwm_enabled"] = True
                 aux_list = list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults())))
@@ -2034,12 +2192,11 @@ def api_mode():
         STATE["ctrl_yaw_hold"] = False
         STATE["manual_pwm_enabled"] = False
         STATE["manual_thr_pwm"] = list(_manual_thr_defaults())
-    _apply_disarmed_arm_lockout()
+        _apply_disarmed_arm_lockout()
+    else:
+        _push_arm_state_to_pi()
     warnings: list[str] = []
     if mode in ("armed", "stabilize"):
-        _sync_arm_unlock()
-        _sync_arm_claw_stop()
-        _subscribe_arm_telemetry()
         if not STATE.get("pixhawk_serial_ok"):
             warnings.append("Pixhawk USB not detected on Pi — plug in /dev/ttyACM0 and Start Onboard")
         elif not STATE.get("onboard_mavproxy"):
@@ -2407,7 +2564,13 @@ def main():
     print(f"  DreadYachet ROV Control UI")
     print(f"  Open: {url}")
     print(f"  Telemetry listening on UDP port {config['telemetry_port']}")
-    print(f"  Arm IMU telemetry on UDP port {config.get('arm_telemetry_port', 5008)}")
+    tel_port = _arm_telemetry_port()
+    arm_port_note = (
+        f"same as thrust telemetry (UDP {tel_port})"
+        if tel_port == int(config.get("telemetry_port", 5006))
+        else f"UDP port {tel_port}"
+    )
+    print(f"  Arm telemetry on {arm_port_note}")
     print(f"  Control packets -> Pi UDP port {config['thrust_udp_port']}")
     print(f"{'='*55}\n")
 

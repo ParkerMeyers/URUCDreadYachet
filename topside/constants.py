@@ -14,6 +14,7 @@ IS_WINDOWS = platform.system() == "Windows"
 
 # ── Arm (Pix6 AUX) — 4 DOF: J1, J2, J3, Claw ───────────────────────────────
 # arm_sender CSV indices for active joints: 0=J1, 4=J2, 5=J3, 6=Claw
+# Arm controller + presets use motor-native PWM (µs) — no stick scaling.
 # Hardware outputs: M13=J1, M9=J2, M11=J3 (continuous), M15=Claw (continuous)
 ARM_JOINT_NAMES = ["J1", "J2", "J3", "Claw"]
 ARM_CSV_INDICES = [0, 4, 5, 6]

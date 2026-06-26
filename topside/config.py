@@ -31,7 +31,7 @@ DEFAULT_CONFIG = {
     "telemetry_port": 5006,
     "arm_udp_port": 5006,
     "arm_control_port": 5009,
-    "arm_telemetry_port": 5008,
+    "arm_telemetry_port": 5006,
     "arm_claw_stop_us": 1425,
     "colmap_command": "python3 colmap_run.py",
     "crabs_command": "python3 crabs.py",
@@ -39,6 +39,7 @@ DEFAULT_CONFIG = {
     "mavproxy_serial": "/dev/ttyACM0",
     "mavproxy_baud": "115200",
     "mavproxy_out1": "udp:192.168.69.2:14550",
+    "topside_ip": "",
     "mavproxy_out2": MAVPROXY_ONBOARD_OUT,
     "mavproxy_out3": MAVPROXY_ARM_ONBOARD_OUT,
     "arm_presets": {

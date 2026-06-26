@@ -48,6 +48,7 @@ STATE: dict = {
     "ctrl_depth_hold": False,
     "ctrl_yaw_hold": False,
     "telemetry_listener_ok": False,
+    "arm_telemetry_listener_ok": False,
     "telemetry_recording": False,
     "telemetry_record_file": "",
     "video_recording": False,

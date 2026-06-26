@@ -200,6 +200,11 @@ class SSHManager:
         normalize_onboard_config()
         bin_ = config["mavproxy_bin"]
         ser = config["mavproxy_serial"]
+        if not self._device_exists(ser):
+            return False, (
+                f"{ser} not found on Pi — plug Pix6 USB into the Raspberry Pi "
+                f"(not the topside laptop). {self.mavproxy_diagnosis()}"
+            )
         baud = int(config.get("mavproxy_baud", 115200))
         out1, out2 = config["mavproxy_out1"], config["mavproxy_out2"]
         out3 = config.get("mavproxy_out3", MAVPROXY_ARM_ONBOARD_OUT)
@@ -296,8 +301,38 @@ class SSHManager:
         return bool(self.mavproxy_serial_candidates())
 
     def list_serial_candidates(self):
-        out, _, _ = self.exec("ls -1 /dev/ttyACM* /dev/ttyUSB* 2>/dev/null || true")
-        return [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+        """USB/UART device nodes that may be the Pixhawk (on the Pi)."""
+        out, _, _ = self.exec(
+            "ls -1 /dev/ttyACM* /dev/ttyUSB* /dev/serial/by-id/* 2>/dev/null || true"
+        )
+        seen = set()
+        ordered = []
+        for ln in out.strip().splitlines():
+            path = ln.strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            ordered.append(path)
+        return ordered
+
+    def _usb_lsusb_summary(self) -> str:
+        out, _, _ = self.exec("lsusb 2>/dev/null || true")
+        lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+        if not lines:
+            return "lsusb: no USB devices (or lsusb missing)"
+        # Highlight common FC vendors: Hex/ProfiCNC 2dae, 3DR 26ac, Cube 1209:5740, STM 0483
+        fc_markers = ("2dae:", "26ac:", "1209:5740", "0483:")
+        fc_hits = [ln for ln in lines if any(m in ln.lower() for m in fc_markers)]
+        if fc_hits:
+            return "FC USB seen but no /dev/ttyACM* — driver or cable issue: " + fc_hits[0][:80]
+        return f"{len(lines)} USB device(s), no Pixhawk-like ID — " + lines[0][:70]
+
+    def _usb_recent_dmesg(self) -> str:
+        out, _, _ = self.exec(
+            "dmesg 2>/dev/null | grep -iE 'usb|ttyACM|ttyUSB|cdc_acm' | tail -5 || true"
+        )
+        lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+        return lines[-1][:100] if lines else ""
 
     def wait_for_mavproxy_fc(self, on_wait=None) -> tuple[bool, str]:
         time.sleep(2.0)
@@ -337,14 +372,29 @@ class SSHManager:
     def mavproxy_diagnosis(self):
         ser = config.get("mavproxy_serial", "/dev/ttyACM0")
         parts = []
-        if not self.serial_port_exists():
+        if not self.any_serial_port_exists():
             parts.append(f"{ser} not found")
             alts = self.list_serial_candidates()
-            parts.append(f"available: {', '.join(alts)}" if alts else "no /dev/ttyACM* or /dev/ttyUSB* devices")
+            if alts:
+                parts.append(f"try: {', '.join(alts)}")
+            else:
+                parts.append("no /dev/ttyACM* or /dev/ttyUSB* on Pi")
+                parts.append(self._usb_lsusb_summary())
+                dmesg_hint = self._usb_recent_dmesg()
+                if dmesg_hint:
+                    parts.append(f"dmesg: {dmesg_hint}")
+                parts.append(
+                    "Check: Pix6 USB → Pi (not laptop), data cable, powered on, "
+                    "then run on Pi: ls -l /dev/ttyACM*"
+                )
+        elif not self.serial_port_exists():
+            parts.append(f"{ser} not found")
+            alts = self.list_serial_candidates()
+            parts.append(f"available: {', '.join(alts)}" if alts else "no serial devices")
         else:
             parts.append(f"{ser} exists but MAVProxy reports no link")
         log_tail = self.get_mavproxy_log(lines=20)
-        if log_tail:
+        if log_tail and self.any_serial_port_exists():
             lower = log_tail.lower()
             if "not enough free disk space" in lower or "flight logs full" in lower:
                 parts.append("Pi disk full — MAVProxy could not open tlog files")

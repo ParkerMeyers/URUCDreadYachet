@@ -13,7 +13,7 @@ UDP_TELEMETRY = 5006
 UDP_ARM_CONTROL = 5009
 
 # Pi → topside arm BNO055 telemetry
-UDP_ARM_TELEMETRY = 5008
+UDP_ARM_TELEMETRY = 5006
 
 # MAVProxy tcpin — one TCP client per port
 MAVPROXY_TCP_STAB = 5762

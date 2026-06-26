@@ -874,6 +874,25 @@ async function saveClawStopFromManual() {
   }
 }
 
+/** Load saved claw stop and re-sync arm mode (DRIVE/ARMED, manual) to Pi. */
+async function syncClawHoldToPi() {
+  try {
+    const r = await fetch('/api/arm_claw_stop');
+    const d = await r.json();
+    if (d.ok && typeof d.stop_us === 'number') {
+      _configClawStopUs = parseInt(d.stop_us, 10) || _configClawStopUs;
+    }
+    if (isRobotArmed()) {
+      await fetch('/api/arm_claw_stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stop_us: _configClawStopUs }),
+      });
+    }
+    await fetch('/api/arm/sync', { method: 'POST' });
+  } catch (_) {}
+}
+
 async function toggleTelemetryRecord() {
   const action = _telemetryRecording ? 'stop' : 'start';
   const r = await fetch('/api/telemetry_record', {
@@ -2800,6 +2819,17 @@ async function openControl() {
 
 async function _doOpenControl() {
   await saveConfig();
+  if (isRobotArmed()) {
+    await fetch('/api/mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: _currentMode }),
+    });
+  }
+  await startTopside();
+  if (!isRobotArmed()) {
+    toast('DISARMED — click DRIVE/ARMED for arm motion', 'warn');
+  }
   activateGamepad();
   document.getElementById('launch').classList.remove('active');
   document.getElementById('control').classList.add('active');

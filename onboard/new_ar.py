@@ -14,8 +14,8 @@ Physical arm (4 DOF): J1, J2, J3, Claw
     AUX2, AUX4, AUX6 — removed joints, held at neutral
     AUX8 (RC ch 16) → spare (always 1500)
 
-arm_sender still transmits 7 joint PWM values (+ optional angle field).
-Indices 1–3 (old J2–J4) and the angle field are ignored.
+arm_sender transmits 7 motor-native PWM values (+ optional angle field).
+Indices 1–3 (removed joints) are ignored; values are clamped per M9/M11/M13/M15 spec.
 
 Incoming UDP packet (comma-separated):
     J1, J2, J3, J4, J5, J6_PWM, Claw [, angle]
@@ -24,7 +24,7 @@ Incoming UDP packet (comma-separated):
 
 Manual AUX PWM (web UI, JSON on UDP port 5006 or 5009):
     {"cmd": "manual_pwm", "enabled": true}
-    {"cmd": "manual_pwm", "aux": 4, "pwm": 1500}
+    {"cmd": "manual_pwm", "aux": 5, "pwm": 1400}
     {"cmd": "manual_pwm", "center": true}
 
 Thruster manual PWM is handled by stabilization.py (UDP 5005).
@@ -50,10 +50,9 @@ IGNORE      = 65535
 OVERRIDE_HZ = 20
 PRINT_HZ    = 2
 ARM_TELEM_HZ = 5
-ARM_TELEM_PORT = 5008
+ARM_TELEM_PORT = 5006
 TIMEOUT_SEC = 0.75
-STICK_CENTER_US = 1500
-ROTATION_IN_DEADBAND = 10
+NEUTRAL_DEADBAND_US = 10
 
 # arm_sender CSV index → RC channel (AUX1=ch9 …)
 CSV_TO_RC_CH = {
@@ -125,22 +124,6 @@ def _claw_stop_us() -> int:
         return int(_claw_stop_pwm)
 
 
-def _claw_output_pwm(claw_input_us):
-    """Claw continuous rotation — centered stick/input → configured stop PWM."""
-    us = _clamp_claw_us(claw_input_us)
-    if abs(us - STICK_CENTER_US) <= ROTATION_IN_DEADBAND:
-        return _claw_stop_us()
-    return us
-
-
-def _j3_output_pwm(j3_input_us):
-    """J3 continuous rotation — centered stick/input → stop PWM (1500 µs)."""
-    us = _clamp_joint_csv(J3_CSV_IDX, j3_input_us)
-    if abs(us - STICK_CENTER_US) <= ROTATION_IN_DEADBAND:
-        return J3_STOP_US
-    return us
-
-
 def _default_joint_us():
     vals = [CENTER_US] * 7
     vals[J1_CSV_IDX] = J1_NEUTRAL_US
@@ -185,10 +168,7 @@ def _should_hold_neutral(last_pkt_time: float) -> bool:
 
 
 def _pwm_for_csv_index(joint_us: list, csv_idx: int) -> int:
-    if csv_idx == CLAW_CSV_IDX:
-        return _claw_output_pwm(joint_us[csv_idx])
-    if csv_idx == J3_CSV_IDX:
-        return _j3_output_pwm(joint_us[csv_idx])
+    """Pass motor-native PWM through (arm controller already uses M9/M11/M13/M15 ranges)."""
     return _clamp_joint_csv(csv_idx, joint_us[csv_idx])
 
 
@@ -226,7 +206,7 @@ def _send_arm_telemetry() -> None:
         armed = _arm_enabled
         manual = _manual_mode
         preset = _preset_motion
-    hold_neutral = _should_hold_neutral(last_pkt)
+    hold_neutral = False if manual else _should_hold_neutral(last_pkt)
 
     payload = json.dumps({
         "type": "arm",
@@ -406,8 +386,9 @@ def _handle_arm_control_json(cmd: dict, addr) -> None:
         _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
     elif cmd.get("cmd") == "arm_telemetry" and cmd.get("subscribe"):
         port = int(cmd.get("port", ARM_TELEM_PORT))
-        _note_telemetry_subscriber(addr[0], port)
-        print(f"[arm] Arm telemetry → {addr[0]}:{port}", flush=True)
+        host = str(addr[0]).strip()
+        _note_telemetry_subscriber(host, port)
+        print(f"[arm] Arm telemetry → {host}:{port}\n", flush=True)
         _send_arm_telemetry()
     elif cmd.get("cmd") == "arm_claw_stop":
         _apply_arm_claw_stop_cmd(cmd)
@@ -446,13 +427,18 @@ def _send_rc_override(master, rc):
 
 
 def _build_rc_manual(aux_vals=None):
+    """Build RC override from manual AUX PWM — same CSV→channel path as arm_sender."""
     rc = [IGNORE] * 18
     if aux_vals is None:
         with _lock:
             aux_vals = list(_manual_aux_pwm)
-    for aux_i in range(1, 8):
-        val = aux_vals[aux_i - 1]
-        rc[8 + aux_i - 1] = _clamp_aux_pwm(aux_i, val)
+    joint_us = [CENTER_US] * 7
+    for aux_i, csv_idx in AUX_TO_CSV.items():
+        joint_us[csv_idx] = aux_vals[aux_i - 1]
+    for csv_idx, rc_ch in CSV_TO_RC_CH.items():
+        rc[rc_ch - 1] = _pwm_for_csv_index(joint_us, csv_idx)
+    for rc_ch in REMOVED_RC_CHS:
+        rc[rc_ch - 1] = CENTER_US
     rc[SPARE_RC_CH - 1] = CENTER_US
     return rc
 
@@ -613,7 +599,7 @@ def _maybe_warn_servo_mismatch(rc: list, fc_rc: dict, fc_srv: dict, hold_neutral
     targets = []
     for rc_ch in CSV_TO_RC_CH.values():
         val = rc[rc_ch - 1]
-        if val == IGNORE or abs(val - _neutral_pwm_for_rc_ch(rc_ch)) <= ROTATION_IN_DEADBAND:
+        if val == IGNORE or abs(val - _neutral_pwm_for_rc_ch(rc_ch)) <= NEUTRAL_DEADBAND_US:
             continue
         targets.append((rc_ch, int(val)))
     if not targets or not fc_rc:
