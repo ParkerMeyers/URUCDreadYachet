@@ -38,7 +38,6 @@ import platform
 import argparse
 import threading
 import subprocess
-import webbrowser
 from pathlib import Path
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -761,6 +760,7 @@ def _reset_onboard_telemetry_state() -> None:
     tel["arm_hold_neutral"] = None
     tel["arm_rx_count"] = None
     tel["arm_enabled"] = None
+    tel["arm_mosfet_enabled"] = None
     tel["arm_mavlink_ok"] = None
     tel["arm_joint_us"] = None
     tel["arm_joints"] = None
@@ -852,6 +852,8 @@ def _update_arm_telemetry_from_json(pkt: dict):
     tel = STATE["telemetry"]
     if pkt.get("arm_enabled") is not None:
         tel["arm_enabled"] = bool(pkt.get("arm_enabled"))
+    if pkt.get("arm_mosfet_enabled") is not None:
+        tel["arm_mosfet_enabled"] = bool(pkt.get("arm_mosfet_enabled"))
     if pkt.get("arm_rx_count") is not None:
         tel["arm_rx_count"] = int(pkt.get("arm_rx_count"))
     if pkt.get("arm_hold_neutral") is not None:
@@ -1238,6 +1240,7 @@ def emit_status():
         "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", CLAW_STOP_US_DEFAULT)),
         "arm_motion_enabled":    _robot_armed(),
         "arm_pi_enabled":        STATE.get("telemetry", {}).get("arm_enabled"),
+        "arm_mosfet_enabled":    STATE.get("telemetry", {}).get("arm_mosfet_enabled"),
     })
 
 
@@ -1668,6 +1671,8 @@ def api_start_onboard():
             ok_sync, msg_sync = ssh.sync_onboard_files()
             _emit_onboard_progress("sync", "done" if ok_sync else "error", msg_sync)
 
+            ssh.disable_arm_mosfet()
+
             # Step 1: MAVProxy (try configured port, then auto-detect ttyACM/ttyUSB)
             normalize_onboard_config()
             preferred_serial = config.get("mavproxy_serial", "/dev/ttyACM0")
@@ -1979,6 +1984,24 @@ def api_arm_claw_stop():
         "ok": ok,
         "msg": msg or f"Claw stop PWM set to {int(stop_us)} µs",
         "stop_us": int(stop_us),
+    })
+
+
+@app.route("/api/arm/mosfet", methods=["POST"])
+def api_arm_mosfet():
+    """Manually enable/disable arm motor power (GPIO 27). Arm/disarm still auto-syncs."""
+    data = request.get_json(force=True) or {}
+    if "enabled" not in data:
+        return jsonify({"ok": False, "msg": "enabled required"}), 400
+    enabled = bool(data.get("enabled"))
+    ok, msg = _send_pi_arm_control({"cmd": "mosfet", "enabled": enabled})
+    if ok:
+        STATE["telemetry"]["arm_mosfet_enabled"] = enabled
+    emit_status()
+    return jsonify({
+        "ok": ok,
+        "msg": msg or f"Arm motor power {'ON' if enabled else 'OFF'}",
+        "enabled": enabled,
     })
 
 
@@ -2420,6 +2443,7 @@ def api_status():
         "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", CLAW_STOP_US_DEFAULT)),
         "arm_motion_enabled":    _robot_armed(),
         "arm_pi_enabled":        STATE.get("telemetry", {}).get("arm_enabled"),
+        "arm_mosfet_enabled":    STATE.get("telemetry", {}).get("arm_mosfet_enabled"),
     })
 
 
@@ -2503,7 +2527,6 @@ def main():
     parser = argparse.ArgumentParser(description="DreadYachet ROV Web Control UI")
     parser.add_argument("--port",       type=int, default=8080, help="Web server port (default 8080)")
     parser.add_argument("--host",       type=str, default="0.0.0.0", help="Bind address")
-    parser.add_argument("--no-browser", action="store_true", help="Don't auto-open browser")
     args = parser.parse_args()
 
     if not HAVE_PARAMIKO:
@@ -2534,9 +2557,6 @@ def main():
     print(f"  Arm telemetry on {arm_port_note}")
     print(f"  Control packets -> Pi UDP port {config['thrust_udp_port']}")
     print(f"{'='*55}\n")
-
-    if not args.no_browser:
-        threading.Timer(1.2, lambda: webbrowser.open(url)).start()
 
     socketio.run(app, host=args.host, port=args.port, debug=False, allow_unsafe_werkzeug=True)
 

@@ -248,6 +248,12 @@
   <!-- Control bar -->
   <div class="controlbar">
 
+    <button class="mode-btn arm-power-btn" id="btn-arm-power" type="button"
+            onclick="toggleArmMosfet()"
+            title="GPIO 27 — arm motor power (manual; arm/disarm still auto-syncs)">⚡ ARM POWER</button>
+
+    <div class="ctrl-sep"></div>
+
     <span class="control-label">Mode</span>
     <button class="mode-btn active-disarmed" id="mode-disarmed"
             onclick="setMode('disarmed')">DISARMED</button>
@@ -399,6 +405,10 @@
     <div class="telem-cell">
       <span class="tc-label">Arm MAV</span>
       <span class="tc-val" id="tel-arm-mav">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Motor</span>
+      <span class="tc-val" id="tel-arm-mosfet">--</span>
     </div>
     <div class="telem-cell">
       <span class="tc-label">Arm Enc</span>

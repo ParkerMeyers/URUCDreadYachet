@@ -280,6 +280,243 @@ async function stopTopside() {
 // ─────────────────────────────────────────────────────────────
 // CONTROL ACTIONS
 // ─────────────────────────────────────────────────────────────
+let _audioCtx = null;
+
+function _getAudioCtx() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  if (!_audioCtx) _audioCtx = new Ctx();
+  if (_audioCtx.state === 'suspended') _audioCtx.resume();
+  return _audioCtx;
+}
+
+const _CONFIRM_MIN_MS = 200;
+const _CONFIRM_TIMEOUT_MS = 10000;
+let _pendingConfirm = {
+  mode: null,
+  modeSince: 0,
+  mosfet: null,
+  mosfetSince: 0,
+  manual: null,
+  manualSince: 0,
+};
+
+function _playToneSequence(enabled, count) {
+  const ctx = _getAudioCtx();
+  if (!ctx) return;
+  const freqs = count === 3
+    ? (enabled ? [440, 554, 698] : [698, 554, 440])
+    : (enabled ? [880, 1175] : [349, 262]);
+  const tone = 0.08;
+  const gap = 0.035;
+  const vol = 1.1;
+  const attack = 0.005;
+  const release = 0.022;
+  const t0 = ctx.currentTime;
+  freqs.forEach((freq, i) => {
+    const start = t0 + i * (tone + gap);
+    const end = start + tone;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.001, start);
+    gain.gain.exponentialRampToValueAtTime(vol, start + attack);
+    gain.gain.setValueAtTime(vol, end - release);
+    gain.gain.exponentialRampToValueAtTime(0.001, end);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(start);
+    osc.stop(end + 0.01);
+  });
+}
+
+/** Three short tones — pitch rises when enabling, falls when disabling. */
+function playEnableDisableSound(enabled) {
+  _playToneSequence(enabled, 3);
+}
+
+/** Two-tone ack when the Pi reports the expected state. */
+function playConfirmSound(enabled) {
+  _playToneSequence(enabled, 2);
+}
+
+/** Filtered noise burst — unique to STABILIZE mode. */
+function playStabilizeNoise(short) {
+  const ctx = _getAudioCtx();
+  if (!ctx) return;
+  const duration = short ? 0.1 : 0.18;
+  const vol = short ? 0.9 : 1.1;
+  const bufferSize = Math.ceil(ctx.sampleRate * duration);
+  const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.value = short ? 1400 : 900;
+  filter.Q.value = 0.7;
+  const gain = ctx.createGain();
+  const t0 = ctx.currentTime;
+  const attack = 0.006;
+  const release = short ? 0.02 : 0.03;
+  gain.gain.setValueAtTime(0.001, t0);
+  gain.gain.exponentialRampToValueAtTime(vol, t0 + attack);
+  gain.gain.setValueAtTime(vol, t0 + duration - release);
+  gain.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
+  source.connect(filter);
+  filter.connect(gain);
+  gain.connect(ctx.destination);
+  source.start(t0);
+  source.stop(t0 + duration + 0.01);
+}
+
+function _playModeSound(mode, prevMode) {
+  if (mode === 'disarmed') {
+    playEnableDisableSound(false);
+  } else if (mode === 'stabilize') {
+    if (prevMode === 'disarmed') playEnableDisableSound(true);
+    playStabilizeNoise(false);
+  } else {
+    playEnableDisableSound(true);
+  }
+  speakModeStatus(mode, _initialBeepDurationMs(mode, prevMode));
+}
+
+// ── Offline TTS (browser system voices via Web Speech API) ──
+let _ttsVoice = null;
+let _modeSpeakTimer = null;
+
+function _initTtsVoices() {
+  if (!window.speechSynthesis) return;
+  const pick = () => {
+    const voices = speechSynthesis.getVoices();
+    if (!voices.length) return;
+    const localEn = voices.filter(v => v.lang.startsWith('en') && v.localService);
+    const pool = localEn.length ? localEn : voices.filter(v => v.lang.startsWith('en'));
+    const prefer = [
+      /natural/i,
+      /jenny/i,
+      /aria/i,
+      /guy/i,
+      /zira/i,
+      /david/i,
+      /samantha/i,
+      /karen/i,
+      /daniel/i,
+    ];
+    for (const pat of prefer) {
+      const v = pool.find(x => pat.test(x.name));
+      if (v) { _ttsVoice = v; return; }
+    }
+    _ttsVoice = pool[0] || voices[0];
+  };
+  pick();
+  speechSynthesis.onvoiceschanged = pick;
+}
+
+function _modeSpeechLabel(mode) {
+  if (mode === 'disarmed') return 'Disarmed';
+  if (mode === 'stabilize') return 'Stabilizing';
+  if (mode === 'armed') return 'Armed';
+  return '';
+}
+
+function _initialBeepDurationMs(mode, prevMode) {
+  const tone = 0.08;
+  const gap = 0.035;
+  const threeToneSec = 3 * tone + 2 * gap;
+  const noiseSec = 0.18;
+  let sec = 0;
+  if (mode === 'disarmed') {
+    sec = threeToneSec;
+  } else if (mode === 'stabilize') {
+    sec = Math.max(prevMode === 'disarmed' ? threeToneSec : 0, noiseSec);
+  } else {
+    sec = threeToneSec;
+  }
+  return Math.ceil(sec * 1000) + 50;
+}
+
+function speakModeStatus(mode, delayMs) {
+  if (!window.speechSynthesis) return;
+  const text = _modeSpeechLabel(mode);
+  if (!text) return;
+  if (_modeSpeakTimer) clearTimeout(_modeSpeakTimer);
+  _modeSpeakTimer = setTimeout(() => {
+    _modeSpeakTimer = null;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.volume = 1;
+    u.rate = 0.92;
+    u.pitch = 1;
+    u.lang = 'en-US';
+    if (_ttsVoice) u.voice = _ttsVoice;
+    speechSynthesis.speak(u);
+  }, delayMs);
+}
+
+function _setPendingConfirm(key, value) {
+  _pendingConfirm[key] = value;
+  _pendingConfirm[key + 'Since'] = Date.now();
+}
+
+function _clearPendingConfirm(key) {
+  _pendingConfirm[key] = null;
+  _pendingConfirm[key + 'Since'] = 0;
+}
+
+function checkPendingConfirmSounds(t) {
+  t = t || _tel || {};
+  const now = Date.now();
+
+  if (_pendingConfirm.mode != null) {
+    const elapsed = now - _pendingConfirm.modeSince;
+    if (elapsed > _CONFIRM_TIMEOUT_MS) {
+      _clearPendingConfirm('mode');
+    } else if (elapsed >= _CONFIRM_MIN_MS) {
+      const wantEnabled = _pendingConfirm.mode !== 'disarmed';
+      if (typeof t.arm_enabled === 'boolean' && t.arm_enabled === wantEnabled) {
+        const pendingMode = _pendingConfirm.mode;
+        _clearPendingConfirm('mode');
+        if (pendingMode === 'stabilize') {
+          playStabilizeNoise(true);
+        } else {
+          playConfirmSound(wantEnabled);
+        }
+      }
+    }
+  }
+
+  if (_pendingConfirm.mosfet !== null) {
+    const elapsed = now - _pendingConfirm.mosfetSince;
+    if (elapsed > _CONFIRM_TIMEOUT_MS) {
+      _clearPendingConfirm('mosfet');
+    } else if (elapsed >= _CONFIRM_MIN_MS) {
+      if (typeof t.arm_mosfet_enabled === 'boolean' && t.arm_mosfet_enabled === _pendingConfirm.mosfet) {
+        const enabled = _pendingConfirm.mosfet;
+        _clearPendingConfirm('mosfet');
+        playConfirmSound(enabled);
+      }
+    }
+  }
+
+  if (_pendingConfirm.manual !== null) {
+    const elapsed = now - _pendingConfirm.manualSince;
+    if (elapsed > _CONFIRM_TIMEOUT_MS) {
+      _clearPendingConfirm('manual');
+    } else if (elapsed >= _CONFIRM_MIN_MS) {
+      if (typeof t.arm_manual_mode === 'boolean' && t.arm_manual_mode === _pendingConfirm.manual) {
+        const enabled = _pendingConfirm.manual;
+        _clearPendingConfirm('manual');
+        playConfirmSound(enabled);
+      }
+    }
+  }
+}
+
 let _currentMode = 'disarmed';
 
 function isRobotArmed() {
@@ -297,6 +534,61 @@ function updateArmControlsUI() {
   if (manualBtn) {
     manualBtn.disabled = !armed || _presetRunning;
     manualBtn.classList.toggle('disabled', !armed || _presetRunning);
+  }
+}
+
+let _armMosfetEnabled = null;
+
+function toggleArmMosfet() {
+  setArmMosfet(_armMosfetEnabled !== true);
+}
+
+async function setArmMosfet(enabled) {
+  const r = await fetch('/api/arm/mosfet', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: !!enabled }),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    _armMosfetEnabled = !!d.enabled;
+    updateMosfetUI();
+    _setPendingConfirm('mosfet', !!d.enabled);
+    playEnableDisableSound(!!d.enabled);
+    toast(d.msg || (`Motor power ${d.enabled ? 'ON' : 'OFF'}`), 'ok');
+  } else {
+    toast(d.msg || 'MOSFET command failed', 'err');
+  }
+}
+
+function updateMosfetUI() {
+  const btn = document.getElementById('btn-arm-power');
+  const tel = document.getElementById('tel-arm-mosfet');
+  const enabled = _armMosfetEnabled;
+
+  if (btn) {
+    btn.classList.remove('active-on', 'active-off');
+    if (enabled === true) {
+      btn.classList.add('active-on');
+      btn.title = 'Arm motor power ON — click to turn OFF';
+    } else if (enabled === false) {
+      btn.classList.add('active-off');
+      btn.title = 'Arm motor power OFF — click to turn ON';
+    } else {
+      btn.title = 'Arm motor power unknown — click to toggle';
+    }
+  }
+  if (tel) {
+    if (enabled === true) {
+      tel.textContent = 'ON';
+      tel.className = 'tc-val good';
+    } else if (enabled === false) {
+      tel.textContent = 'OFF';
+      tel.className = 'tc-val bad';
+    } else {
+      tel.textContent = '--';
+      tel.className = 'tc-val';
+    }
   }
 }
 
@@ -326,8 +618,11 @@ async function setMode(mode) {
   });
   const d = await r.json();
   if (d.ok) {
+    const prevMode = _currentMode;
     _currentMode = mode;
     updateModeUI(mode);
+    _setPendingConfirm('mode', mode);
+    _playModeSound(mode, prevMode);
     if (Array.isArray(d.warnings)) {
       d.warnings.forEach(msg => toast(msg, 'warn'));
     }
@@ -790,6 +1085,8 @@ async function setManualPwmEnabled(enabled) {
   if (d.ok) {
     applyManualPwmPayload(d);
     updateManualPwmUI();
+    _setPendingConfirm('manual', _manualPwmEnabled);
+    playEnableDisableSound(_manualPwmEnabled);
     toast(
       _manualPwmEnabled ? 'Manual mode ON — gamepad/arm_sender ignored on Pi' : 'Manual mode OFF',
       _manualPwmEnabled ? 'warn' : ''
@@ -1606,6 +1903,11 @@ function updateArmPipelineTelemetry(t) {
       armImu.title = 'IMU_STATUS / IMU_ANGLE from arm controller';
     }
   }
+
+  if (typeof t.arm_mosfet_enabled === 'boolean') {
+    _armMosfetEnabled = t.arm_mosfet_enabled;
+    updateMosfetUI();
+  }
 }
 
 function updateStatus() {
@@ -1701,6 +2003,11 @@ function updateStatus() {
     _armLastPwm = s.arm_last_pwm;
     updateArmCurrentDisplay();
   }
+
+  if (typeof s.arm_mosfet_enabled === 'boolean') {
+    _armMosfetEnabled = s.arm_mosfet_enabled;
+  }
+  updateMosfetUI();
 
   if (typeof s.manual_pwm_enabled !== 'undefined') {
     _manualPwmEnabled = !!s.manual_pwm_enabled;
@@ -1869,6 +2176,8 @@ function updateTelemetry() {
     yhEl.textContent = t.yaw_hold_active ? 'HOLD' : (t.yaw_hold_request ? 'WAIT' : 'OFF');
     yhEl.className   = 'tc-val ' + (t.yaw_hold_active ? 'good' : t.yaw_hold_request ? 'warn' : '');
   }
+
+  checkPendingConfirmSounds(t);
 }
 
 function updateCtrlCmdsFromTelemetry() {
@@ -3084,6 +3393,7 @@ function toast(msg, type='') {
 // INIT
 // ─────────────────────────────────────────────────────────────
 window.addEventListener('load', async () => {
+  _initTtsVoices();
   await loadConfig();
   buildArmPwmGrid();
   loadArmPresets();

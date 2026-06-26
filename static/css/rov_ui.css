@@ -347,6 +347,8 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 .mode-btn.active-disarmed  { border-color:var(--red);   color:var(--red);   background:rgba(255,61,90,.12); }
 .mode-btn.active-armed     { border-color:var(--amber); color:var(--amber); background:rgba(255,179,32,.12); }
 .mode-btn.active-stabilize { border-color:var(--green); color:var(--green); background:rgba(0,224,138,.12); }
+.mode-btn.arm-power-btn.active-on  { border-color:var(--green); color:var(--green); background:rgba(0,224,138,.12); }
+.mode-btn.arm-power-btn.active-off { border-color:var(--red);   color:var(--red);   background:rgba(255,61,90,.12); }
 
 /* Controller state indicators */
 .ctrl-flag {

@@ -133,6 +133,20 @@ class SSHManager:
                     continue
         return None, (err or out or "supervisor returned no JSON").strip()[:240]
 
+    def disable_arm_mosfet(self) -> tuple[bool, str]:
+        """Cut arm motor power on the Pi (GPIO 27) before MAVProxy / arm start."""
+        rov_path = shlex.quote(config["pi_rov_path"])
+        cmd = (
+            f"cd {rov_path} && PYTHONUNBUFFERED=1 python3 -c "
+            "'import sys; sys.path.insert(0,\"onboard\"); "
+            "from arm_mosfet import init; init()'"
+        )
+        out, err, error = self.exec(cmd, timeout=10)
+        if error:
+            return False, error
+        detail = (out or err or "GPIO 27 OFF").strip().splitlines()[-1][:120]
+        return True, detail
+
     def supervisor_start_and_wait(
         self, name: str, timeout_sec: float = 50.0, extra_args: str = ""
     ) -> tuple[bool, str]:

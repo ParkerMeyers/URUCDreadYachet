@@ -19,6 +19,7 @@ UDP (port 5006 — CSV + JSON; port 5009 — legacy JSON control):
     Web UI JSON:    {"cmd": "manual_pwm", "joint": 2, "pwm": 1600}
                     {"cmd": "preset_step", "pwm": [7 values]}
                     {"cmd": "arm_enable", "enabled": true}
+                    {"cmd": "mosfet", "enabled": true}
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ from arm_joints import (
     joint_to_rc_ch,
     parse_arm_controller_csv,
 )
+from arm_mosfet import init as mosfet_init, is_enabled as mosfet_is_enabled, set_enabled as mosfet_set_enabled
 from mavlink_rc import MAVLINK_ONBOARD_ARM, connect_mavlink, send_rc_channels_override
 
 UDP_PORT = 5006
@@ -199,6 +201,7 @@ def _telemetry_payload() -> dict:
     return {
         "type": "arm",
         "arm_enabled": bool(armed),
+        "arm_mosfet_enabled": mosfet_is_enabled(),
         "arm_claw_stop_us": claw,
         "arm_rx_count": int(rx_count),
         "arm_hold_neutral": bool(hold),
@@ -321,7 +324,14 @@ def _apply_arm_enable(cmd: dict) -> None:
         else:
             _preset_motion = False
             _last_pkt_time = time.time()
+    mosfet_set_enabled(enabled)
     print(f"[arm] Arm {'ENABLED' if enabled else 'DISABLED'}", flush=True)
+
+
+def _apply_mosfet(cmd: dict) -> None:
+    enabled = bool(cmd.get("enabled", False))
+    mosfet_set_enabled(enabled)
+    print(f"[arm] MOSFET manual → {'ON' if enabled else 'OFF'}", flush=True)
 
 
 def _apply_arm_claw_stop(cmd: dict) -> None:
@@ -431,6 +441,8 @@ def _handle_json(cmd: dict, addr: tuple[str, int] | None) -> None:
         _apply_arm_claw_stop(cmd)
     elif name == "arm_enable":
         _apply_arm_enable(cmd)
+    elif name == "mosfet":
+        _apply_mosfet(cmd)
     else:
         return
 
@@ -504,6 +516,7 @@ def _connect_mavlink():
 def main() -> None:
     global _mav_master, _mavlink_ok
 
+    mosfet_init()
     print("[arm] Arm controller starting...", flush=True)
     print("[arm] J1/M13  J2/M9  J3/M11  Claw/M15", flush=True)
 
@@ -604,6 +617,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n[arm] Stopping — centering all joints.", flush=True)
     finally:
+        mosfet_set_enabled(False)
         _center_all()
         master = _mav_master
         if master is not None:

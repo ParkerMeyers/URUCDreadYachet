@@ -23,6 +23,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+if str(ROOT / "onboard") not in sys.path:
+    sys.path.insert(0, str(ROOT / "onboard"))
+
+from arm_mosfet import init as mosfet_init
+
 SERVICES: dict[str, dict] = {
     "stab": {
         "script": "onboard/stabilization.py",
@@ -188,6 +193,7 @@ def _status_service(name: str, svc: dict) -> dict:
 
 
 def cmd_start(name: str, extra_args: str = "") -> dict:
+    mosfet_init()
     svc = SERVICES[name]
     pid = _start_service(svc, extra_args)
     return {"ok": True, "name": name, "pid": pid}
@@ -195,6 +201,7 @@ def cmd_start(name: str, extra_args: str = "") -> dict:
 
 def cmd_start_all(extra_args: str = "") -> dict:
     """Start onboard services in dependency order (stab → arm → cam)."""
+    mosfet_init()
     order = ("stab", "arm", "cam")
     started = []
     for name in order:
@@ -208,12 +215,15 @@ def cmd_start_all(extra_args: str = "") -> dict:
 
 
 def cmd_stop(name: str) -> dict:
+    if name in ("arm", "all"):
+        mosfet_init()
     _stop_service(SERVICES[name])
     return {"ok": True, "name": name}
 
 
 def cmd_stop_all() -> dict:
     # Stop arm first so BNO055 I2C is released before the next start.
+    mosfet_init()
     _stop_service(SERVICES["arm"])
     time.sleep(0.35)
     for name, svc in SERVICES.items():
