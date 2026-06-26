@@ -23,9 +23,9 @@ Incoming UDP packet (from arm_sender.py), comma-separated:
 
 Optional hardware (degrades gracefully if absent):
     BNO055 IMU  — J6 auto-level stabilization when stick is centered
-    lgpio/GPIO17 MOSFET — servo power rail switch controlled from web UI
+    lgpio/GPIO17 MOSFET — driven by onboard/mosfet_service.py (UDP 5007), not this process
 
-Manual AUX PWM (web UI, JSON on UDP port 5007):
+Manual AUX PWM (web UI, JSON on UDP port 5006 or 5009):
     {"cmd": "manual_pwm", "enabled": true}   — override arm_sender UDP
     {"cmd": "manual_pwm", "enabled": false}
     {"cmd": "manual_pwm", "aux": 6, "pwm": 1500}  — AUX1–7, 500–2500 µs
@@ -42,22 +42,20 @@ from pymavlink import mavutil
 
 from mavlink_rc import MAVLINK_ONBOARD_ARM, connect_mavlink, send_rc_channels_override, wait_for_heartbeat
 
-# ── Optional hardware (initialized lazily — I2C/GPIO can block at import) ─────
+# ── Optional hardware (initialized lazily — I2C can block at import) ─────
 _bno = None
 _i2c = None
 HAVE_BNO = False
-_gpio_h = None
-HAVE_GPIO = False
-_lgpio = None
-BNO_INIT_RETRY_SEC = 1.0
+BNO_INIT_RETRY_SEC = 5.0
+BNO_FAIL_LOG_INTERVAL_SEC = 30.0
+_bno_last_fail_log = 0.0
+_bno_fail_hint_shown = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 UDP_PORT    = 5006
 MAVLINK_URL = MAVLINK_ONBOARD_ARM
-# Set False to disable GPIO17 servo power rail without removing MOSFET code paths.
-MOSFET_ENABLED = True
-MOSFET_GPIO = 17
-MOSFET_PORT = 5007
+# MOSFET is handled by onboard/mosfet_service.py on UDP 5007 (same as test script).
+ARM_CONTROL_PORT = 5009
 CENTER_US   = 1500
 MIN_US      = 500
 MAX_US      = 2500
@@ -224,7 +222,7 @@ def _release_bno() -> None:
 
 def _try_init_bno_once() -> bool:
     """Try once to bring up the BNO055. Returns True on success."""
-    global _bno, _i2c, HAVE_BNO
+    global _bno, _i2c, HAVE_BNO, _bno_last_fail_log, _bno_fail_hint_shown
 
     _release_bno()
     time.sleep(0.15)
@@ -254,38 +252,23 @@ def _try_init_bno_once() -> bool:
         return False
     except Exception as _e:
         _release_bno()
-        print(f"[arm] BNO055 init failed ({_e})", flush=True)
+        now = time.time()
+        if now - _bno_last_fail_log >= BNO_FAIL_LOG_INTERVAL_SEC:
+            _bno_last_fail_log = now
+            print(f"[arm] BNO055 init failed ({_e})", flush=True)
+            if not _bno_fail_hint_shown:
+                _bno_fail_hint_shown = True
+                print(
+                    "[arm] BNO055 hint: enable I2C (raspi-config), check wiring, "
+                    "run: i2cdetect -y 1  (expect 0x29). MOSFET is on UDP 5007 "
+                    "via mosfet_service.py — independent of IMU.",
+                    flush=True,
+                )
         return False
 
 
-def _init_mosfet_gpio() -> None:
-    """Drive MOSFET GPIO immediately — must run before AUX servos need power."""
-    global _gpio_h, HAVE_GPIO, _lgpio
-
-    if not MOSFET_ENABLED:
-        print("[arm] MOSFET control disabled (MOSFET_ENABLED=False)", flush=True)
-        return
-
-    try:
-        import lgpio as _lgpio_mod
-        _lgpio = _lgpio_mod
-        _gpio_h = _lgpio.gpiochip_open(0)
-        _lgpio.gpio_claim_output(_gpio_h, MOSFET_GPIO, 1 if _mosfet_on else 0)
-        HAVE_GPIO = True
-        print(
-            f"[arm] lgpio ready — MOSFET on GPIO{MOSFET_GPIO} "
-            f"({'ON' if _mosfet_on else 'OFF'})",
-            flush=True,
-        )
-    except Exception as _e:
-        HAVE_GPIO = False
-        _lgpio = None
-        _gpio_h = None
-        print(f"[arm] lgpio not available ({_e}) — MOSFET control disabled", flush=True)
-
-
 def _init_optional_hardware() -> None:
-    """Probe BNO055 without blocking process startup (MOSFET init is synchronous)."""
+    """Probe BNO055 in background — does not block arm UDP / MAVLink startup."""
     attempt = 0
     while not HAVE_BNO:
         if _try_init_bno_once():
@@ -499,7 +482,6 @@ _joint_us      = _default_joint_us()
 _j6_target_deg = 0.0
 _last_pkt_time = 0.0
 _rx_count      = 0
-_mosfet_on     = False
 _manual_mode   = False
 _manual_aux_pwm = _default_manual_aux_pwm()
 _claw_hold_enabled = False
@@ -522,16 +504,6 @@ _imu_snap_stale = False
 _imu_last_poll_time = 0.0
 _imu_consecutive_failures = 0
 _bno_lock = threading.Lock()
-
-
-# ── MOSFET control ────────────────────────────────────────────────────────────
-def _set_mosfet(on: bool):
-    global _mosfet_on
-    if not MOSFET_ENABLED:
-        return
-    _mosfet_on = on
-    if HAVE_GPIO:
-        _lgpio.gpio_write(_gpio_h, MOSFET_GPIO, 1 if on else 0)
 
 
 def _note_telemetry_subscriber(host: str, port: int) -> None:
@@ -728,6 +700,7 @@ def _apply_manual_pwm_cmd(cmd: dict) -> None:
 
     with _lock:
         if not _arm_enabled:
+            print("[arm] Manual AUX ignored — arm DISABLED (switch to DRIVE/ARMED)", flush=True)
             return
 
     if cmd.get("center"):
@@ -768,26 +741,62 @@ def _apply_manual_pwm_cmd(cmd: dict) -> None:
     print(f"[arm] Manual AUX{aux_i} ({label}) → {pwm_i} µs [override ON]", flush=True)
 
 
+def _handle_arm_control_json(cmd: dict, addr) -> None:
+    """Handle JSON control commands from the web UI (manual AUX, presets, arm_enable)."""
+    if not isinstance(cmd, dict) or not cmd.get("cmd"):
+        return
+    if cmd.get("cmd") == "preset_motion":
+        _apply_preset_motion_cmd(cmd)
+        _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+    elif cmd.get("cmd") == "preset_step":
+        _apply_preset_step_cmd(cmd)
+        _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+    elif cmd.get("cmd") == "manual_pwm":
+        _apply_manual_pwm_cmd(cmd)
+        _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+    elif cmd.get("cmd") == "arm_telemetry" and cmd.get("subscribe"):
+        port = int(cmd.get("port", ARM_TELEM_PORT))
+        _note_telemetry_subscriber(addr[0], port)
+        print(f"[arm] Arm telemetry → {addr[0]}:{port}", flush=True)
+        _send_arm_telemetry(J6_OUT_CENTER)
+    elif cmd.get("cmd") == "claw_hold":
+        _apply_claw_hold_cmd(cmd)
+        _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+    elif cmd.get("cmd") == "arm_imu_cal":
+        _apply_arm_imu_cal_cmd(cmd)
+        _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+    elif cmd.get("cmd") == "arm_claw_stop":
+        _apply_arm_claw_stop_cmd(cmd)
+        _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+    elif cmd.get("cmd") == "arm_imu_zero":
+        _apply_arm_imu_zero_cmd(cmd)
+        _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+    elif cmd.get("cmd") == "arm_enable":
+        _apply_arm_enable_cmd(cmd)
+        _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+
+
 def _arm_control_listener():
-    """Background thread: MOSFET + manual AUX PWM JSON commands from the web UI."""
+    """Background thread: manual AUX PWM / preset / IMU JSON from the web UI."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("0.0.0.0", MOSFET_PORT))
+        s.bind(("0.0.0.0", ARM_CONTROL_PORT))
         s.settimeout(1.0)
     except Exception as e:
-        print(f"[arm] Control listener bind failed: {e}")
+        print(f"[arm] Control listener bind failed on UDP {ARM_CONTROL_PORT}: {e}", flush=True)
+        print(
+            "[arm] FATAL: manual AUX / presets unavailable — restart arm after mosfet_service "
+            f"(port {ARM_CONTROL_PORT} must be free)",
+            flush=True,
+        )
         return
+    print(f"[arm] Control JSON on UDP {ARM_CONTROL_PORT}", flush=True)
     while True:
         try:
             data, addr = s.recvfrom(512)
             cmd = json.loads(data.decode())
-            if cmd.get("cmd") == "mosfet":
-                if MOSFET_ENABLED:
-                    _set_mosfet(bool(cmd.get("state", False)))
-                    _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
-                    print(f"[arm] MOSFET {'ON' if _mosfet_on else 'OFF'} (web UI)", flush=True)
-            elif cmd.get("cmd") == "preset_motion":
+            if cmd.get("cmd") == "preset_motion":
                 _apply_preset_motion_cmd(cmd)
                 _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
             elif cmd.get("cmd") == "preset_step":
@@ -1033,7 +1042,6 @@ def main():
     global _joint_us, _j6_target_deg, _last_pkt_time, _rx_count, _mavlink_up
 
     print("[arm] Arm controller starting...", flush=True)
-    _init_mosfet_gpio()
     threading.Thread(
         target=_init_optional_hardware, daemon=True, name="arm-hw-init",
     ).start()
@@ -1055,11 +1063,8 @@ def main():
     ).start()
 
     print(f"[arm] Listening on UDP {UDP_PORT}", flush=True)
-    print(f"[arm] Manual AUX PWM on UDP {MOSFET_PORT} (cmd=manual_pwm)", flush=True)
     print(f"[arm] AUX1=J5  AUX2=J2  AUX3=J6  AUX4=J1  AUX5=J3  AUX6=J4  AUX7=Claw", flush=True)
-    print(f"[arm] BNO055={'yes' if HAVE_BNO else 'pending'}  "
-          f"MOSFET={'yes' if MOSFET_ENABLED and HAVE_GPIO else 'off'}  "
-          f"MAVLink=connecting", flush=True)
+    print(f"[arm] BNO055={'yes' if HAVE_BNO else 'pending'}  MAVLink=connecting", flush=True)
 
     last_send      = 0.0
     last_heartbeat = 0.0
@@ -1164,7 +1169,7 @@ def main():
                         f"A{i+1}={aux_pwm[i]}" for i in range(7)
                     )
                     print(
-                        f"[arm] MANUAL mosfet={_mosfet_on} | {aux_str}",
+                        f"[arm] MANUAL | {aux_str}",
                         flush=True,
                     )
                 else:
@@ -1181,7 +1186,7 @@ def main():
                     print(
                         f"[arm] rx={rx} armed={armed} mav={'OK' if _mavlink_up else 'DOWN'} "
                         f"hold={hold_neutral} claw={claw_hold} "
-                        f"j6={'MAN' if j6_manual else 'IMU'} mosfet={_mosfet_on} | "
+                        f"j6={'MAN' if j6_manual else 'IMU'} | "
                         f"J1={jus[0]} J2={jus[1]} J3={jus[2]} J4={jus[3]} "
                         f"J5={jus[4]} J6={j6_pwm}(in={jus[5]},tgt={j6t:.1f}) "
                         f"Claw={jus[6]}",
@@ -1205,10 +1210,6 @@ def main():
             time.sleep(0.2)
 
         _drop_mavlink_master()
-
-        if MOSFET_ENABLED and HAVE_GPIO and _gpio_h is not None:
-            _lgpio.gpio_write(_gpio_h, MOSFET_GPIO, 0)
-            _lgpio.gpiochip_close(_gpio_h)
 
         _release_bno()
         print("[arm] Done.", flush=True)

@@ -159,6 +159,7 @@ DEFAULT_CONFIG = {
     "telemetry_port":      5006,
     "arm_udp_port":        5006,
     "mosfet_control_port": 5007,
+    "arm_control_port":    5009,
     "mosfet_enabled":      True,
     "arm_telemetry_port":  5008,
     "arm_imu_sign":        -1.0,
@@ -213,6 +214,14 @@ def normalize_onboard_config():
     global config
     normalize_camera_config()
     normalize_arm_presets()
+    try:
+        config["arm_control_port"] = int(config.get("arm_control_port", 5009))
+    except (TypeError, ValueError):
+        config["arm_control_port"] = 5009
+    try:
+        config["mosfet_control_port"] = int(config.get("mosfet_control_port", 5007))
+    except (TypeError, ValueError):
+        config["mosfet_control_port"] = 5007
     out2 = str(config.get("mavproxy_out2", "")).strip()
     if "tcpin" not in out2.lower() or str(MAVPROXY_TCP_PORT) not in out2:
         config["mavproxy_out2"] = MAVPROXY_ONBOARD_OUT
@@ -455,14 +464,53 @@ def _sync_arm_enable():
 
 def _mosfet_enabled() -> bool:
     load_config_file()
-    return bool(config.get("mosfet_enabled", False))
+    val = config.get("mosfet_enabled", True)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(val)
+
+
+def _send_mosfet_command(state: bool) -> tuple[bool, str]:
+    """UDP to Pi mosfet_service.py — same JSON as test/mosfet_test_topside.py."""
+    if not _mosfet_enabled():
+        return False, "MOSFET disabled in config"
+    load_config_file()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            payload = json.dumps({"cmd": "mosfet", "state": bool(state)}).encode("utf-8")
+            port = int(config["mosfet_control_port"])
+            sock.sendto(payload, (config["pi_ip"], port))
+        finally:
+            sock.close()
+        return True, f"sent → {config['pi_ip']}:{port}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _send_pi_arm_control(payload: dict) -> tuple[bool, str]:
+    """Send JSON control command to new_ar.py (arm control port, not MOSFET)."""
+    load_config_file()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            port = int(config.get("arm_control_port", 5009))
+            sock.sendto(
+                json.dumps(payload).encode("utf-8"),
+                (config["pi_ip"], port),
+            )
+        finally:
+            sock.close()
+        return True, f"sent → {config['pi_ip']}:{port}"
+    except Exception as e:
+        return False, str(e)
 
 
 def _sync_arm_power():
-    """Push current MOSFET state to new_ar.py (GPIO17 servo power rail)."""
+    """Push current MOSFET state to mosfet_service.py on the Pi."""
     if not _mosfet_enabled():
         return
-    _send_pi_arm_control({"cmd": "mosfet", "state": bool(STATE.get("mosfet_on", False))})
+    _send_mosfet_command(bool(STATE.get("mosfet_on", False)))
 
 
 def _apply_disarmed_arm_lockout():
@@ -496,23 +544,6 @@ def _send_arm_csv(csv_line: str):
         )
     finally:
         sock.close()
-
-
-def _send_pi_arm_control(payload: dict) -> tuple[bool, str]:
-    """Send JSON control command to new_ar.py (MOSFET port, manual AUX PWM)."""
-    load_config_file()
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.sendto(
-                json.dumps(payload).encode("utf-8"),
-                (config["pi_ip"], int(config["mosfet_control_port"])),
-            )
-        finally:
-            sock.close()
-        return True, f"sent → {config['pi_ip']}:{config['mosfet_control_port']}"
-    except Exception as e:
-        return False, str(e)
 
 
 def _parse_manual_pwm_line(line: str) -> tuple[int, int, str] | None:
@@ -603,6 +634,7 @@ STATE = {
     "onboard_arm":         False,
     "onboard_cam":         False,
     "onboard_mavproxy":    False,
+    "onboard_mosfet":     False,
     "ssh_connected":       False,
     "ssh_error":           "",
     "mode":                "disarmed",
@@ -875,34 +907,54 @@ class SSHManager:
         return out
 
     def send_mosfet(self, state: bool):
-        if not _mosfet_enabled():
-            return True, "MOSFET disabled (hardware not installed)"
-        return _send_pi_arm_control({"cmd": "mosfet", "state": bool(state)})
+        return _send_mosfet_command(bool(state))
+
+    def _release_serial_port(self, ser: str) -> None:
+        """Free the Pix6 USB serial device before MAVProxy opens it."""
+        if not ser:
+            return
+        q = shlex.quote(ser)
+        self.exec(
+            f"fuser -k {q} 2>/dev/null; "
+            "pkill -f mavproxy 2>/dev/null; pkill -f MAVProxy 2>/dev/null; "
+            "sleep 0.5"
+        )
 
     def _start_mavproxy_fresh(self):
         """Kill any existing MAVProxy and launch a fresh bridge."""
-        self.exec("pkill -f mavproxy 2>/dev/null; pkill -f MAVProxy 2>/dev/null; sleep 0.5")
         normalize_onboard_config()
         bin_  = config["mavproxy_bin"]
         ser   = config["mavproxy_serial"]
-        baud  = config["mavproxy_baud"]
+        baud  = int(config.get("mavproxy_baud", 115200))
         out1  = config["mavproxy_out1"]
         out2  = config["mavproxy_out2"]
         out3  = config.get("mavproxy_out3", MAVPROXY_ARM_ONBOARD_OUT)
+
+        self._release_serial_port(ser)
+        self.exec("truncate -s 0 /tmp/rov_mavproxy.log 2>/dev/null || true")
+
+        # --no-state: skip .tlog files (log_writer thread). Critical on Pi SD
+        # cards that are full or read-only — otherwise MAVProxy dies with
+        # "Exception in thread log_writer" and never links to the FC.
         cmd = (
-            f"setsid nohup {bin_} "
-            f"--master={ser} "
+            f"setsid nohup {shlex.quote(bin_)} "
+            f"--master={shlex.quote(ser)} "
             f"--baudrate {baud} "
             f"--non-interactive "
+            f"--no-state "
             f"--out={out1} "
             f"--out={out2} "
             f"--out={out3} "
-            f"< /dev/null > /tmp/rov_mavproxy.log 2>&1 & echo $!"
+            f"< /dev/null >> /tmp/rov_mavproxy.log 2>&1 & echo $!"
         )
         out, _, error = self.exec(cmd, timeout=10)
         if error:
             return False, error
         pid = out.strip()
+        if not pid.isdigit():
+            tail = self.get_mavproxy_log(lines=8)
+            hint = tail.strip().splitlines()[-1][:120] if tail.strip() else "no log output"
+            return False, f"MAVProxy failed to start — {hint}"
         return True, f"MAVProxy started (PID {pid})"
 
     def ensure_mavproxy(self):
@@ -1078,13 +1130,43 @@ class SSHManager:
                 parts.append("no /dev/ttyACM* or /dev/ttyUSB* devices")
         else:
             parts.append(f"{ser} exists but MAVProxy reports no link")
-        log_tail = self.get_mavproxy_log(lines=3)
+
+        log_tail = self.get_mavproxy_log(lines=20)
         if log_tail:
-            parts.append(f"log: {log_tail.strip().splitlines()[-1][:80]}")
+            lower = log_tail.lower()
+            if "not enough free disk space" in lower or "flight logs full" in lower:
+                parts.append("Pi disk full — MAVProxy could not open tlog files")
+            if "log_writer" in lower:
+                parts.append(
+                    "log_writer thread crashed (disk full or permissions) — "
+                    "restart onboard after updating rov_ui.py"
+                )
+            if "permission denied" in lower:
+                parts.append(f"permission denied on {ser} — run: sudo usermod -aG dialout uruc")
+            if "multiple access" in lower or "returned no data" in lower:
+                parts.append("serial port busy — another process may hold the USB port")
+
+            for ln in reversed(log_tail.strip().splitlines()):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                low = ln.lower()
+                if low in ("no link", "link 1 down", "link down"):
+                    continue
+                parts.append(f"log: {ln[:100]}")
+                break
+
+        df_out, _, _ = self.exec("df -h / 2>/dev/null | tail -1")
+        if df_out.strip():
+            df_line = df_out.strip()
+            if any(p in df_line for p in ("100%", "99%", "98%")):
+                parts.append(f"disk nearly full: {df_line[:70]}")
+
         return " — ".join(parts)
 
     def stop_mavproxy(self):
-        self.exec("pkill -f mavproxy 2>/dev/null; pkill -f MAVProxy 2>/dev/null || true")
+        ser = config.get("mavproxy_serial", "/dev/ttyACM0")
+        self._release_serial_port(ser)
 
     def is_mavproxy_running(self):
         # pgrep -a shows full command line; -f matches against it.
@@ -1098,9 +1180,10 @@ class SSHManager:
         """Check onboard processes via the Pi-side supervisor."""
         st = self.supervisor_status()
         if not st:
-            return {"mavproxy": False, "stab": False, "arm": False, "cam": False}
+            return {"mavproxy": False, "mosfet": False, "stab": False, "arm": False, "cam": False}
         return {
             "mavproxy": self.is_mavproxy_running() and self.is_mavproxy_fc_connected(),
+            "mosfet":   bool(st.get("mosfet", {}).get("alive")),
             "stab":     bool(st.get("stab", {}).get("alive")),
             "arm":      bool(st.get("arm", {}).get("alive")),
             "cam":      bool(st.get("cam", {}).get("alive")),
@@ -1401,20 +1484,25 @@ def _on_onboard_stack_ready() -> None:
     _sync_arm_imu_cal()
     _sync_arm_claw_stop()
     _apply_disarmed_arm_lockout()
+    if STATE.get("onboard_mosfet"):
+        _sync_arm_power()
     socketio.emit("telemetry", _telemetry_emit_payload())
     emit_status()
 
     def _resync_arm_after_restart():
         for delay in (0.75, 2.0, 5.0):
             time.sleep(delay)
+            if STATE.get("onboard_mosfet"):
+                _sync_arm_power()
             if not STATE.get("onboard_arm"):
-                return
+                continue
             _subscribe_arm_telemetry()
             _sync_arm_claw_hold()
             _sync_arm_imu_cal()
             _sync_arm_claw_stop()
             _sync_arm_enable()
-            _sync_arm_power()
+            if STATE.get("onboard_mosfet"):
+                _sync_arm_power()
 
     socketio.start_background_task(_resync_arm_after_restart)
 
@@ -1506,6 +1594,10 @@ def _update_arm_telemetry_from_json(pkt: dict):
         tel["arm_imu_sign"] = float(pkt["arm_imu_sign"])
     if pkt.get("arm_claw_stop_us") is not None:
         tel["arm_claw_stop_us"] = int(pkt["arm_claw_stop_us"])
+    if pkt.get("arm_mosfet_on") is not None:
+        tel["arm_mosfet_on"] = bool(pkt.get("arm_mosfet_on"))
+    if pkt.get("arm_mosfet_gpio_ok") is not None:
+        tel["arm_mosfet_gpio_ok"] = bool(pkt.get("arm_mosfet_gpio_ok"))
     if pkt.get("arm_imu_read_age_sec") is not None:
         tel["arm_imu_read_age_sec"] = float(pkt["arm_imu_read_age_sec"])
     STATE["last_arm_telemetry_time"] = time.time()
@@ -1549,7 +1641,7 @@ def _subscribe_arm_telemetry():
         try:
             s.sendto(
                 payload,
-                (config["pi_ip"], int(config["mosfet_control_port"])),
+                (config["pi_ip"], int(config.get("arm_control_port", 5009))),
             )
         finally:
             s.close()
@@ -1772,12 +1864,14 @@ def _monitor_loop():
                 STATE["ssh_connected"]         = True
                 status = ssh.get_onboard_status()
                 STATE["onboard_mavproxy"] = status["mavproxy"]
+                STATE["onboard_mosfet"]   = status["mosfet"]
                 STATE["onboard_stab"]     = status["stab"]
                 STATE["onboard_arm"]      = status["arm"]
                 STATE["onboard_cam"]      = status["cam"]
             else:
                 STATE["ssh_connected"]    = False
                 STATE["onboard_mavproxy"] = False
+                STATE["onboard_mosfet"]   = False
                 STATE["onboard_stab"]     = False
                 STATE["onboard_arm"]      = False
                 STATE["onboard_cam"]      = False
@@ -1804,6 +1898,7 @@ def emit_status():
         "thrust_running":        STATE["thrust_running"],
         "arm_running":           STATE["arm_running"],
         "onboard_stab":          STATE["onboard_stab"],
+        "onboard_mosfet":        STATE["onboard_mosfet"],
         "onboard_arm":           STATE["onboard_arm"],
         "onboard_cam":           STATE["onboard_cam"],
         "onboard_mavproxy":      STATE["onboard_mavproxy"],
@@ -2310,11 +2405,13 @@ def api_start_onboard():
             cam_args = f"--cam0 {cam0_dev} --cam1 {cam1_dev}"
 
             service_specs = [
+                ("mosfet", "mosfet", "onboard_mosfet", 15.0, ""),
                 ("stabilization", "stab", "onboard_stab", 75.0, ""),
                 ("arm_ctrl", "arm", "onboard_arm", 45.0, ""),
                 ("camera", "cam", "onboard_cam", 30.0, cam_args),
             ]
             service_labels = {
+                "mosfet": "mosfet_service.py (servo power rail)",
                 "stabilization": "stabilization.py",
                 "arm_ctrl": "new_ar.py (arm controller)",
                 "camera": "camera_stream.py (MJPEG feeds)",
@@ -2335,13 +2432,23 @@ def api_start_onboard():
                 _emit_onboard_progress(step, "done" if ok else "error", msg)
                 emit_status()
 
+            ok_mos, msg_mos = service_results.get("mosfet", (False, "missing result"))
             ok_s, msg_s = service_results.get("stabilization", (False, "missing result"))
             ok_a, msg_a = service_results.get("arm_ctrl", (False, "missing result"))
             ok_c, msg_c = service_results.get("camera", (False, "missing result"))
 
             core_ok = ok_m and ok_s
-            if core_ok and ok_a and ok_c:
-                summary = "✓ All onboard programs running (MAVProxy, stabilization, new_ar, cameras)"
+            if core_ok and ok_mos and ok_a and ok_c:
+                summary = "✓ All onboard programs running (MAVProxy, MOSFET, stabilization, new_ar, cameras)"
+            elif core_ok and ok_a and ok_c:
+                parts_warn = []
+                if not ok_mos:
+                    parts_warn.append("MOSFET service")
+                summary = (
+                    "✓ ROV ready — optional failed: " + ", ".join(parts_warn)
+                    if parts_warn
+                    else "✓ ROV ready — cameras unavailable (check device paths / opencv install)"
+                )
             elif core_ok and ok_a:
                 summary = "✓ ROV ready — cameras unavailable (check device paths / opencv install)"
             elif core_ok:
@@ -2390,6 +2497,7 @@ def api_stop_onboard():
     ssh.stop_mavproxy()
     ssh.exec("sleep 0.75", timeout=5)
     STATE["onboard_stab"]     = False
+    STATE["onboard_mosfet"]   = False
     STATE["onboard_arm"]      = False
     STATE["onboard_cam"]      = False
     STATE["onboard_mavproxy"] = False
@@ -2669,10 +2777,12 @@ def api_mosfet():
         }), 400
     data = request.get_json(force=True) or {}
     state = bool(data.get("state", False))
-    ok, msg = ssh.send_mosfet(state)
+    ok, msg = _send_mosfet_command(state)
+    if not ok:
+        return jsonify({"ok": False, "msg": msg, "mosfet_on": STATE.get("mosfet_on", False)}), 500
     STATE["mosfet_on"] = state
     emit_status()
-    return jsonify({"ok": ok, "msg": msg, "mosfet_on": state, "mosfet_enabled": True})
+    return jsonify({"ok": True, "msg": msg, "mosfet_on": state, "mosfet_enabled": True})
 
 
 @app.route("/api/manual_pwm", methods=["GET"])
@@ -2693,6 +2803,9 @@ def api_manual_pwm():
             "msg": "Manual AUX disabled while DISARMED",
             "enabled": False,
         }), 403
+
+    # Ensure Pi arm motion is unlocked before manual override commands.
+    _sync_arm_unlock()
 
     data = request.get_json(force=True) or {}
     action = (data.get("action") or "").strip().lower()
@@ -3004,6 +3117,7 @@ def api_status():
         "thrust_running":        STATE["thrust_running"],
         "arm_running":           STATE["arm_running"],
         "onboard_stab":          STATE["onboard_stab"],
+        "onboard_mosfet":        STATE["onboard_mosfet"],
         "onboard_arm":           STATE["onboard_arm"],
         "onboard_cam":           STATE["onboard_cam"],
         "onboard_mavproxy":      STATE["onboard_mavproxy"],
@@ -3056,6 +3170,7 @@ def api_onboard_progress():
             "starting": STATE["onboard_starting"],
             "events": list(STATE["onboard_progress"]),
             "onboard_mavproxy": STATE["onboard_mavproxy"],
+            "onboard_mosfet": STATE["onboard_mosfet"],
             "onboard_stab": STATE["onboard_stab"],
             "onboard_arm": STATE["onboard_arm"],
             "onboard_cam": STATE["onboard_cam"],
@@ -3064,7 +3179,7 @@ def api_onboard_progress():
 
 @app.route("/api/onboard_log/<name>")
 def api_onboard_log(name):
-    allowed = {"stab", "arm", "cam", "colmap", "crabs"}
+    allowed = {"mosfet", "stab", "arm", "cam", "colmap", "crabs"}
     if name not in allowed:
         return jsonify({"lines": []})
     out = ssh.get_onboard_log(name)

@@ -23,6 +23,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 SERVICES: dict[str, dict] = {
+    "mosfet": {
+        "script": "onboard/mosfet_service.py",
+        "log": "/tmp/rov_mosfet.log",
+        "pidfile": "/tmp/rov_mosfet.pid",
+        "ready_re": r"\[mosfet-svc\] Listening on UDP",
+    },
     "stab": {
         "script": "onboard/stabilization.py",
         "log": "/tmp/rov_stab.log",
@@ -33,7 +39,7 @@ SERVICES: dict[str, dict] = {
         "script": "onboard/new_ar.py",
         "log": "/tmp/rov_arm.log",
         "pidfile": "/tmp/rov_arm.pid",
-        "ready_re": r"\[arm\] (Arm controller starting|Listening on UDP|rx=|MAVLink link up)",
+        "ready_re": r"\[arm\] Control JSON on UDP",
     },
     "cam": {
         "script": "onboard/camera_stream.py",

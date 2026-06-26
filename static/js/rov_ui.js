@@ -4,12 +4,13 @@
 let _tel    = {};
 let _status = {};
 let _currentLog  = 'arm';
-const _logs = { thrust: [], arm: [], onboard_stab: [], onboard_arm: [], onboard_cam: [], colmap: [], crabs: [] };
+const _logs = { thrust: [], arm: [], onboard_mosfet: [], onboard_stab: [], onboard_arm: [], onboard_cam: [], colmap: [], crabs: [] };
 let _onboardPollTimer = null;
 const _onboardProgressSeen = new Set();
 const _dotStarting = {};
 const ONBOARD_DOT_BY_STEP = {
   mavproxy: 'dot-mavproxy',
+  mosfet: 'dot-mosfet',
   stabilization: 'dot-stab',
   arm_ctrl: 'dot-arm',
   camera: 'dot-cam',
@@ -131,6 +132,7 @@ function startOnboardPoll() {
         if (_onboardPollTimer) _onboardPollTimer._lastCount = d.events.length;
       }
       if (d.onboard_mavproxy) setDot('dot-mavproxy', true);
+      if (d.onboard_mosfet)   setDot('dot-mosfet', true);
       if (d.onboard_stab)     setDot('dot-stab', true);
       if (d.onboard_arm)      setDot('dot-arm', true);
       if (d.onboard_cam)      setDot('dot-cam', true);
@@ -158,7 +160,7 @@ function getCfg() {
                  'serial_port','forward_camera_url','arm_camera_url',
                  'camera0_device','camera1_device',
                  'thrust_udp_port','telemetry_port','arm_udp_port',
-                 'mosfet_control_port','colmap_command','crabs_command',
+                 'mosfet_control_port','arm_control_port','colmap_command','crabs_command',
                  'mavproxy_bin','mavproxy_serial','mavproxy_baud',
                  'mavproxy_out1','mavproxy_out2'];
   const obj = {};
@@ -301,13 +303,16 @@ async function toggleMosfet() {
       toast(d.msg || 'MOSFET command failed', 'err');
       return;
     }
+    updateMosfetUI(_mosfetOn);
+    const detail = d.msg ? ` (${d.msg})` : '';
+    toast('MOSFET ' + (_mosfetOn ? 'ON' : 'OFF') + detail, _mosfetOn ? 'ok' : '');
+    if (_tel.arm_mosfet_gpio_ok === false) {
+      toast('Pi reports MOSFET GPIO unavailable — check /tmp/rov_mosfet.log', 'warn');
+    }
   } catch (e) {
     _mosfetOn = !_mosfetOn;
     toast('MOSFET command failed', 'err');
-    return;
   }
-  updateMosfetUI(_mosfetOn);
-  toast('MOSFET ' + (_mosfetOn ? 'ON' : 'OFF'), _mosfetOn ? 'ok' : '');
 }
 
 function updateMosfetUI(on) {
@@ -320,6 +325,59 @@ function updateMosfetUI(on) {
   if (!toggle || !label) return;
   if (on) { toggle.classList.add('on');    label.textContent = 'MOSFET ON'; }
   else    { toggle.classList.remove('on'); label.textContent = 'MOSFET OFF'; }
+  updateMosfetStatusPill(_status);
+}
+
+function updateMosfetStatusPill(s) {
+  const pill = document.getElementById('pill-mosfet');
+  const cell = document.getElementById('tel-mosfet');
+  if (!pill && !cell) return;
+
+  const status = s || _status || {};
+  const enabled = status.mosfet_enabled !== false;
+  const svcUp = !!status.onboard_mosfet;
+  const railOn = !!status.mosfet_on;
+
+  let label = '--';
+  let cls = '';
+  let title = 'MOSFET servo power rail';
+
+  if (!enabled) {
+    label = 'N/A';
+    cls = '';
+    title = 'MOSFET disabled in config';
+  } else if (!svcUp) {
+    label = 'SVC DOWN';
+    cls = 'err';
+    title = 'mosfet_service.py not running — Start Onboard';
+  } else if (railOn) {
+    label = 'ON';
+    cls = 'ok';
+    title = 'Servo power rail ON';
+  } else {
+    label = 'OFF';
+    cls = 'warn';
+    title = 'Servo power rail OFF';
+  }
+
+  if (pill) {
+    pill.innerHTML = `<span class="status-dot"></span> MOSFET: ${label}`;
+    pill.className = 'status-pill' + (cls ? ` ${cls}` : '');
+    pill.title = title;
+  }
+  if (cell) {
+    if (!enabled) {
+      cell.textContent = 'N/A';
+      cell.className = 'tc-val';
+    } else if (!svcUp) {
+      cell.textContent = 'DOWN';
+      cell.className = 'tc-val bad';
+    } else {
+      cell.textContent = railOn ? 'ON' : 'OFF';
+      cell.className = 'tc-val ' + (railOn ? 'good' : 'warn');
+    }
+    cell.title = title;
+  }
 }
 
 let _currentMode = 'disarmed';
@@ -787,6 +845,10 @@ async function setManualPwmEnabled(enabled) {
 }
 
 async function sendManualPwmLine() {
+  if (!isRobotArmed()) {
+    toast('Manual AUX disabled while DISARMED', 'warn');
+    return;
+  }
   await saveConfig();
   const inp = document.getElementById('manual-pwm-input');
   const line = inp ? inp.value.trim() : '';
@@ -810,6 +872,10 @@ async function sendManualPwmLine() {
 }
 
 async function centerManualPwm() {
+  if (!isRobotArmed()) {
+    toast('Manual AUX disabled while DISARMED', 'warn');
+    return;
+  }
   await saveConfig();
   const r = await fetch('/api/manual_pwm', {
     method: 'POST',
@@ -1674,6 +1740,7 @@ function updateStatus() {
   const s = _status;
 
   setDot('dot-mavproxy', s.onboard_mavproxy);
+  setDot('dot-mosfet',   s.onboard_mosfet);
   setDot('dot-stab',     s.onboard_stab);
   setDot('dot-arm',      s.onboard_arm);
   setDot('dot-cam',      s.onboard_cam);
@@ -1729,6 +1796,7 @@ function updateStatus() {
   } else {
     updateMosfetUI(_mosfetOn);
   }
+  updateMosfetStatusPill(s);
   if (typeof s.claw_hold === 'boolean') { _ctrlState.claw_hold = s.claw_hold; updateFlagUI(); }
   if (typeof s.arm_claw_stop_us === 'number') { _configClawStopUs = s.arm_claw_stop_us; }
   if (typeof s.preset_running === 'boolean') {
@@ -1805,6 +1873,7 @@ function updatePreDiveChecklist(s) {
   const items = [
     { id: 'chk-ssh', ok: s.ssh_connected },
     { id: 'chk-mavproxy', ok: s.onboard_mavproxy },
+    { id: 'chk-mosfet', ok: s.mosfet_enabled === false || s.onboard_mosfet },
     { id: 'chk-stab', ok: s.onboard_stab },
     { id: 'chk-arm-onboard', ok: s.onboard_arm },
     { id: 'chk-cam', ok: s.onboard_cam },
@@ -2956,6 +3025,7 @@ function unbindCameraResize() {
 // ─────────────────────────────────────────────────────────────
 const _ONBOARD_SYSTEMS = [
   { key: 'onboard_mavproxy', label: 'mavproxy (UDP bridge)' },
+  { key: 'onboard_mosfet',   label: 'mosfet_service.py' },
   { key: 'onboard_stab',     label: 'stabilization.py' },
   { key: 'onboard_arm',      label: 'new_ar.py' },
   { key: 'onboard_cam',      label: 'camera_stream.py' },
@@ -2963,7 +3033,10 @@ const _ONBOARD_SYSTEMS = [
 
 function getOfflineOnboardSystems(status) {
   const s = status || _status || {};
-  return _ONBOARD_SYSTEMS.filter(sys => !s[sys.key]).map(sys => sys.label);
+  return _ONBOARD_SYSTEMS.filter(sys => {
+    if (sys.key === 'onboard_mosfet' && s.mosfet_enabled === false) return false;
+    return !s[sys.key];
+  }).map(sys => sys.label);
 }
 
 function updateOpenControlButton(status) {
@@ -3085,7 +3158,7 @@ let _logRefreshTimer = null;
 
 // Map JS log name → API endpoint name for onboard (Pi-side) logs
 const _onboardLogNames = {
-  onboard_stab: 'stab', onboard_arm: 'arm', onboard_cam: 'cam',
+  onboard_mosfet: 'mosfet', onboard_stab: 'stab', onboard_arm: 'arm', onboard_cam: 'cam',
   colmap: 'colmap', crabs: 'crabs',
 };
 
@@ -3103,7 +3176,7 @@ function toggleLog() {
 function switchLog(name) {
   _currentLog = name;
   const tabMap = {
-    arm: 'lt-arm', onboard_stab: 'lt-stab', onboard_arm: 'lt-arm2',
+    arm: 'lt-arm', onboard_mosfet: 'lt-mosfet', onboard_stab: 'lt-stab', onboard_arm: 'lt-arm2',
     onboard_cam: 'lt-cam', colmap: 'lt-colmap', crabs: 'lt-crabs',
   };
   Object.entries(tabMap).forEach(([n, id]) => {

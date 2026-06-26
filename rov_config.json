@@ -1,6 +1,7 @@
 {
   "arm_camera_url": "http://192.168.69.100:8160",
   "arm_claw_stop_us": 1515,
+  "arm_control_port": 5009,
   "arm_imu_sign": -1.0,
   "arm_imu_zero_offset": -154.0,
   "arm_presets": {
@@ -45,7 +46,7 @@
   "mavproxy_out2": "tcpin:127.0.0.1:5762",
   "mavproxy_out3": "tcpin:127.0.0.1:5763",
   "mavproxy_serial": "/dev/ttyACM0",
-  "mosfet_control_port": "5007",
+  "mosfet_control_port": 5007,
   "mosfet_enabled": true,
   "pi_ip": "192.168.69.100",
   "pi_password": "yahboom",

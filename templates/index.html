@@ -64,6 +64,8 @@
         <input id="cfg-arm_udp_port" type="text" value="5006"/></div>
       <div class="field"><label>MOSFET Control Port</label>
         <input id="cfg-mosfet_control_port" type="text" value="5007"/></div>
+      <div class="field"><label>Arm Control Port (JSON → Pi)</label>
+        <input id="cfg-arm_control_port" type="text" value="5009"/></div>
     </div>
 
     <div class="config-group">
@@ -95,10 +97,12 @@
     <!-- Onboard panel -->
     <div class="panel">
       <h2>🔵 Onboard Programs <small style="font-size:.7rem;color:var(--dim)">(Pi)</small></h2>
-      <p class="panel-desc">Launches MAVProxy, <code>stabilization.py</code> (thruster control) and
-        <code>new_ar.py</code> (arm + MOSFET) on the ROV Pi via SSH.</p>
+      <p class="panel-desc">Launches MAVProxy, <code>mosfet_service.py</code> (servo power),
+        <code>stabilization.py</code> (thruster control), and
+        <code>new_ar.py</code> (arm) on the ROV Pi via SSH.</p>
       <div class="program-status">
         <div class="prog-row"><div class="dot" id="dot-mavproxy"></div><span>mavproxy (UDP bridge)</span></div>
+        <div class="prog-row"><div class="dot" id="dot-mosfet"></div><span>mosfet_service.py</span></div>
         <div class="prog-row"><div class="dot" id="dot-stab"></div><span>stabilization.py</span></div>
         <div class="prog-row"><div class="dot" id="dot-arm"></div><span>new_ar.py</span></div>
         <div class="prog-row"><div class="dot" id="dot-cam"></div><span>camera_stream.py</span></div>
@@ -143,6 +147,7 @@
     <ul class="checklist" id="checklist-items">
       <li id="chk-ssh"><span class="chk-icon">○</span> SSH connected to Pi</li>
       <li id="chk-mavproxy"><span class="chk-icon">○</span> MAVProxy / Pixhawk link</li>
+      <li id="chk-mosfet"><span class="chk-icon">○</span> mosfet_service.py running</li>
       <li id="chk-stab"><span class="chk-icon">○</span> stabilization.py running</li>
       <li id="chk-arm-onboard"><span class="chk-icon">○</span> new_ar.py running</li>
       <li id="chk-cam"><span class="chk-icon">○</span> camera_stream.py running</li>
@@ -178,6 +183,9 @@
     </span>
     <span id="pill-mode" class="status-pill">
       <span class="status-dot"></span> Mode: --
+    </span>
+    <span id="pill-mosfet" class="status-pill" title="MOSFET service + servo power rail">
+      <span class="status-dot"></span> MOSFET: --
     </span>
     <span id="pill-gamepad" class="status-pill err">
       <span class="status-dot"></span> GP: NONE
@@ -407,6 +415,10 @@
       <span class="tc-val" id="tel-cmd-v">--</span>
     </div>
     <div class="telem-cell">
+      <span class="tc-label">MOSFET</span>
+      <span class="tc-val" id="tel-mosfet">--</span>
+    </div>
+    <div class="telem-cell">
       <span class="tc-label">Arm →Pi</span>
       <span class="tc-val" id="tel-arm-proc">--</span>
     </div>
@@ -428,6 +440,7 @@
     PROCESS LOGS
       <div class="log-tabs">
       <div class="log-tab active" onclick="switchLog('arm')" id="lt-arm">Arm Sender</div>
+      <div class="log-tab" onclick="switchLog('onboard_mosfet')" id="lt-mosfet">MOSFET</div>
       <div class="log-tab" onclick="switchLog('onboard_stab')" id="lt-stab">Onboard Stab</div>
       <div class="log-tab" onclick="switchLog('onboard_arm')" id="lt-arm2">Onboard Arm</div>
       <div class="log-tab" onclick="switchLog('onboard_cam')" id="lt-cam">Cameras</div>
