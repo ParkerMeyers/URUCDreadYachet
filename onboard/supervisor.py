@@ -39,7 +39,7 @@ SERVICES: dict[str, dict] = {
         "script": "onboard/new_ar.py",
         "log": "/tmp/rov_arm.log",
         "pidfile": "/tmp/rov_arm.pid",
-        "ready_re": r"\[arm\] Control JSON on UDP",
+        "ready_re": r"\[arm\] Listening on UDP 5006",
     },
     "cam": {
         "script": "onboard/camera_stream.py",

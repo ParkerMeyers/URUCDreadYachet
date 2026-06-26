@@ -362,10 +362,13 @@ class CameraStream:
     def _capture_loop(self) -> None:
         cap = None
         retry_delay = 1.0
+        read_fails = 0
+        _READ_FAIL_REOPEN = 8
 
         while self._running:
             # (Re-)open the camera device
             if cap is None or not cap.isOpened():
+                read_fails = 0
                 cap = self._open_capture()
                 if cap is not None and cap.isOpened():
                     retry_delay = 1.0
@@ -386,11 +389,18 @@ class CameraStream:
                     if ret and frame is not None and frame.size > 0:
                         break
             if not ret or frame is None or frame.size == 0:
+                read_fails += 1
+                if read_fails < _READ_FAIL_REOPEN:
+                    time.sleep(0.06)
+                    continue
+                read_fails = 0
                 _log(f"[cam] {self.device}: read failed — reopening")
                 _release_capture(cap)
                 cap = None
                 time.sleep(0.5)
                 continue
+
+            read_fails = 0
 
             ok, jpeg = cv2.imencode(
                 ".jpg", frame,

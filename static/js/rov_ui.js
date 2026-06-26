@@ -2910,10 +2910,15 @@ function setupCamera(imgId, noSigId, camNum) {
     failCount: 0,
     active: true,
     lastLoad: 0,
+    lastFrameAt: 0,
+    lastPixelSig: '',
+    probeCanvas: null,
   };
   _cameraState[camNum] = st;
 
-  function showNoSignal() {
+  function showNoSignal(force) {
+    // Keep the last good frame visible during brief proxy/USB hiccups.
+    if (!force && st.lastFrameAt && Date.now() - st.lastFrameAt < 6000) return;
     noSig.style.display = 'flex';
     img.style.display = 'none';
     const nsText = noSig.querySelector('.ns-text');
@@ -2932,23 +2937,53 @@ function setupCamera(imgId, noSigId, camNum) {
   function onSuccess() {
     if (!st.active) return;
     st.failCount = 0;
-    if (st.watchdogT) { clearTimeout(st.watchdogT); st.watchdogT = null; }
-    if (st.framePoll) { clearInterval(st.framePoll); st.framePoll = null; }
+    st.lastFrameAt = Date.now();
     noSig.style.display = 'none';
     img.style.display = 'block';
   }
 
+  function armWatchdog() {
+    if (st.watchdogT) clearTimeout(st.watchdogT);
+    st.watchdogT = setTimeout(() => {
+      st.watchdogT = null;
+      if (!st.active) return;
+      const fresh = st.lastFrameAt && (Date.now() - st.lastFrameAt < 8000);
+      if (hasFrame() && fresh) return;
+      if (!hasFrame()) loadStream(true);
+    }, 15000);
+  }
+
   function startFramePoll() {
     if (st.framePoll) clearInterval(st.framePoll);
+    if (!st.probeCanvas) {
+      st.probeCanvas = document.createElement('canvas');
+      st.probeCanvas.width = 1;
+      st.probeCanvas.height = 1;
+    }
+    const pctx = st.probeCanvas.getContext('2d', { willReadFrequently: true });
     st.framePoll = setInterval(() => {
-      if (!st.active) return;
-      if (hasFrame()) onSuccess();
-    }, 400);
+      if (!st.active || !hasFrame()) return;
+      onSuccess();
+      try {
+        const cx = Math.max(0, (img.naturalWidth >> 1) - 1);
+        const cy = Math.max(0, (img.naturalHeight >> 1) - 1);
+        pctx.drawImage(img, cx, cy, 1, 1, 0, 0, 1, 1);
+        const px = pctx.getImageData(0, 0, 1, 1).data;
+        const sig = `${px[0]},${px[1]},${px[2]}`;
+        if (sig !== st.lastPixelSig) {
+          st.lastPixelSig = sig;
+          st.lastFrameAt = Date.now();
+          armWatchdog();
+        } else if (st.lastFrameAt && Date.now() - st.lastFrameAt > 12000) {
+          loadStream(true);
+        }
+      } catch (_) {}
+    }, 500);
   }
 
   function scheduleRetry() {
     if (!st.active || st.retryT) return;
-    const delay = Math.min(8000, 800 + st.failCount * 700);
+    const delay = Math.min(8000, 1200 + st.failCount * 800);
     st.retryT = setTimeout(() => {
       st.retryT = null;
       loadStream(true);
@@ -2958,7 +2993,12 @@ function setupCamera(imgId, noSigId, camNum) {
   function onFail() {
     if (!st.active) return;
     st.failCount++;
-    showNoSignal();
+    // Transient MJPEG/proxy glitch — retry without flashing "No Signal".
+    if (hasFrame() && st.lastFrameAt && Date.now() - st.lastFrameAt < 5000) {
+      scheduleRetry();
+      return;
+    }
+    showNoSignal(true);
     scheduleRetry();
   }
 
@@ -2968,6 +3008,8 @@ function setupCamera(imgId, noSigId, camNum) {
     if (!control || !control.classList.contains('active')) return;
 
     st.lastLoad = Date.now();
+    if (!hasFrame()) showNoSignal(true);
+
     if (forceReconnect) {
       img.onload = null;
       img.onerror = null;
@@ -2981,14 +3023,7 @@ function setupCamera(imgId, noSigId, camNum) {
       startFramePoll();
       const sub = (window._crabActive && camNum === 2) ? '/crab' : '';
       img.src = `/camera/${camNum}${sub}?t=${Date.now()}`;
-      if (st.watchdogT) clearTimeout(st.watchdogT);
-      st.watchdogT = setTimeout(() => {
-        st.watchdogT = null;
-        if (!st.active) return;
-        if (hasFrame()) { onSuccess(); return; }
-        if (img.style.display === 'block') return;
-        loadStream(true);
-      }, 8000);
+      armWatchdog();
     };
 
     if (forceReconnect && img.src) {
@@ -2998,14 +3033,14 @@ function setupCamera(imgId, noSigId, camNum) {
     }
   }
 
-  showNoSignal();
   loadStream(false);
 }
 
 function startAllCameras() {
   stopAllCameras();
   setupCamera('cam1', 'no-sig-1', 1);
-  setTimeout(() => setupCamera('cam2', 'no-sig-2', 2), 450);
+  // Stagger Pi connections — opening both USB cameras at once often flakes one feed.
+  setTimeout(() => setupCamera('cam2', 'no-sig-2', 2), 1200);
 }
 
 function bindCameraResize() {

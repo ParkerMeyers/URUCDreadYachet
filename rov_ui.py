@@ -159,7 +159,7 @@ DEFAULT_CONFIG = {
     "telemetry_port":      5006,
     "arm_udp_port":        5006,
     "mosfet_control_port": 5007,
-    "arm_control_port":    5009,
+    "arm_control_port":    5006,
     "mosfet_enabled":      True,
     "arm_telemetry_port":  5008,
     "arm_imu_sign":        -1.0,
@@ -215,9 +215,13 @@ def normalize_onboard_config():
     normalize_camera_config()
     normalize_arm_presets()
     try:
-        config["arm_control_port"] = int(config.get("arm_control_port", 5009))
+        config["arm_control_port"] = int(config.get("arm_control_port", config.get("arm_udp_port", 5006)))
     except (TypeError, ValueError):
-        config["arm_control_port"] = 5009
+        config["arm_control_port"] = int(config.get("arm_udp_port", 5006))
+    try:
+        config["arm_udp_port"] = int(config.get("arm_udp_port", 5006))
+    except (TypeError, ValueError):
+        config["arm_udp_port"] = 5006
     try:
         config["mosfet_control_port"] = int(config.get("mosfet_control_port", 5007))
     except (TypeError, ValueError):
@@ -488,20 +492,36 @@ def _send_mosfet_command(state: bool) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _arm_control_ports() -> list[int]:
+    """UDP ports for JSON arm control (primary = arm CSV port, legacy 5009 optional)."""
+    load_config_file()
+    primary = int(config.get("arm_udp_port", 5006))
+    try:
+        legacy = int(config.get("arm_control_port", primary))
+    except (TypeError, ValueError):
+        legacy = primary
+    ports = [primary]
+    if legacy != primary:
+        ports.append(legacy)
+    if 5009 not in ports and primary != 5009:
+        ports.append(5009)
+    return ports
+
+
 def _send_pi_arm_control(payload: dict) -> tuple[bool, str]:
-    """Send JSON control command to new_ar.py (arm control port, not MOSFET)."""
+    """Send JSON control command to new_ar.py on the arm UDP port(s)."""
     load_config_file()
     try:
+        body = json.dumps(payload).encode("utf-8")
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            port = int(config.get("arm_control_port", 5009))
-            sock.sendto(
-                json.dumps(payload).encode("utf-8"),
-                (config["pi_ip"], port),
-            )
+            sent_ports = []
+            for port in _arm_control_ports():
+                sock.sendto(body, (config["pi_ip"], port))
+                sent_ports.append(str(port))
         finally:
             sock.close()
-        return True, f"sent → {config['pi_ip']}:{port}"
+        return True, f"sent → {config['pi_ip']}:{','.join(sent_ports)}"
     except Exception as e:
         return False, str(e)
 
@@ -1639,10 +1659,9 @@ def _subscribe_arm_telemetry():
         }).encode("utf-8")
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            s.sendto(
-                payload,
-                (config["pi_ip"], int(config.get("arm_control_port", 5009))),
-            )
+            body = payload
+            for port in _arm_control_ports():
+                s.sendto(body, (config["pi_ip"], port))
         finally:
             s.close()
     except Exception as e:
@@ -1935,6 +1954,25 @@ def emit_status():
 
 # UI slot 1 = forward, slot 2 = arm
 _CAMERA_UI_URL_KEY = {1: "forward_camera_url", 2: "arm_camera_url"}
+# Pi USB cameras can take >1s to accept a second HTTP client when both feeds start.
+_CAMERA_CONNECT_TIMEOUT = (5, 120)
+_CAMERA_CONNECT_RETRIES = 3
+
+
+def _open_camera_upstream(cam_url: str):
+    """Open one MJPEG upstream with short retries before returning 502 to the browser."""
+    last_exc = None
+    for attempt in range(_CAMERA_CONNECT_RETRIES):
+        try:
+            resp = _requests.get(cam_url, stream=True, timeout=_CAMERA_CONNECT_TIMEOUT)
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < _CAMERA_CONNECT_RETRIES:
+                time.sleep(0.4 * (attempt + 1))
+    raise last_exc
+
 
 @app.route("/camera/<int:cam_num>")
 def camera_stream(cam_num):
@@ -1952,8 +1990,7 @@ def camera_stream(cam_num):
     # unreachable cameras return 502 (img.onerror) instead of 200 with an empty
     # body that leaves the UI stuck on "No Signal" until the client watchdog fires.
     try:
-        upstream = _requests.get(cam_url, stream=True, timeout=(1, 30))
-        upstream.raise_for_status()
+        upstream = _open_camera_upstream(cam_url)
     except Exception as exc:
         return Response(str(exc), status=502)
 
@@ -2592,6 +2629,24 @@ def api_arm_diagnostic():
             "detail": "Start Onboard" if not STATE.get("onboard_arm") else "OK",
         },
         {
+            "name": "MOSFET service (Pi)",
+            "ok": not _mosfet_enabled() or bool(STATE.get("onboard_mosfet")),
+            "detail": (
+                "Start Onboard"
+                if _mosfet_enabled() and not STATE.get("onboard_mosfet")
+                else ("N/A" if not _mosfet_enabled() else "OK")
+            ),
+        },
+        {
+            "name": "Servo power rail (MOSFET ON)",
+            "ok": not _mosfet_enabled() or bool(STATE.get("mosfet_on")),
+            "detail": (
+                "Toggle MOSFET ON in control bar"
+                if _mosfet_enabled() and not STATE.get("mosfet_on")
+                else ("N/A" if not _mosfet_enabled() else "OK")
+            ),
+        },
+        {
             "name": "Pi MAVLink to Pix6",
             "ok": bool(tel.get("arm_mavlink_ok")),
             "detail": "Check MAVProxy + onboard arm log" if not tel.get("arm_mavlink_ok") else "OK",
@@ -2892,7 +2947,13 @@ def api_mode():
         STATE["ctrl_stabilize"] = False
         STATE["ctrl_depth_hold"] = False
         STATE["ctrl_yaw_hold"] = False
+        STATE["manual_pwm_enabled"] = False
     _apply_disarmed_arm_lockout()
+    if mode in ("armed", "stabilize"):
+        _sync_arm_claw_hold()
+        _sync_arm_imu_cal()
+        _sync_arm_claw_stop()
+        _subscribe_arm_telemetry()
     emit_status()
     return jsonify({"ok": True, "mode": mode})
 

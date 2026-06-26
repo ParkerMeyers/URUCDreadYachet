@@ -589,9 +589,8 @@ def _apply_arm_enable_cmd(cmd: dict) -> None:
             _preset_motion = False
         else:
             _preset_motion = False
-            # Avoid hold-neutral stall after disarm or Pi restart handshake.
-            if not was_enabled and (_rx_count > 0 or _last_pkt_time > 0):
-                _last_pkt_time = time.time()
+            # Clear hold-neutral stall after arm unlock (manual/preset can run immediately).
+            _last_pkt_time = time.time()
     print(f"[arm] Arm {'ENABLED' if enabled else 'DISABLED (disarmed)'}", flush=True)
 
 
@@ -796,35 +795,7 @@ def _arm_control_listener():
         try:
             data, addr = s.recvfrom(512)
             cmd = json.loads(data.decode())
-            if cmd.get("cmd") == "preset_motion":
-                _apply_preset_motion_cmd(cmd)
-                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
-            elif cmd.get("cmd") == "preset_step":
-                _apply_preset_step_cmd(cmd)
-                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
-            elif cmd.get("cmd") == "manual_pwm":
-                _apply_manual_pwm_cmd(cmd)
-                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
-            elif cmd.get("cmd") == "arm_telemetry" and cmd.get("subscribe"):
-                port = int(cmd.get("port", ARM_TELEM_PORT))
-                _note_telemetry_subscriber(addr[0], port)
-                print(f"[arm] Arm telemetry → {addr[0]}:{port}", flush=True)
-                _send_arm_telemetry(J6_OUT_CENTER)
-            elif cmd.get("cmd") == "claw_hold":
-                _apply_claw_hold_cmd(cmd)
-                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
-            elif cmd.get("cmd") == "arm_imu_cal":
-                _apply_arm_imu_cal_cmd(cmd)
-                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
-            elif cmd.get("cmd") == "arm_claw_stop":
-                _apply_arm_claw_stop_cmd(cmd)
-                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
-            elif cmd.get("cmd") == "arm_imu_zero":
-                _apply_arm_imu_zero_cmd(cmd)
-                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
-            elif cmd.get("cmd") == "arm_enable":
-                _apply_arm_enable_cmd(cmd)
-                _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+            _handle_arm_control_json(cmd, addr)
         except socket.timeout:
             pass
         except json.JSONDecodeError as e:
@@ -1062,7 +1033,7 @@ def main():
         target=_mavlink_connect_loop, daemon=True, name="arm-mavlink",
     ).start()
 
-    print(f"[arm] Listening on UDP {UDP_PORT}", flush=True)
+    print(f"[arm] Listening on UDP {UDP_PORT} (CSV arm + JSON control)", flush=True)
     print(f"[arm] AUX1=J5  AUX2=J2  AUX3=J6  AUX4=J1  AUX5=J3  AUX6=J4  AUX7=Claw", flush=True)
     print(f"[arm] BNO055={'yes' if HAVE_BNO else 'pending'}  MAVLink=connecting", flush=True)
 
@@ -1093,7 +1064,17 @@ def main():
             # ── Receive UDP arm commands ──────────────────────────────────────
             try:
                 data, addr = sock.recvfrom(1024)
-                line = data.decode(errors="ignore").strip()
+                text = data.decode(errors="ignore").strip()
+                if not text:
+                    continue
+                if text.startswith("{"):
+                    try:
+                        cmd = json.loads(text)
+                        _handle_arm_control_json(cmd, addr)
+                        continue
+                    except json.JSONDecodeError:
+                        pass
+                line = text
                 if line.startswith("PWM:"):
                     line = line[4:]
                 parts = line.split(",")
