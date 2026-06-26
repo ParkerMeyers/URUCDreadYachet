@@ -159,7 +159,7 @@ DEFAULT_CONFIG = {
     "telemetry_port":      5006,
     "arm_udp_port":        5006,
     "mosfet_control_port": 5007,
-    "arm_control_port":    5006,
+    "arm_control_port":    5009,
     "mosfet_enabled":      True,
     "arm_telemetry_port":  5008,
     "arm_imu_sign":        -1.0,
@@ -222,6 +222,9 @@ def normalize_onboard_config():
         config["arm_udp_port"] = int(config.get("arm_udp_port", 5006))
     except (TypeError, ValueError):
         config["arm_udp_port"] = 5006
+    # JSON arm commands belong on 5009; CSV arm_sender stays on arm_udp_port (5006).
+    if config["arm_control_port"] == config["arm_udp_port"]:
+        config["arm_control_port"] = 5009
     try:
         config["mosfet_control_port"] = int(config.get("mosfet_control_port", 5007))
     except (TypeError, ValueError):
@@ -530,6 +533,9 @@ def _sync_arm_power():
     """Push current MOSFET state to mosfet_service.py on the Pi."""
     if not _mosfet_enabled():
         return
+    # Servo rail needs power for any arm motion — auto-enable when armed.
+    if _robot_armed() and not STATE.get("mosfet_on"):
+        STATE["mosfet_on"] = True
     _send_mosfet_command(bool(STATE.get("mosfet_on", False)))
 
 
@@ -2731,6 +2737,8 @@ def api_arm_jog():
         _send_pi_arm_control({
             "cmd": "manual_pwm", "enabled": True, "aux": aux, "pwm": center,
         })
+        time.sleep(0.05)
+        _send_pi_arm_control({"cmd": "manual_pwm", "enabled": False})
 
     threading.Thread(target=_restore, daemon=True, name=f"arm-jog-{label}").start()
     return jsonify({
@@ -2950,6 +2958,8 @@ def api_mode():
         STATE["manual_pwm_enabled"] = False
     _apply_disarmed_arm_lockout()
     if mode in ("armed", "stabilize"):
+        if _mosfet_enabled():
+            _sync_arm_power()
         _sync_arm_claw_hold()
         _sync_arm_imu_cal()
         _sync_arm_claw_stop()

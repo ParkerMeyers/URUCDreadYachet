@@ -1,7 +1,7 @@
 {
   "arm_camera_url": "http://192.168.69.100:8160",
   "arm_claw_stop_us": 1515,
-  "arm_control_port": 5006,
+  "arm_control_port": 5009,
   "arm_imu_sign": -1.0,
   "arm_imu_zero_offset": -154.0,
   "arm_presets": {
