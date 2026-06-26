@@ -30,6 +30,9 @@ Manual AUX PWM (web UI, JSON on UDP port 5006 or 5009):
     {"cmd": "manual_pwm", "enabled": false}
     {"cmd": "manual_pwm", "aux": 6, "pwm": 1500}  — AUX1–7, 500–2500 µs
     {"cmd": "manual_pwm", "center": true}
+
+Thruster manual PWM is handled by stabilization.py (UDP 5005):
+    {"cmd": "manual_pwm", "motor": 1, "pwm": 1600}  — M1–8, 1100–1900 µs
 """
 
 import json

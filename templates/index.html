@@ -607,8 +607,9 @@
     </div>
     <div class="modal-body">
       <p class="manual-pwm-desc">
-        Direct PWM to Pix6 AUX outputs (500–2500 µs). When enabled, overrides
-        <code>arm_sender.py</code> / <code>new_ar.py</code> UDP commands.
+        Direct PWM to Pix6 outputs. Arm AUX1–7 (500–2500 µs) and thrusters M1–8
+        (1100–1900 µs). When enabled, overrides gamepad mixer and
+        <code>arm_sender.py</code> UDP commands.
       </p>
       <div class="manual-pwm-toggle-row">
         <button class="btn btn-danger" id="btn-manual-pwm-off" onclick="setManualPwmEnabled(false)">Manual OFF</button>
@@ -617,7 +618,7 @@
       </div>
       <div class="manual-pwm-cmd-row">
         <label for="manual-pwm-input">Command</label>
-        <input id="manual-pwm-input" type="text" placeholder="claw 1510  or  7 1510  or  J1 1500"
+        <input id="manual-pwm-input" type="text" placeholder="claw 1510  |  J1 1500  |  M3 1600  |  flh 1600"
                onkeydown="if(event.key==='Enter')sendManualPwmLine()"/>
         <button class="btn btn-primary" onclick="sendManualPwmLine()">Send</button>
         <button class="btn btn-secondary" onclick="centerManualPwm()">Center all</button>
@@ -625,8 +626,9 @@
       </div>
       <div class="manual-pwm-grid" id="manual-pwm-grid"></div>
       <p class="manual-pwm-hint">
-        Claw (AUX7): use <strong>claw 1510</strong> or <strong>7 1510</strong>. Tune until no drift, then <strong>Save claw stop</strong>.
-        Centered stick/command maps to that stop PWM automatically.
+        Arm: <strong>claw 1510</strong>, <strong>J1 1500</strong>, or <strong>4 1500</strong> (AUX4).
+        Thrusters: <strong>M3 1600</strong> or <strong>flh 1600</strong> (motor names: flh, blh, flv, frv, frh, brh, brv, blv).
+        Tune claw until no drift, then <strong>Save claw stop</strong>.
       </p>
     </div>
   </div>

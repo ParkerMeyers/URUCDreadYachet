@@ -17,6 +17,7 @@ This version:
 import json
 import math
 import socket
+import threading
 import time
 from dataclasses import dataclass
 
@@ -250,6 +251,70 @@ VERTICAL_MOTORS = [
     "back_left_v",
     "back_right_v",
 ]
+
+# RC channel 1–8 → motor name (matches motor_test_onboard.py)
+MOTOR_CH_TO_NAME = {
+    1: "front_left_h",
+    2: "back_left_h",
+    3: "front_left_v",
+    4: "front_right_v",
+    5: "front_right_h",
+    6: "back_right_h",
+    7: "back_right_v",
+    8: "back_left_v",
+}
+
+# Manual thruster PWM (web UI JSON on UDP_LISTEN_PORT with cmd=manual_pwm)
+_manual_lock = threading.Lock()
+_manual_mode = False
+_manual_thr_pwm = [NEUTRAL_US] * 8
+
+
+def _default_manual_thr_pwm():
+    return [NEUTRAL_US] * 8
+
+
+def _clamp_thr_us(value) -> int:
+    return int(clamp(int(round(float(value))), MIN_US, MAX_US))
+
+
+def _apply_manual_pwm_cmd(cmd: dict) -> None:
+    """Handle manual thruster PWM from the web UI (overrides gamepad mixer)."""
+    global _manual_mode, _manual_thr_pwm
+
+    if cmd.get("center"):
+        with _manual_lock:
+            _manual_mode = True
+            _manual_thr_pwm = _default_manual_thr_pwm()
+        print("[stab] Manual thr: all centered (1500 µs)", flush=True)
+        return
+
+    if "enabled" in cmd and cmd.get("motor") is None:
+        enabled = bool(cmd.get("enabled"))
+        with _manual_lock:
+            _manual_mode = enabled
+        print(
+            f"[stab] Manual thr mode {'ON — ignoring gamepad mixer' if enabled else 'OFF'}",
+            flush=True,
+        )
+        return
+
+    motor = cmd.get("motor")
+    pwm = cmd.get("pwm")
+    if motor is None or pwm is None:
+        return
+    try:
+        motor_i = int(motor)
+        pwm_i = _clamp_thr_us(pwm)
+    except (TypeError, ValueError):
+        return
+    if not (1 <= motor_i <= 8):
+        return
+    with _manual_lock:
+        _manual_mode = True
+        _manual_thr_pwm[motor_i - 1] = pwm_i
+    label = MOTOR_CH_TO_NAME.get(motor_i, "?")
+    print(f"[stab] Manual M{motor_i} ({label}) → {pwm_i} µs [override ON]", flush=True)
 
 
 # ============================================================
@@ -1012,6 +1077,10 @@ class ControlReceiver:
             except Exception:
                 continue
 
+            if packet.get("cmd") == "manual_pwm":
+                _apply_manual_pwm_cmd(packet)
+                continue
+
             self.forward = float(packet.get("forward", 0.0))
             self.lateral = float(packet.get("lateral", 0.0))
             self.yaw = float(packet.get("yaw", 0.0))
@@ -1276,7 +1345,12 @@ def main():
             attitude_stale = mav.attitude_stale()
             depth_stale = mav.depth_stale()
 
-            if control_timed_out:
+            with _manual_lock:
+                manual_thr_active = _manual_mode
+                if manual_thr_active:
+                    manual_thr_snap = list(_manual_thr_pwm)
+
+            if control_timed_out and not manual_thr_active:
                 control.zero_controls()
                 filt_forward = 0.0
                 filt_lateral = 0.0
@@ -1594,22 +1668,32 @@ def main():
                 1.0,
             )
 
-            cmds = mix_thrusters(
-                forward=filt_forward,
-                lateral=filt_lateral,
-                yaw=yaw_for_mixer,
-                vertical=vertical_for_mixer,
-                pitch_correction=pitch_correction,
-                roll_correction=roll_correction,
-            )
+            if manual_thr_active:
+                pwm_out = {
+                    MOTOR_CH_TO_NAME[ch]: int(clamp(manual_thr_snap[ch - 1], MIN_US, MAX_US))
+                    for ch in range(1, 9)
+                }
+                h_group = 0.0
+                v_group = 0.0
+                cmds = {name: 0.0 for name in MOTORS}
+            else:
+                cmds = mix_thrusters(
+                    forward=filt_forward,
+                    lateral=filt_lateral,
+                    yaw=yaw_for_mixer,
+                    vertical=vertical_for_mixer,
+                    pitch_correction=pitch_correction,
+                    roll_correction=roll_correction,
+                )
 
-            h_group = group_max(cmds, HORIZONTAL_MOTORS)
-            v_group = group_max(cmds, VERTICAL_MOTORS)
+                h_group = group_max(cmds, HORIZONTAL_MOTORS)
+                v_group = group_max(cmds, VERTICAL_MOTORS)
 
-            pwm_out = {
-                motor_name: command_to_pwm_us(motor_name, cmd)
-                for motor_name, cmd in cmds.items()
-            }
+                pwm_out = {
+                    motor_name: command_to_pwm_us(motor_name, cmd)
+                    for motor_name, cmd in cmds.items()
+                }
+
             pixhawk.update_pwm(pwm_out)
             pixhawk.tick_send(now)
 

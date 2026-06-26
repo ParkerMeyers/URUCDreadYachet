@@ -543,7 +543,7 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 .arm-preset-form-actions { display:flex; gap:8px; flex-wrap:wrap; }
 
 /* ── manual AUX PWM ── */
-.manual-pwm-box { width:min(640px,96vw); }
+.manual-pwm-box { width:min(720px,96vw); }
 .manual-pwm-desc {
   font-size:0.82rem; color:var(--dim); line-height:1.5; margin-bottom:14px;
 }
@@ -568,6 +568,14 @@ html,body { height:100%; background:var(--bg); color:var(--text);
   display:grid; grid-template-columns:repeat(2, 1fr); gap:8px; margin-bottom:10px;
 }
 @media(min-width:520px){ .manual-pwm-grid { grid-template-columns:repeat(4, 1fr); } }
+.manual-pwm-section {
+  grid-column:1 / -1;
+  font-size:0.72rem; font-weight:700; color:var(--dim);
+  text-transform:uppercase; letter-spacing:0.04em;
+  margin-top:4px; padding-top:6px; border-top:1px solid var(--border);
+}
+.manual-pwm-section:first-child { margin-top:0; padding-top:0; border-top:none; }
+.manual-pwm-cell-thr { border-color:rgba(0,180,255,.25); }
 .manual-pwm-cell {
   padding:8px 10px; background:var(--bg3); border:1px solid var(--border);
   border-radius:8px; font-family:var(--mono); font-size:0.75rem;

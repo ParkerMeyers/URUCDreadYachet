@@ -120,11 +120,48 @@ MANUAL_AUX_DEFAULTS = [1500, 1500, 1500, 1500, 1500, 1500, 1515]  # legacy fallb
 JOINT_TO_AUX = {1: 4, 2: 2, 3: 5, 4: 6, 5: 1, 6: 3, 7: 7}
 AUX_TO_JOINT = {v: k for k, v in JOINT_TO_AUX.items()}
 
+# Pix6 RC1–8 thruster labels (matches onboard/stabilization.py MOTOR_CH_TO_NAME)
+MANUAL_THR_LABELS = [
+    "FL_H", "BL_H", "FL_V", "FR_V", "FR_H", "BR_H", "BR_V", "BL_V",
+]
+MANUAL_THR_NAMES = {
+    1: "front_left_h",
+    2: "back_left_h",
+    3: "front_left_v",
+    4: "front_right_v",
+    5: "front_right_h",
+    6: "back_right_h",
+    7: "back_right_v",
+    8: "back_left_v",
+}
+MOTOR_NAME_ALIASES = {
+    "m1": 1, "motor1": 1, "flh": 1, "front_left_h": 1,
+    "m2": 2, "motor2": 2, "blh": 2, "back_left_h": 2,
+    "m3": 3, "motor3": 3, "flv": 3, "front_left_v": 3,
+    "m4": 4, "motor4": 4, "frv": 4, "front_right_v": 4,
+    "m5": 5, "motor5": 5, "frh": 5, "front_right_h": 5,
+    "m6": 6, "motor6": 6, "brh": 6, "back_right_h": 6,
+    "m7": 7, "motor7": 7, "brv": 7, "back_right_v": 7,
+    "m8": 8, "motor8": 8, "blv": 8, "back_left_v": 8,
+}
+THR_PWM_MIN = 1100
+THR_PWM_MAX = 1900
+NEUTRAL_THR_PWM = 1500
+
 
 def _manual_aux_defaults() -> list[int]:
     """Default manual AUX PWM with configured claw stop."""
     claw_stop = int(config.get("arm_claw_stop_us", 1515))
     return [1500, 1500, 1500, 1500, 1500, 1500, claw_stop]
+
+
+def _manual_thr_defaults() -> list[int]:
+    """Default manual thruster PWM (all neutral)."""
+    return [NEUTRAL_THR_PWM] * 8
+
+
+def _clamp_thr_pwm(value) -> int:
+    return int(max(THR_PWM_MIN, min(THR_PWM_MAX, int(round(float(value))))))
 
 DEFAULT_ARM_PRESETS = {
     "stow": {
@@ -529,6 +566,22 @@ def _send_pi_arm_control(payload: dict) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _send_pi_stab_control(payload: dict) -> tuple[bool, str]:
+    """Send JSON control command to stabilization.py on the thrust UDP port."""
+    load_config_file()
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        port = int(config["thrust_udp_port"])
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.sendto(body, (config["pi_ip"], port))
+        finally:
+            sock.close()
+        return True, f"sent → {config['pi_ip']}:{port}"
+    except Exception as e:
+        return False, str(e)
+
+
 def _sync_arm_power():
     """Push current MOSFET state to mosfet_service.py on the Pi."""
     if not _mosfet_enabled():
@@ -549,6 +602,7 @@ def _apply_disarmed_arm_lockout():
     STATE["preset_active_name"] = ""
     _send_pi_arm_control({"cmd": "arm_enable", "enabled": False})
     _send_pi_arm_control({"cmd": "manual_pwm", "enabled": False})
+    _send_pi_stab_control({"cmd": "manual_pwm", "enabled": False})
     _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
 
 
@@ -572,31 +626,59 @@ def _send_arm_csv(csv_line: str):
         sock.close()
 
 
-def _parse_manual_pwm_line(line: str) -> tuple[int, int, str] | None:
-    """Parse '6 1500', 'J1 1500', or 'claw 1600' → (aux, pwm, label)."""
+def _parse_manual_pwm_line(line: str) -> tuple[str, int, int, str] | None:
+    """Parse manual PWM line → (kind, index, pwm, label). kind is 'aux' or 'motor'."""
     line = (line or "").strip()
     if not line:
         return None
     parts = line.split()
     if len(parts) != 2:
         return None
+
+    token = parts[0].strip().lower()
     try:
-        pwm = _clamp_arm_pwm(parts[1])
+        pwm_raw = parts[1]
+    except IndexError:
+        return None
+
+    # Thruster: M1–M8 or motor name alias
+    if token.startswith("m") and len(token) > 1 and token[1:].isdigit():
+        motor_i = int(token[1:])
+        if not (1 <= motor_i <= 8):
+            return None
+        try:
+            pwm = _clamp_thr_pwm(pwm_raw)
+        except (TypeError, ValueError):
+            return None
+        label = f"M{motor_i} ({MANUAL_THR_LABELS[motor_i - 1]})"
+        return "motor", motor_i, pwm, label
+
+    if token in MOTOR_NAME_ALIASES:
+        motor_i = MOTOR_NAME_ALIASES[token]
+        try:
+            pwm = _clamp_thr_pwm(pwm_raw)
+        except (TypeError, ValueError):
+            return None
+        label = f"M{motor_i} ({MANUAL_THR_LABELS[motor_i - 1]})"
+        return "motor", motor_i, pwm, label
+
+    # Arm AUX / joint
+    try:
+        pwm = _clamp_arm_pwm(pwm_raw)
     except (TypeError, ValueError):
         return None
 
-    token = parts[0].strip().lower()
     if token in ("claw",):
-        return 7, pwm, "Claw"
+        return "aux", 7, pwm, "Claw"
     if token in ("j6", "wrist"):
-        return JOINT_TO_AUX[6], pwm, "J6"
+        return "aux", JOINT_TO_AUX[6], pwm, "J6"
     if token.startswith("j") and token[1:].isdigit():
         joint_i = int(token[1:])
         if joint_i not in JOINT_TO_AUX:
             return None
         aux = JOINT_TO_AUX[joint_i]
         label = f"J{joint_i}" if joint_i < 7 else "Claw"
-        return aux, pwm, label
+        return "aux", aux, pwm, label
     try:
         aux = int(parts[0])
     except (TypeError, ValueError):
@@ -604,7 +686,7 @@ def _parse_manual_pwm_line(line: str) -> tuple[int, int, str] | None:
     if not (1 <= aux <= 7):
         return None
     label = f"AUX{aux} ({MANUAL_AUX_LABELS[aux - 1]})"
-    return aux, pwm, label
+    return "aux", aux, pwm, label
 
 
 config = DEFAULT_CONFIG.copy()
@@ -687,6 +769,7 @@ STATE = {
     "preset_active_name":    "",
     "manual_pwm_enabled":    False,
     "manual_aux_pwm":        list(_manual_aux_defaults()),
+    "manual_thr_pwm":        list(_manual_thr_defaults()),
     "claw_hold":             bool(config.get("claw_hold", False)),
     "telemetry": {
         "rx_state":                "NO_TELEMETRY",
@@ -1947,6 +2030,7 @@ def emit_status():
         "preset_active_name":    STATE.get("preset_active_name", ""),
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
         "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(_manual_aux_defaults())),
+        "manual_thr_pwm":        STATE.get("manual_thr_pwm", list(_manual_thr_defaults())),
         "claw_hold":             STATE.get("claw_hold", False),
         "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", 1515)),
         "arm_motion_enabled":    _robot_armed(),
@@ -2854,8 +2938,22 @@ def api_manual_pwm_get():
         "ok": True,
         "enabled": bool(STATE.get("manual_pwm_enabled")),
         "aux_pwm": list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults()))),
+        "thr_pwm": list(STATE.get("manual_thr_pwm", list(_manual_thr_defaults()))),
         "aux_labels": MANUAL_AUX_LABELS,
+        "thr_labels": MANUAL_THR_LABELS,
     })
+
+
+def _manual_pwm_json(extra: dict | None = None) -> dict:
+    """Common manual PWM fields for API responses."""
+    payload = {
+        "enabled": STATE.get("manual_pwm_enabled", False),
+        "aux_pwm": list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults()))),
+        "thr_pwm": list(STATE.get("manual_thr_pwm", list(_manual_thr_defaults()))),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 @app.route("/api/manual_pwm", methods=["POST"])
@@ -2875,37 +2973,54 @@ def api_manual_pwm():
 
     if action == "toggle":
         enabled = bool(data.get("enabled"))
-        ok, msg = _send_pi_arm_control({"cmd": "manual_pwm", "enabled": enabled})
-        if ok:
+        ok_arm, msg_arm = _send_pi_arm_control({"cmd": "manual_pwm", "enabled": enabled})
+        ok_stab, msg_stab = _send_pi_stab_control({"cmd": "manual_pwm", "enabled": enabled})
+        ok = ok_arm and ok_stab
+        msg = "; ".join(filter(None, [msg_arm if ok_arm else f"arm: {msg_arm}",
+                                      msg_stab if ok_stab else f"stab: {msg_stab}"]))
+        if ok_arm or ok_stab:
             STATE["manual_pwm_enabled"] = enabled
         emit_status()
-        return jsonify({
-            "ok": ok,
-            "msg": msg,
-            "enabled": STATE.get("manual_pwm_enabled", False),
-            "aux_pwm": list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults()))),
-        })
+        return jsonify({"ok": ok, "msg": msg, **_manual_pwm_json()})
 
     if action == "center":
-        ok, msg = _send_pi_arm_control({"cmd": "manual_pwm", "center": True, "enabled": True})
-        if ok:
+        ok_arm, msg_arm = _send_pi_arm_control({
+            "cmd": "manual_pwm", "center": True, "enabled": True,
+        })
+        ok_stab, msg_stab = _send_pi_stab_control({
+            "cmd": "manual_pwm", "center": True, "enabled": True,
+        })
+        ok = ok_arm and ok_stab
+        msg = "; ".join(filter(None, [msg_arm if ok_arm else f"arm: {msg_arm}",
+                                      msg_stab if ok_stab else f"stab: {msg_stab}"]))
+        if ok_arm or ok_stab:
             STATE["manual_pwm_enabled"] = True
             STATE["manual_aux_pwm"] = list(_manual_aux_defaults())
+            STATE["manual_thr_pwm"] = list(_manual_thr_defaults())
         emit_status()
-        return jsonify({
-            "ok": ok,
-            "msg": msg,
-            "enabled": STATE.get("manual_pwm_enabled", False),
-            "aux_pwm": list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults()))),
-        })
+        return jsonify({"ok": ok, "msg": msg, **_manual_pwm_json()})
 
     if action == "set":
-        aux = data.get("aux")
-        pwm = data.get("pwm")
         parsed = None
+        aux = data.get("aux")
+        motor = data.get("motor")
+        pwm = data.get("pwm")
         if aux is not None and pwm is not None:
             try:
-                parsed = (int(aux), _clamp_arm_pwm(pwm))
+                aux_i = int(aux)
+                pwm_i = _clamp_arm_pwm(pwm)
+                if 1 <= aux_i <= 7:
+                    parsed = ("aux", aux_i, pwm_i,
+                              f"AUX{aux_i} ({MANUAL_AUX_LABELS[aux_i - 1]})")
+            except (TypeError, ValueError):
+                parsed = None
+        elif motor is not None and pwm is not None:
+            try:
+                motor_i = int(motor)
+                pwm_i = _clamp_thr_pwm(pwm)
+                if 1 <= motor_i <= 8:
+                    parsed = ("motor", motor_i, pwm_i,
+                              f"M{motor_i} ({MANUAL_THR_LABELS[motor_i - 1]})")
             except (TypeError, ValueError):
                 parsed = None
         elif data.get("line"):
@@ -2914,31 +3029,60 @@ def api_manual_pwm():
         if not parsed:
             return jsonify({
                 "ok": False,
-                "msg": "Use AUX 1–7 or J1–J6/claw plus PWM (e.g. 'J1 1500', '4 1500', 'claw 1600')",
+                "msg": (
+                    "Use AUX 1–7 / J1–J6 / claw, or M1–M8 / flh etc. plus PWM "
+                    "(e.g. 'J1 1500', 'M3 1600', 'flh 1600')"
+                ),
             })
-        aux_i, pwm_i, label = parsed
-        ok, msg = _send_pi_arm_control({
+
+        kind, idx, pwm_i, label = parsed
+        if kind == "aux":
+            ok, msg = _send_pi_arm_control({
+                "cmd": "manual_pwm",
+                "enabled": True,
+                "aux": idx,
+                "pwm": pwm_i,
+            })
+            if ok:
+                STATE["manual_pwm_enabled"] = True
+                aux_list = list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults())))
+                while len(aux_list) < 7:
+                    aux_list.append(1500)
+                aux_list[idx - 1] = pwm_i
+                STATE["manual_aux_pwm"] = aux_list
+            emit_status()
+            return jsonify({
+                "ok": ok,
+                "msg": msg,
+                "kind": kind,
+                "aux": idx,
+                "pwm": pwm_i,
+                "label": label,
+                **_manual_pwm_json(),
+            })
+
+        ok, msg = _send_pi_stab_control({
             "cmd": "manual_pwm",
             "enabled": True,
-            "aux": aux_i,
+            "motor": idx,
             "pwm": pwm_i,
         })
         if ok:
             STATE["manual_pwm_enabled"] = True
-            aux_list = list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults())))
-            while len(aux_list) < 7:
-                aux_list.append(1500)
-            aux_list[aux_i - 1] = pwm_i
-            STATE["manual_aux_pwm"] = aux_list
+            thr_list = list(STATE.get("manual_thr_pwm", list(_manual_thr_defaults())))
+            while len(thr_list) < 8:
+                thr_list.append(NEUTRAL_THR_PWM)
+            thr_list[idx - 1] = pwm_i
+            STATE["manual_thr_pwm"] = thr_list
         emit_status()
         return jsonify({
             "ok": ok,
             "msg": msg,
-            "aux": aux_i,
+            "kind": kind,
+            "motor": idx,
             "pwm": pwm_i,
             "label": label,
-            "enabled": STATE.get("manual_pwm_enabled", False),
-            "aux_pwm": list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults()))),
+            **_manual_pwm_json(),
         })
 
     return jsonify({"ok": False, "msg": "action must be toggle, set, or center"})
@@ -2956,6 +3100,7 @@ def api_mode():
         STATE["ctrl_depth_hold"] = False
         STATE["ctrl_yaw_hold"] = False
         STATE["manual_pwm_enabled"] = False
+        STATE["manual_thr_pwm"] = list(_manual_thr_defaults())
     _apply_disarmed_arm_lockout()
     if mode in ("armed", "stabilize"):
         if _mosfet_enabled():
@@ -3212,6 +3357,7 @@ def api_status():
         "preset_active_name":    STATE.get("preset_active_name", ""),
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
         "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(_manual_aux_defaults())),
+        "manual_thr_pwm":        STATE.get("manual_thr_pwm", list(_manual_thr_defaults())),
         "claw_hold":             STATE.get("claw_hold", False),
         "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", 1515)),
         "arm_motion_enabled":    _robot_armed(),

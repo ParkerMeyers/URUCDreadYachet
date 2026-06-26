@@ -744,19 +744,41 @@ function hideArmPresetsOutside(e) {
 
 // ── Manual AUX PWM (direct Pix6 AUX override on Pi) ───────────
 const MANUAL_AUX_LABELS = ['J5', 'J2', 'J6', 'J1', 'J3', 'J4', 'Claw'];
+const MANUAL_THR_LABELS = ['FL_H', 'BL_H', 'FL_V', 'FR_V', 'FR_H', 'BR_H', 'BR_V', 'BL_V'];
 let _configClawStopUs = 1515;
 
 function manualAuxDefaults() {
   return [1500, 1500, 1500, 1500, 1500, 1500, _configClawStopUs];
 }
 
+function manualThrDefaults() {
+  return [1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500];
+}
+
 let _manualPwmEnabled = false;
 let _manualAuxPwm = manualAuxDefaults();
+let _manualThrPwm = manualThrDefaults();
+
+function applyManualPwmPayload(d) {
+  if (typeof d.enabled !== 'undefined') _manualPwmEnabled = !!d.enabled;
+  if (Array.isArray(d.aux_pwm) && d.aux_pwm.length >= 7) {
+    _manualAuxPwm = d.aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
+  }
+  if (Array.isArray(d.thr_pwm) && d.thr_pwm.length >= 8) {
+    _manualThrPwm = d.thr_pwm.slice(0, 8).map(v => parseInt(v, 10) || 1500);
+  }
+}
 
 function buildManualPwmGrid() {
   const grid = document.getElementById('manual-pwm-grid');
   if (!grid) return;
   grid.innerHTML = '';
+
+  const armHead = document.createElement('div');
+  armHead.className = 'manual-pwm-section';
+  armHead.textContent = 'Arm (AUX1–7)';
+  grid.appendChild(armHead);
+
   for (let i = 0; i < 7; i++) {
     const cell = document.createElement('div');
     cell.className = 'manual-pwm-cell';
@@ -764,6 +786,21 @@ function buildManualPwmGrid() {
     cell.innerHTML =
       `<span class="aux-name">AUX${i + 1} ${MANUAL_AUX_LABELS[i]}</span>` +
       `<span class="aux-val">${_manualAuxPwm[i]}</span>`;
+    grid.appendChild(cell);
+  }
+
+  const thrHead = document.createElement('div');
+  thrHead.className = 'manual-pwm-section';
+  thrHead.textContent = 'Thrusters (M1–8)';
+  grid.appendChild(thrHead);
+
+  for (let i = 0; i < 8; i++) {
+    const cell = document.createElement('div');
+    cell.className = 'manual-pwm-cell manual-pwm-cell-thr';
+    cell.id = 'manual-pwm-thr-cell-' + (i + 1);
+    cell.innerHTML =
+      `<span class="aux-name">M${i + 1} ${MANUAL_THR_LABELS[i]}</span>` +
+      `<span class="aux-val">${_manualThrPwm[i]}</span>`;
     grid.appendChild(cell);
   }
 }
@@ -787,6 +824,13 @@ function updateManualPwmUI() {
       if (valEl) valEl.textContent = _manualAuxPwm[i];
     }
   }
+  for (let i = 0; i < 8; i++) {
+    const cell = document.getElementById('manual-pwm-thr-cell-' + (i + 1));
+    if (cell) {
+      const valEl = cell.querySelector('.aux-val');
+      if (valEl) valEl.textContent = _manualThrPwm[i];
+    }
+  }
 }
 
 async function loadManualPwmState() {
@@ -794,10 +838,7 @@ async function loadManualPwmState() {
     const r = await fetch('/api/manual_pwm');
     const d = await r.json();
     if (d.ok) {
-      _manualPwmEnabled = !!d.enabled;
-      if (Array.isArray(d.aux_pwm) && d.aux_pwm.length >= 7) {
-        _manualAuxPwm = d.aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
-      }
+      applyManualPwmPayload(d);
       updateManualPwmUI();
     }
   } catch (_) {}
@@ -832,11 +873,10 @@ async function setManualPwmEnabled(enabled) {
   });
   const d = await r.json();
   if (d.ok) {
-    _manualPwmEnabled = !!d.enabled;
-    if (Array.isArray(d.aux_pwm)) _manualAuxPwm = d.aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
+    applyManualPwmPayload(d);
     updateManualPwmUI();
     toast(
-      _manualPwmEnabled ? 'Manual AUX ON — arm_sender ignored on Pi' : 'Manual AUX OFF',
+      _manualPwmEnabled ? 'Manual mode ON — gamepad/arm_sender ignored on Pi' : 'Manual mode OFF',
       _manualPwmEnabled ? 'warn' : ''
     );
   } else {
@@ -860,14 +900,15 @@ async function sendManualPwmLine() {
   });
   const d = await r.json();
   if (d.ok) {
-    _manualPwmEnabled = !!d.enabled;
-    if (Array.isArray(d.aux_pwm)) _manualAuxPwm = d.aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
+    applyManualPwmPayload(d);
     updateManualPwmUI();
-    const who = d.label || `AUX${d.aux} (${MANUAL_AUX_LABELS[d.aux - 1]})`;
+    const who = d.label || (d.kind === 'motor'
+      ? `M${d.motor} (${MANUAL_THR_LABELS[d.motor - 1]})`
+      : `AUX${d.aux} (${MANUAL_AUX_LABELS[d.aux - 1]})`);
     toast(`${who} → ${d.pwm} µs`, 'ok');
     if (inp) inp.value = '';
   } else {
-    toast(d.msg || 'Invalid command — use: claw 1510 or 7 1510', 'err');
+    toast(d.msg || 'Invalid command — use: claw 1510, M3 1600, or flh 1600', 'err');
   }
 }
 
@@ -884,10 +925,9 @@ async function centerManualPwm() {
   });
   const d = await r.json();
   if (d.ok) {
-    _manualPwmEnabled = !!d.enabled;
-    if (Array.isArray(d.aux_pwm)) _manualAuxPwm = d.aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
+    applyManualPwmPayload(d);
     updateManualPwmUI();
-    toast('All joints centered (claw uses saved stop PWM)', 'ok');
+    toast('All arm joints and thrusters centered', 'ok');
   } else {
     toast(d.msg || 'Center failed', 'err');
   }
@@ -1847,6 +1887,9 @@ function updateStatus() {
   }
   if (Array.isArray(s.manual_aux_pwm) && s.manual_aux_pwm.length >= 7) {
     _manualAuxPwm = s.manual_aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
+  }
+  if (Array.isArray(s.manual_thr_pwm) && s.manual_thr_pwm.length >= 8) {
+    _manualThrPwm = s.manual_thr_pwm.slice(0, 8).map(v => parseInt(v, 10) || 1500);
   }
   updateManualPwmUI();
 
