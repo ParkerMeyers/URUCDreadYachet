@@ -68,8 +68,9 @@ ARM_TELEM_HZ = 5
 ARM_TELEM_PORT = 5008   # topside rov_ui listener (must match arm_telemetry_port)
 TIMEOUT_SEC = 0.75    # center all joints if no UDP packet received for this long
 IMU_READ_STALE_SEC = 5.0       # drop cached angle after this long without a good read
-IMU_STALE_WARN_SEC = 1.0       # UI/control "stale" only after this long without a good read
+IMU_STALE_WARN_SEC = 2.0       # UI/control "stale" after this long without a good read
 IMU_MIN_READ_INTERVAL_SEC = 0.05  # cap BNO055 I2C reads (~20 Hz)
+IMU_REINIT_AFTER_FAILURES = 50    # re-open BNO055 after this many consecutive bad reads
 
 # Maps incoming CSV joint index → RC channel number (AUX1=ch9, AUX2=ch10 …)
 # Incoming order: J1(0), J2(1), J3(2), J4(3), J5(4), J6_PWM(5), Claw(6)
@@ -145,31 +146,44 @@ def _read_j6_grav_deg():
     """Gravity atan2 angle minus factory ref, before user zero/sign."""
     if not HAVE_BNO or _bno is None:
         return None
-    for attempt in range(2):
-        try:
-            g = _bno.gravity
-            if g is None or any(v is None for v in g):
-                if attempt == 0:
-                    time.sleep(0.002)
-                    continue
-                return None
-            gravity = _normalize(g)
-            if gravity is None:
-                if attempt == 0:
-                    time.sleep(0.002)
-                    continue
-                return None
-            raw_deg = math.degrees(math.atan2(
-                gravity[J6_IMU_GRAV_NUM],
-                gravity[J6_IMU_GRAV_DEN],
-            ))
-            return _wrap_deg180(raw_deg - _J6_IMU_REF_DEG)
-        except Exception:
-            if attempt == 0:
-                time.sleep(0.002)
-                continue
-            return None
-    return None
+
+    gravity = None
+    with _bno_lock:
+        for attempt in range(4):
+            try:
+                g = _bno.gravity
+                if g is not None and not any(v is None for v in g):
+                    gravity = g
+                    break
+            except Exception:
+                pass
+            if attempt < 3:
+                time.sleep(0.003)
+
+        # Fusion gravity can briefly return None — accel ≈ gravity when stationary.
+        if gravity is None:
+            for attempt in range(3):
+                try:
+                    a = _bno.acceleration
+                    if a is not None and not any(v is None for v in a):
+                        gravity = a
+                        break
+                except Exception:
+                    pass
+                if attempt < 2:
+                    time.sleep(0.003)
+
+    if gravity is None:
+        return None
+
+    vec = _normalize(gravity)
+    if vec is None:
+        return None
+    raw_deg = math.degrees(math.atan2(
+        vec[J6_IMU_GRAV_NUM],
+        vec[J6_IMU_GRAV_DEN],
+    ))
+    return _wrap_deg180(raw_deg - _J6_IMU_REF_DEG)
 
 
 def _apply_j6_imu_calibration(raw_deg: float) -> float:
@@ -183,25 +197,28 @@ def _reset_imu_cache() -> None:
     """Clear IMU angle cache after a fresh BNO055 init."""
     global _last_imu_angle_deg, _last_imu_read_time
     global _imu_snap_angle, _imu_snap_stale, _imu_last_poll_time
+    global _imu_consecutive_failures
     _last_imu_angle_deg = None
     _last_imu_read_time = 0.0
     _imu_snap_angle = None
     _imu_snap_stale = False
     _imu_last_poll_time = 0.0
+    _imu_consecutive_failures = 0
 
 
 def _release_bno() -> None:
     """Release the I2C bus so the next process start can reopen the BNO055."""
     global _bno, _i2c, HAVE_BNO
-    _bno = None
-    HAVE_BNO = False
-    if _i2c is not None:
-        try:
-            if hasattr(_i2c, "deinit"):
-                _i2c.deinit()
-        except Exception:
-            pass
-        _i2c = None
+    with _bno_lock:
+        _bno = None
+        HAVE_BNO = False
+        if _i2c is not None:
+            try:
+                if hasattr(_i2c, "deinit"):
+                    _i2c.deinit()
+            except Exception:
+                pass
+            _i2c = None
 
 
 def _try_init_bno_once() -> bool:
@@ -218,17 +235,20 @@ def _try_init_bno_once() -> bool:
 
         i2c = busio.I2C(board.SCL, board.SDA)
         bno = adafruit_bno055.BNO055_I2C(i2c, address=0x29)
+        bno.mode = adafruit_bno055.NDOF_MODE
+        time.sleep(0.05)
         # Confirm the chip responds before marking it ready.
-        for _ in range(10):
-            g = bno.gravity
-            if g is not None and not any(v is None for v in g):
-                _i2c = i2c
-                _bno = bno
-                HAVE_BNO = True
-                _reset_imu_cache()
-                print("[arm] BNO055 IMU ready — J6 auto-level enabled", flush=True)
-                return True
-            time.sleep(0.05)
+        with _bno_lock:
+            for _ in range(15):
+                g = bno.gravity
+                if g is not None and not any(v is None for v in g):
+                    _i2c = i2c
+                    _bno = bno
+                    HAVE_BNO = True
+                    _reset_imu_cache()
+                    print("[arm] BNO055 IMU ready — J6 auto-level enabled", flush=True)
+                    return True
+                time.sleep(0.05)
         _release_bno()
         return False
     except Exception as _e:
@@ -278,6 +298,28 @@ def _init_optional_hardware() -> None:
         time.sleep(BNO_INIT_RETRY_SEC)
 
 
+def _start_imu_poll_thread() -> None:
+    """Dedicated BNO055 reader — avoids stale reads when the main loop is busy."""
+    def _loop():
+        global _imu_consecutive_failures
+        while True:
+            if HAVE_BNO:
+                _poll_imu_cache(force=True)
+                if _imu_consecutive_failures >= IMU_REINIT_AFTER_FAILURES:
+                    _imu_consecutive_failures = 0
+                    print(
+                        "[arm] BNO055 reads failing — reinitializing I2C...",
+                        flush=True,
+                    )
+                    _try_init_bno_once()
+            else:
+                _imu_snap_angle = None
+                _imu_snap_stale = False
+            time.sleep(IMU_MIN_READ_INTERVAL_SEC)
+
+    threading.Thread(target=_loop, daemon=True, name="arm-imu").start()
+
+
 def _read_j6_angle_deg_raw():
     """Single BNO055 gravity read. None on error; does not touch the IMU cache."""
     raw = _read_j6_grav_deg()
@@ -287,9 +329,10 @@ def _read_j6_angle_deg_raw():
 
 
 def _poll_imu_cache(force=False):
-    """Rate-limited BNO055 read; one I2C transaction per control loop."""
+    """BNO055 read; normally called from the dedicated arm-imu thread."""
     global _last_imu_angle_deg, _last_imu_read_time
     global _imu_snap_angle, _imu_snap_stale, _imu_last_poll_time
+    global _imu_consecutive_failures
 
     if not HAVE_BNO:
         _imu_snap_angle = None
@@ -316,7 +359,10 @@ def _poll_imu_cache(force=False):
         _last_imu_read_time = now
         _imu_snap_angle = angle
         _imu_snap_stale = False
+        _imu_consecutive_failures = 0
         return
+
+    _imu_consecutive_failures += 1
 
     if _last_imu_angle_deg is not None and (now - _last_imu_read_time) <= IMU_READ_STALE_SEC:
         _imu_snap_angle = _last_imu_angle_deg
@@ -325,6 +371,12 @@ def _poll_imu_cache(force=False):
 
     _imu_snap_angle = None
     _imu_snap_stale = True
+
+
+def _imu_read_age_sec() -> float | None:
+    if _last_imu_read_time <= 0.0:
+        return None
+    return round(time.time() - _last_imu_read_time, 3)
 
 
 def _cached_j6_angle_deg():
@@ -466,6 +518,8 @@ _last_imu_read_time = 0.0
 _imu_snap_angle = None
 _imu_snap_stale = False
 _imu_last_poll_time = 0.0
+_imu_consecutive_failures = 0
+_bno_lock = threading.Lock()
 
 
 # ── MOSFET control ────────────────────────────────────────────────────────────
@@ -506,6 +560,7 @@ def _send_arm_telemetry(j6_pwm_out: int) -> None:
         "arm_bno_ready": HAVE_BNO,
         "arm_imu_ok": bool(HAVE_BNO and imu_angle is not None),
         "arm_imu_stale": bool(imu_stale),
+        "arm_imu_read_age_sec": _imu_read_age_sec(),
         "arm_imu_angle_deg": round(imu_angle, 2) if imu_angle is not None else None,
         "arm_j6_target_deg": round(j6_target, 2),
         "arm_j6_pwm_out": int(j6_pwm_out),
@@ -737,6 +792,7 @@ def _arm_control_listener():
                 port = int(cmd.get("port", ARM_TELEM_PORT))
                 _note_telemetry_subscriber(addr[0], port)
                 print(f"[arm] Arm telemetry → {addr[0]}:{port}", flush=True)
+                _send_arm_telemetry(J6_OUT_CENTER)
             elif cmd.get("cmd") == "claw_hold":
                 _apply_claw_hold_cmd(cmd)
                 _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
@@ -972,6 +1028,7 @@ def main():
     threading.Thread(
         target=_init_optional_hardware, daemon=True, name="arm-hw-init",
     ).start()
+    _start_imu_poll_thread()
 
     # Bind UDP first so arm_sender / UI can reach us while MAVLink connects.
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1008,7 +1065,6 @@ def main():
     try:
         while True:
             now = time.time()
-            _poll_imu_cache()
             _maybe_clear_stale_preset_motion(now)
 
             master = _get_mavlink_master()

@@ -1513,6 +1513,8 @@ def _update_arm_telemetry_from_json(pkt: dict):
         tel["arm_imu_sign"] = float(pkt["arm_imu_sign"])
     if pkt.get("arm_claw_stop_us") is not None:
         tel["arm_claw_stop_us"] = int(pkt["arm_claw_stop_us"])
+    if pkt.get("arm_imu_read_age_sec") is not None:
+        tel["arm_imu_read_age_sec"] = float(pkt["arm_imu_read_age_sec"])
     STATE["last_arm_telemetry_time"] = time.time()
     socketio.emit("telemetry", _telemetry_emit_payload())
 
@@ -2505,6 +2507,19 @@ def api_arm_diagnostic():
                 "Waiting for arm telemetry from Pi"
                 if arm_tel_stale
                 else f"rx={rx if rx is not None else '?'} — plug in arm USB if 0"
+            ),
+        },
+        {
+            "name": "Arm BNO055 read fresh",
+            "ok": not arm_tel_stale and bool(tel.get("arm_imu_ok")) and not bool(tel.get("arm_imu_stale")),
+            "detail": (
+                f"IMU read age {tel.get('arm_imu_read_age_sec')}s — check BNO055 wiring/I2C"
+                if tel.get("arm_imu_stale")
+                else (
+                    "Waiting for BNO055"
+                    if not tel.get("arm_imu_ok")
+                    else "OK"
+                )
             ),
         },
         {
