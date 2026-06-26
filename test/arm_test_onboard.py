@@ -18,9 +18,16 @@ Setup in Mission Planner first:
     SERVO15_FUNCTION = 65   (RCPassThru15 → Claw / AUX7 / M15)
     BRD_SAFETYENABLE = 0
 
-Start MAVProxy first, then run this script:
+Start MAVProxy first (arm test uses tcp:127.0.0.1:5763), then run:
     python3 test/arm_test_onboard.py
+
+Joint PWM limits (M9/M11/M13/M15):
+    J1 / M13         500–2350 µs, neutral 1400
+    J2 / M9          950–2200 µs, neutral 1600
+    J3 / M11 (cont)  1300–1700 µs, stop 1500
+    Claw / M15 (cont) open 1325, close 1525, stop 1425
 """
+from __future__ import annotations
 
 import json
 import socket
@@ -56,12 +63,14 @@ JOINT_NAMES = {
 }
 
 JOINT_TO_AUX = {1: 5, 2: 1, 3: 3, 4: 7}
+JOINT_TO_MOTOR = {1: 13, 2: 9, 3: 11, 4: 15}
+JOINT_CONTINUOUS = {3, 4}
 
 JOINT_LIMITS = {
-    1: (500, 2350, 1400),
-    2: (950, 2200, 1600),
-    3: (1300, 1700, 1500),
-    4: (CLAW_MIN_US, CLAW_MAX_US, CLAW_CENTER_US),
+    1: (500, 2350, 1400),   # M13 — positional, neutral 1400
+    2: (950, 2200, 1600),   # M9  — positional, neutral 1600
+    3: (1300, 1700, 1500),  # M11 — continuous, stop 1500
+    4: (CLAW_MIN_US, CLAW_MAX_US, CLAW_CENTER_US),  # M15 — open/close/stop
 }
 
 IGNORE = 65535
@@ -226,7 +235,7 @@ def main():
             elif rc_matches and not srv_matches:
                 print("[DIAG] *** RC input changed but SERVO output did NOT —")
                 print("[DIAG]     Most likely fixes:")
-                print("[DIAG]       1. Set SERVO9-16_FUNCTION = 1 (RCPassThru) in Mission Planner")
+                print("[DIAG]       1. Set SERVO9/11/13/15_FUNCTION = 59/61/63/65 in Mission Planner")
                 print("[DIAG]       2. Set BRD_SAFETYENABLE = 0 in Mission Planner")
             elif rc_matches and srv_matches:
                 print("[DIAG] RC input AND servo output both match — FC side is OK.")
@@ -262,7 +271,8 @@ def main():
                         name  = JOINT_NAMES.get(joint, "?")
                         aux   = JOINT_TO_AUX[joint]
                         rc_ch = joint_to_rc_ch(joint)
-                        print(f"[arm-onboard] {name} (AUX{aux}) → ch{rc_ch}  {us} µs")
+                        motor = JOINT_TO_MOTOR[joint]
+                        print(f"[arm-onboard] {name}/M{motor} (AUX{aux}) → ch{rc_ch}  {us} µs")
                     else:
                         print(f"[arm-onboard] Ignored joint {joint} — valid range 1-{NUM_JOINTS}")
 
