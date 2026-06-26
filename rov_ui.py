@@ -164,6 +164,7 @@ DEFAULT_CONFIG = {
     "arm_imu_sign":        -1.0,
     "arm_imu_zero_offset": -154.0,
     "arm_claw_stop_us":    1515,
+    "claw_hold":           False,
     "colmap_command":      "python3 colmap_run.py",
     "crabs_command":       "python3 crabs.py",
     "mavproxy_bin":        "/home/uruc/mav_env/bin/mavproxy.py",
@@ -628,7 +629,7 @@ STATE = {
     "preset_active_name":    "",
     "manual_pwm_enabled":    False,
     "manual_aux_pwm":        list(_manual_aux_defaults()),
-    "claw_hold":             True,
+    "claw_hold":             bool(config.get("claw_hold", False)),
     "telemetry": {
         "rx_state":                "NO_TELEMETRY",
         "gain_percent":            100,
@@ -665,7 +666,7 @@ STATE = {
         "arm_imu_angle_deg":       None,
         "arm_j6_target_deg":       None,
         "arm_j6_pwm_out":          None,
-        "arm_claw_hold_request":   True,
+        "arm_claw_hold_request":   False,
         "arm_claw_hold_active":    False,
         "arm_j6_manual":           True,
     },
@@ -876,15 +877,7 @@ class SSHManager:
     def send_mosfet(self, state: bool):
         if not _mosfet_enabled():
             return True, "MOSFET disabled (hardware not installed)"
-        payload = json.dumps({"cmd": "mosfet", "state": state}).encode()
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(1.0)
-            s.sendto(payload, (config["pi_ip"], config["mosfet_control_port"]))
-            s.close()
-            return True, "sent"
-        except Exception as e:
-            return False, str(e)
+        return _send_pi_arm_control({"cmd": "mosfet", "state": bool(state)})
 
     def _start_mavproxy_fresh(self):
         """Kill any existing MAVProxy and launch a fresh bridge."""
@@ -1490,7 +1483,7 @@ def _update_arm_telemetry_from_json(pkt: dict):
     tel["arm_imu_angle_deg"] = pkt.get("arm_imu_angle_deg")
     tel["arm_j6_target_deg"] = pkt.get("arm_j6_target_deg")
     tel["arm_j6_pwm_out"]    = pkt.get("arm_j6_pwm_out")
-    tel["arm_claw_hold_request"] = bool(pkt.get("arm_claw_hold_request", tel.get("arm_claw_hold_request", True)))
+    tel["arm_claw_hold_request"] = bool(pkt.get("arm_claw_hold_request", tel.get("arm_claw_hold_request", False)))
     tel["arm_claw_hold_active"]  = bool(pkt.get("arm_claw_hold_active", False))
     tel["arm_j6_manual"]         = bool(pkt.get("arm_j6_manual", True))
     if pkt.get("arm_enabled") is not None:
@@ -1523,7 +1516,7 @@ def _sync_arm_claw_hold():
     """Push claw-hold flag to new_ar.py (J6 IMU auto-level)."""
     _send_pi_arm_control({
         "cmd": "claw_hold",
-        "enabled": bool(STATE.get("claw_hold", True)),
+        "enabled": bool(STATE.get("claw_hold", False)),
     })
 
 
@@ -1834,7 +1827,7 @@ def emit_status():
         "preset_active_name":    STATE.get("preset_active_name", ""),
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
         "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(_manual_aux_defaults())),
-        "claw_hold":             STATE.get("claw_hold", True),
+        "claw_hold":             STATE.get("claw_hold", False),
         "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", 1515)),
         "arm_motion_enabled":    _robot_armed(),
         "arm_pi_enabled":        STATE.get("telemetry", {}).get("arm_enabled"),
@@ -2646,7 +2639,7 @@ def api_claw_hold():
     if request.method == "GET":
         return jsonify({
             "ok": True,
-            "enabled": bool(STATE.get("claw_hold", True)),
+            "enabled": bool(STATE.get("claw_hold", False)),
         })
 
     if not _robot_armed():
@@ -2656,8 +2649,10 @@ def api_claw_hold():
         }), 403
 
     data = request.get_json(force=True) or {}
-    enabled = bool(data.get("enabled", True))
+    enabled = bool(data.get("enabled", False))
     STATE["claw_hold"] = enabled
+    config["claw_hold"] = enabled
+    save_config_file()
     ok, msg = _send_pi_arm_control({"cmd": "claw_hold", "enabled": enabled})
     emit_status()
     return jsonify({"ok": ok, "msg": msg, "enabled": enabled})
@@ -3032,7 +3027,7 @@ def api_status():
         "preset_active_name":    STATE.get("preset_active_name", ""),
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
         "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(_manual_aux_defaults())),
-        "claw_hold":             STATE.get("claw_hold", True),
+        "claw_hold":             STATE.get("claw_hold", False),
         "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", 1515)),
         "arm_motion_enabled":    _robot_armed(),
         "arm_pi_enabled":        STATE.get("telemetry", {}).get("arm_enabled"),

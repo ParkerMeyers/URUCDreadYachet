@@ -89,7 +89,8 @@ CLAW_JOINT_IDX = 6
 SPARE_RC_CH   = 16   # AUX8 — always CENTER_US
 
 # J6 continuous rotation (center 1500 µs)
-J6_IN_DEADBAND  = 10      # ±µs from 1500 that counts as "centered"
+J6_IN_DEADBAND      = 10    # ±µs from 1500 — stick centered for IMU hold (hold ON)
+J6_MANUAL_DEADBAND  = 50    # ±µs from 1500 — snap to stop when rotation hold is OFF
 J6_OUT_MIN      = 1350
 J6_OUT_CENTER   = 1500
 J6_OUT_MAX      = 1650
@@ -384,47 +385,48 @@ def _cached_j6_angle_deg():
     return _imu_snap_angle, _imu_snap_stale
 
 
-def _compute_j6_pwm(j6_input_us, j6_target_angle_deg):
+def _j6_stick_centered(j6_input_us: int) -> bool:
+    return abs(int(j6_input_us) - CENTER_US) <= J6_IN_DEADBAND
+
+
+def _compute_j6_pwm(j6_input_us, j6_target_angle_deg, claw_hold_enabled: bool):
     """
     Compute J6 continuous-rotation servo PWM.
-    Stick outside deadband → direct manual mapping.
-    Stick centered + claw hold ON + BNO055 available → auto-level to target angle.
-    Stick centered + manual mode (hold OFF or IMU unavailable) → hold stop PWM.
+
+    Rotation hold OFF → never run IMU; snap to stop PWM inside manual deadband.
+    Rotation hold ON  → stick deflection passthrough; centered stick → IMU hold.
     """
-    if j6_input_us > CENTER_US + J6_IN_DEADBAND:
-        scale = (j6_input_us - (CENTER_US + J6_IN_DEADBAND)) / \
-                (MAX_US - (CENTER_US + J6_IN_DEADBAND))
-        return int(round(_clamp(
-            J6_OUT_CENTER + scale * (J6_OUT_MAX - J6_OUT_CENTER),
-            J6_OUT_CENTER, J6_OUT_MAX
-        )))
+    us = _clamp_us(j6_input_us)
 
-    if j6_input_us < CENTER_US - J6_IN_DEADBAND:
-        scale = ((CENTER_US - J6_IN_DEADBAND) - j6_input_us) / \
-                ((CENTER_US - J6_IN_DEADBAND) - MIN_US)
-        return int(round(_clamp(
-            J6_OUT_CENTER - scale * (J6_OUT_CENTER - J6_OUT_MIN),
-            J6_OUT_MIN, J6_OUT_CENTER
-        )))
+    # Hold OFF — manual only; tolerate RC noise near center (matches arm test stop).
+    if not claw_hold_enabled:
+        if abs(us - CENTER_US) <= J6_MANUAL_DEADBAND:
+            return J6_OUT_CENTER
+        return us
 
-    # Stick centered — IMU auto-level only when claw hold is ON and BNO is healthy
-    if not _j6_manual_mode():
-        angle, _stale = _cached_j6_angle_deg()
-        if angle is not None:
-            err = angle + j6_target_angle_deg
-            if abs(err) < J6_DEADBAND_DEG:
-                return J6_OUT_CENTER
-            return int(round(_clamp(J6_OUT_CENTER + J6_KP * err, J6_OUT_MIN, J6_OUT_MAX)))
+    # Hold ON — operator stick overrides IMU for manual wrist trim.
+    if not _j6_stick_centered(us):
+        return us
+
+    # Hold ON + centered stick → IMU rotation hold to target angle.
+    angle, stale = _cached_j6_angle_deg()
+    if angle is not None and not stale:
+        err = _wrap_deg180(angle + j6_target_angle_deg)
+        if abs(err) < J6_DEADBAND_DEG:
+            return J6_OUT_CENTER
+        return int(round(_clamp(
+            J6_OUT_CENTER + J6_KP * err, J6_OUT_MIN, J6_OUT_MAX
+        )))
 
     return J6_OUT_CENTER
 
 
 def _imu_available_for_autolevel() -> bool:
-    """True when BNO055 is present and returning a usable angle."""
+    """True when BNO055 is present and returning a fresh angle."""
     if not HAVE_BNO:
         return False
-    angle, _stale = _cached_j6_angle_deg()
-    return angle is not None
+    angle, stale = _cached_j6_angle_deg()
+    return angle is not None and not stale
 
 
 def _j6_manual_mode(claw_hold_snap=None) -> bool:
@@ -500,7 +502,7 @@ _rx_count      = 0
 _mosfet_on     = False
 _manual_mode   = False
 _manual_aux_pwm = _default_manual_aux_pwm()
-_claw_hold_enabled = True
+_claw_hold_enabled = False
 _arm_enabled       = True   # topside sends arm_enable=false when DISARMED
 _mavlink_up        = False
 _mav_master        = None
@@ -538,7 +540,11 @@ def _note_telemetry_subscriber(host: str, port: int) -> None:
 
 
 def _send_arm_telemetry(j6_pwm_out: int) -> None:
-    """Push arm BNO055 gripper angle to subscribed topside UI clients."""
+    """Push arm BNO055 gripper angle to subscribed topside UI clients.
+
+    IMU readout is always included when the BNO055 is reading — independent of
+    rotation/claw hold (hold only affects J6 PWM in _compute_j6_pwm).
+    """
     imu_angle, imu_stale = _cached_j6_angle_deg()
     with _lock:
         j6_target = _j6_target_deg
@@ -618,9 +624,11 @@ def _apply_arm_enable_cmd(cmd: dict) -> None:
 
 
 def _apply_claw_hold_cmd(cmd: dict) -> None:
-    """Enable/disable J6 IMU auto-level (claw hold)."""
+    """Enable/disable J6 IMU auto-level (rotation / claw hold)."""
     global _claw_hold_enabled
-    enabled = bool(cmd.get("enabled", True))
+    if "enabled" not in cmd:
+        return
+    enabled = bool(cmd["enabled"])
     with _lock:
         _claw_hold_enabled = enabled
     mode = "MANUAL" if _j6_manual_mode(enabled) else "IMU HOLD"
@@ -848,9 +856,10 @@ def _build_rc_array():
 
     rc = [IGNORE] * 18
     with _lock:
-        joint_us_snap  = list(_joint_us)
-        j6_target_snap = _j6_target_deg
-        last_pkt_snap  = _last_pkt_time
+        joint_us_snap   = list(_joint_us)
+        j6_target_snap  = _j6_target_deg
+        last_pkt_snap   = _last_pkt_time
+        claw_hold_snap  = _claw_hold_enabled
 
     if _should_hold_neutral(last_pkt_snap):
         # Safety: stop all joints at neutral PWM (no BNO auto-level before arm_sender)
@@ -865,9 +874,9 @@ def _build_rc_array():
         else:
             rc[rc_ch - 1] = _clamp_us(joint_us_snap[joint_idx])
 
-    # J6 continuous rotation (index 5 = J6_manual input)
+    # J6 continuous rotation (index 5 = J6 stick input from arm_sender)
     rc[J6_RC_CH - 1] = _compute_j6_pwm(
-        _clamp_us(joint_us_snap[5]), j6_target_snap
+        _clamp_us(joint_us_snap[5]), j6_target_snap, claw_hold_snap
     )
 
     rc[SPARE_RC_CH - 1] = CENTER_US
@@ -1164,7 +1173,11 @@ def main():
                         claw_hold = _claw_hold_enabled
                         armed = _arm_enabled
                     j6_manual = _j6_manual_mode(claw_hold) if not hold_neutral else True
-                    j6_pwm = J6_OUT_CENTER if hold_neutral else _compute_j6_pwm(_clamp_us(jus[5]), j6t)
+                    j6_pwm = (
+                        J6_OUT_CENTER
+                        if hold_neutral
+                        else _compute_j6_pwm(_clamp_us(jus[5]), j6t, claw_hold)
+                    )
                     print(
                         f"[arm] rx={rx} armed={armed} mav={'OK' if _mavlink_up else 'DOWN'} "
                         f"hold={hold_neutral} claw={claw_hold} "

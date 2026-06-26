@@ -1096,8 +1096,7 @@ function drawArmTelemetryPanel(ctx, W, H, t) {
   const x = W - 10 * scale;
   let y = 18 * scale;
   const lineH = 17 * scale;
-  const armPktFresh = t.arm_telemetry_age_sec == null || t.arm_telemetry_age_sec <= 5.0;
-  const armHasAngle = t.arm_imu_ok && t.arm_imu_angle_deg != null && armPktFresh;
+  const armHasAngle = armImuHasAngle(t);
 
   ctx.save();
   ctx.textBaseline = 'alphabetic';
@@ -1107,17 +1106,8 @@ function drawArmTelemetryPanel(ctx, W, H, t) {
   drawTelemetryLine(ctx, x, y, 'TGT   ', t.arm_j6_target_deg != null ? fmtNum(t.arm_j6_target_deg, 1, '°') : '--',
     'rgba(220,230,255,0.85)', base, base);
   y += lineH;
-  let imuText = 'NO DATA';
-  let imuColor = 'rgba(255,179,32,0.95)';
-  if (armHasAngle && t.arm_imu_stale) {
-    imuText = 'STALE';
-  } else if (armHasAngle) {
-    imuText = t.arm_j6_manual ? 'MAN' : 'HOLD';
-    imuColor = t.arm_j6_manual ? 'rgba(255,179,32,0.95)' : 'rgba(0,224,138,0.95)';
-  } else if (t.arm_bno_ready && !armPktFresh) {
-    imuText = 'LINK';
-  }
-  drawTelemetryLine(ctx, x, y, 'IMU   ', imuText, imuColor, base, base);
+  const imuStatus = armImuStatusText(t);
+  drawTelemetryLine(ctx, x, y, 'IMU   ', imuStatus.text, imuStatus.color, base, base);
   ctx.restore();
 }
 
@@ -1463,6 +1453,33 @@ function stopMissionPoll() {
 // ─────────────────────────────────────────────────────────────
 // CONTROL FLAG TOGGLES (clickable from control bar + S/D/Y keys)
 // ─────────────────────────────────────────────────────────────
+const ARM_IMU_STALE_SEC = 5.0;
+
+function armImuPacketFresh(t) {
+  return !!(t && (t.arm_telemetry_age_sec == null || t.arm_telemetry_age_sec <= ARM_IMU_STALE_SEC));
+}
+
+function armImuHasAngle(t) {
+  return !!(t && t.arm_imu_ok && t.arm_imu_angle_deg != null && armImuPacketFresh(t));
+}
+
+function armImuStatusText(t) {
+  if (!t) return { text: 'NO DATA', color: 'rgba(255,179,32,0.95)', className: 'val-warn' };
+  if (armImuHasAngle(t)) {
+    if (t.arm_imu_stale) {
+      return { text: 'STALE', color: 'rgba(255,179,32,0.95)', className: 'val-warn' };
+    }
+    if (t.arm_claw_hold_active) {
+      return { text: 'HOLD', color: 'rgba(0,224,138,0.95)', className: 'val-hi' };
+    }
+    return { text: 'LIVE', color: 'rgba(0,224,138,0.95)', className: 'val-hi' };
+  }
+  if (t.arm_bno_ready && !armImuPacketFresh(t)) {
+    return { text: 'LINK', color: 'rgba(255,179,32,0.95)', className: 'val-warn' };
+  }
+  return { text: 'NO DATA', color: 'rgba(255,179,32,0.95)', className: 'val-warn' };
+}
+
 function armImuAvailable(t) {
   if (!t) return false;
   if (t.arm_imu_ok && t.arm_imu_angle_deg != null) {
@@ -1478,8 +1495,9 @@ function toggleClawHold() {
     toast('Claw hold disabled while DISARMED', 'warn');
     return;
   }
-  if (!armImuAvailable(_tel)) {
-    toast('Arm IMU not available — J6 is in manual mode', 'warn');
+  const turningOn = !_ctrlState.claw_hold;
+  if (turningOn && !armImuAvailable(_tel)) {
+    toast('Arm IMU not available — cannot enable rotation hold', 'warn');
     return;
   }
   _ctrlState.claw_hold = !_ctrlState.claw_hold;
@@ -1591,7 +1609,7 @@ function updateFlagUI() {
   const yawBtn   = document.getElementById('flag-yaw');
   const clawBtn  = document.getElementById('flag-claw');
   const imuOk    = armImuAvailable(_tel);
-  const j6Manual = _tel.arm_j6_manual !== false && (!_ctrlState.claw_hold || !imuOk);
+  const holdActive = !!_tel.arm_claw_hold_active;
 
   if (stabBtn) {
     stabBtn.textContent = `STAB: ${_ctrlState.stabilize ? 'ON' : 'OFF'}`;
@@ -1611,15 +1629,15 @@ function updateFlagUI() {
       clawBtn.className = 'ctrl-flag disabled';
       clawBtn.title = 'Arm disabled while DISARMED';
     } else if (!imuOk) {
-      clawBtn.textContent = 'CLAW: MAN';
+      clawBtn.textContent = 'CLAW: N/A';
       clawBtn.className = 'ctrl-flag disabled';
-      clawBtn.title = 'Arm IMU offline — wrist (J6) manual control';
+      clawBtn.title = 'Arm IMU offline — rotation hold unavailable (readout may still show when linked)';
     } else {
       clawBtn.textContent = `CLAW: ${_ctrlState.claw_hold ? 'ON' : 'OFF'}`;
       clawBtn.className = 'ctrl-flag' + (_ctrlState.claw_hold ? ' active-claw' : '');
-      clawBtn.title = j6Manual
-        ? 'J6 manual — centered stick stops rotation'
-        : 'J6 IMU hold — auto-levels gripper to target angle';
+      clawBtn.title = holdActive
+        ? 'Rotation hold ON — IMU holds wrist when stick centered'
+        : 'Rotation hold OFF — IMU readout only; J6 stick control';
     }
   }
 }
@@ -1878,25 +1896,14 @@ function updateTelemetry() {
   }
 
   // Arm camera IMU overlay readouts
-  const armPktFresh = t.arm_telemetry_age_sec == null || t.arm_telemetry_age_sec <= 5.0;
-  const armHasAngle = t.arm_imu_ok && t.arm_imu_angle_deg != null && armPktFresh;
+  const armHasAngle = armImuHasAngle(t);
   setText('cam-arm-angle', armHasAngle ? fmtNum(t.arm_imu_angle_deg, 1) : '--');
   setText('cam-arm-target', t.arm_j6_target_deg != null ? fmtNum(t.arm_j6_target_deg, 1) : '--');
   const imuEl = document.getElementById('cam-arm-imu');
   if (imuEl) {
-    if (armHasAngle && t.arm_imu_stale) {
-      imuEl.textContent = 'STALE';
-      imuEl.className = 'val-warn';
-    } else if (armHasAngle) {
-      imuEl.textContent = t.arm_j6_manual ? 'MAN' : 'HOLD';
-      imuEl.className = t.arm_j6_manual ? 'val-warn' : 'val-hi';
-    } else if (t.arm_bno_ready && !armPktFresh) {
-      imuEl.textContent = 'LINK';
-      imuEl.className = 'val-warn';
-    } else {
-      imuEl.textContent = 'NO DATA';
-      imuEl.className = 'val-warn';
-    }
+    const imuStatus = armImuStatusText(t);
+    imuEl.textContent = imuStatus.text;
+    imuEl.className = imuStatus.className;
   }
 
   updateFlagUI();
@@ -1984,7 +1991,7 @@ let _ctrlState = {
   stabilize:    false,
   depth_hold:   false,
   yaw_hold:     false,
-  claw_hold:    true,
+  claw_hold:    false,
   gain_percent: CTRL_CFG.GAIN_DEFAULT,
   seq:          0,
 };
@@ -2572,8 +2579,6 @@ function drawHUD(canvasId, t) {
   ctx.fillStyle = modeColors[mode] || 'rgba(200,200,200,0.6)';
   ctx.fillText(modeLabels[mode] || mode.toUpperCase(), W * 0.5, H - 42);
 }
-
-const ARM_IMU_STALE_SEC = 5.0;
 
 function armImuLive(t) {
   if (!t || !t.arm_imu_ok || t.arm_imu_angle_deg == null) return false;

@@ -1,5 +1,6 @@
 {
   "arm_camera_url": "http://192.168.69.100:8160",
+  "arm_claw_stop_us": 1515,
   "arm_imu_sign": -1.0,
   "arm_imu_zero_offset": -154.0,
   "arm_presets": {
@@ -32,10 +33,9 @@
   },
   "arm_telemetry_port": 5008,
   "arm_udp_port": "5006",
-  "battery_crit_v": "11.0",
-  "battery_warn_v": "12.0",
   "camera0_device": "/dev/video0",
   "camera1_device": "/dev/video2",
+  "claw_hold": false,
   "colmap_command": "python3 colmap_run.py",
   "crabs_command": "python3 crabs.py",
   "forward_camera_url": "http://192.168.69.100:8161",
@@ -46,6 +46,7 @@
   "mavproxy_out3": "tcpin:127.0.0.1:5763",
   "mavproxy_serial": "/dev/ttyACM0",
   "mosfet_control_port": "5007",
+  "mosfet_enabled": true,
   "pi_ip": "192.168.69.100",
   "pi_password": "yahboom",
   "pi_rov_path": "/home/uruc/URUCDreadYachet",
