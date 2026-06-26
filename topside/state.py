@@ -81,6 +81,8 @@ STATE: dict = {
         "depth_recapture_pending": False, "yaw_recapture_pending": False,
         "arm_hold_neutral": None, "arm_rx_count": None, "arm_enabled": None,
         "arm_mavlink_ok": None, "arm_joint_us": None, "arm_joints": None,
+        "arm_encoder1_status": None, "arm_encoder2_status": None,
+        "arm_imu_status": None, "arm_imu_angle_deg": None, "arm_grip_on": None,
         "arm_manual_mode": None, "arm_preset_motion": None,
     },
     "logs": {

@@ -298,12 +298,6 @@ function updateArmControlsUI() {
     manualBtn.disabled = !armed || _presetRunning;
     manualBtn.classList.toggle('disabled', !armed || _presetRunning);
   }
-  const armJogBtn = document.getElementById('btn-arm-jog');
-  if (armJogBtn) {
-    const jogOk = isRobotArmed() && !!_status.onboard_arm;
-    armJogBtn.disabled = !jogOk;
-    armJogBtn.classList.toggle('disabled', !jogOk);
-  }
 }
 
 function handlePresetProgress(data) {
@@ -1521,37 +1515,6 @@ function calibrateIMU() {
   toast('IMU zero sent — current pitch/roll set as targets', 'ok');
 }
 
-async function armJogTest() {
-  if (!isRobotArmed()) {
-    toast('Switch to DRIVE/ARMED first', 'warn');
-    return;
-  }
-  const r = await fetch('/api/arm_jog', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ joint: 2, pwm: 1650, hold_sec: 1.2 }),
-  });
-  const d = await r.json();
-  toast(d.ok ? d.msg : (d.msg || 'Arm jog failed'), d.ok ? 'ok' : 'err');
-}
-
-async function armDiagnostic() {
-  const r = await fetch('/api/arm_diagnostic');
-  const d = await r.json();
-  if (!d.ok) {
-    toast('Arm diagnostic failed', 'err');
-    return;
-  }
-  const failed = (d.checks || []).filter(c => !c.ok);
-  if (!failed.length) {
-    toast('Arm pipeline OK — all checks passed', 'ok');
-    return;
-  }
-  const lines = failed.map(c => `${c.name}: ${c.detail}`).join('\n');
-  toast(`Arm issues (${failed.length}):\n${lines}`, 'warn');
-  if (d.hint) toast(d.hint, '');
-}
-
 function updateFlagUI() {
   const stabBtn  = document.getElementById('flag-stab');
   const depthBtn = document.getElementById('flag-depth');
@@ -1608,6 +1571,39 @@ function updateArmPipelineTelemetry(t) {
       armMav.title = mismatch
         ? 'MAVLink OK — servo output mismatch (check RCPassThru / BRD_SAFETYENABLE)'
         : 'MAVLink OK — FC servo output matches commands';
+    }
+  }
+
+  const armEnc = document.getElementById('tel-arm-enc');
+  if (armEnc) {
+    const e1 = t.arm_encoder1_status;
+    const e2 = t.arm_encoder2_status;
+    if (e1 == null && e2 == null) {
+      armEnc.textContent = '--';
+      armEnc.className = 'tc-val';
+      armEnc.title = 'Encoder status from arm USB controller';
+    } else {
+      armEnc.textContent = `E1:${e1 ?? '--'} E2:${e2 ?? '--'}`;
+      armEnc.className = 'tc-val';
+      armEnc.title = 'ENCODER1_STATUS / ENCODER2_STATUS (arm controller)';
+    }
+  }
+
+  const armImu = document.getElementById('tel-arm-imu');
+  if (armImu) {
+    const st = t.arm_imu_status;
+    const ang = t.arm_imu_angle_deg;
+    if (st == null && ang == null) {
+      armImu.textContent = '--';
+      armImu.className = 'tc-val';
+      armImu.title = 'Arm IMU status from USB controller';
+    } else {
+      const angStr = ang != null && !Number.isNaN(Number(ang)) ? `${Number(ang).toFixed(1)}°` : '--';
+      armImu.textContent = `${st ?? '--'} ${angStr}`;
+      const stLower = String(st || '').toLowerCase();
+      const ok = !st || stLower === 'ok' || stLower === '1' || stLower === 'good';
+      armImu.className = 'tc-val ' + (ok ? 'good' : 'warn');
+      armImu.title = 'IMU_STATUS / IMU_ANGLE from arm controller';
     }
   }
 }
@@ -2594,7 +2590,9 @@ function stopCamera(camNum) {
   st.active = false;
   if (st.retryT) { clearTimeout(st.retryT); st.retryT = null; }
   if (st.watchdogT) { clearTimeout(st.watchdogT); st.watchdogT = null; }
+  if (st.noSigT) { clearTimeout(st.noSigT); st.noSigT = null; }
   if (st.framePoll) { clearInterval(st.framePoll); st.framePoll = null; }
+  if (st.snapUrl) { URL.revokeObjectURL(st.snapUrl); st.snapUrl = null; }
   if (st.img) {
     st.img.onload = null;
     st.img.onerror = null;
@@ -2621,6 +2619,8 @@ function setupCamera(imgId, noSigId, camNum) {
     retryT: null,
     watchdogT: null,
     framePoll: null,
+    noSigT: null,
+    snapUrl: null,
     failCount: 0,
     active: true,
     lastLoad: 0,
@@ -2630,6 +2630,19 @@ function setupCamera(imgId, noSigId, camNum) {
   };
   _cameraState[camNum] = st;
 
+  function camLabel() {
+    const camNames = { 1: 'Forward Camera', 2: 'Arm Camera' };
+    return camNames[camNum] || `Cam ${camNum}`;
+  }
+
+  function showConnecting() {
+    if (hasFrame()) return;
+    noSig.style.display = 'flex';
+    img.style.display = 'none';
+    const nsText = noSig.querySelector('.ns-text');
+    if (nsText) nsText.textContent = `Connecting — ${camLabel()}…`;
+  }
+
   function showNoSignal(force) {
     // Keep the last good frame visible during brief proxy/USB hiccups.
     if (!force && st.lastFrameAt && Date.now() - st.lastFrameAt < 6000) return;
@@ -2638,10 +2651,19 @@ function setupCamera(imgId, noSigId, camNum) {
     const nsText = noSig.querySelector('.ns-text');
     if (nsText) {
       const upstream = cameraDirectUrl(camNum) || 'not configured';
-      const camNames = { 1: 'Forward Camera', 2: 'Arm Camera' };
-      const camLabel = camNames[camNum] || `Cam ${camNum}`;
-      nsText.textContent = `No Signal — ${camLabel} (upstream ${upstream})`;
+      nsText.textContent = `No Signal — ${camLabel()} (upstream ${upstream})`;
     }
+  }
+
+  function scheduleNoSignal(force) {
+    if (st.noSigT) clearTimeout(st.noSigT);
+    if (hasFrame()) return;
+    const delay = force ? 0 : 4000;
+    st.noSigT = setTimeout(() => {
+      st.noSigT = null;
+      if (!st.active || hasFrame()) return;
+      showNoSignal(force);
+    }, delay);
   }
 
   function hasFrame() {
@@ -2652,8 +2674,10 @@ function setupCamera(imgId, noSigId, camNum) {
     if (!st.active) return;
     st.failCount = 0;
     st.lastFrameAt = Date.now();
+    if (st.noSigT) { clearTimeout(st.noSigT); st.noSigT = null; }
     noSig.style.display = 'none';
     img.style.display = 'block';
+    if (camNum === 1) _maybeStartCam2();
   }
 
   function armWatchdog() {
@@ -2712,8 +2736,28 @@ function setupCamera(imgId, noSigId, camNum) {
       scheduleRetry();
       return;
     }
-    showNoSignal(true);
+    scheduleNoSignal(true);
     scheduleRetry();
+  }
+
+  function prefetchSnapshot() {
+    fetch(`/camera/${camNum}/snapshot?t=${Date.now()}`)
+      .then(r => (r.ok ? r.blob() : null))
+      .then(blob => {
+        if (!st.active || !blob || hasFrame()) return;
+        if (st.snapUrl) URL.revokeObjectURL(st.snapUrl);
+        st.snapUrl = URL.createObjectURL(blob);
+        img.onload = () => {
+          if (st.snapUrl) {
+            URL.revokeObjectURL(st.snapUrl);
+            st.snapUrl = null;
+          }
+          onSuccess();
+        };
+        img.onerror = null;
+        img.src = st.snapUrl;
+      })
+      .catch(() => {});
   }
 
   function loadStream(forceReconnect) {
@@ -2722,7 +2766,11 @@ function setupCamera(imgId, noSigId, camNum) {
     if (!control || !control.classList.contains('active')) return;
 
     st.lastLoad = Date.now();
-    if (!hasFrame()) showNoSignal(true);
+    if (!hasFrame()) {
+      showConnecting();
+      scheduleNoSignal(false);
+      prefetchSnapshot();
+    }
 
     if (forceReconnect) {
       img.onload = null;
@@ -2742,6 +2790,9 @@ function setupCamera(imgId, noSigId, camNum) {
 
     if (forceReconnect && img.src) {
       requestAnimationFrame(attach);
+    } else if (!hasFrame() && !forceReconnect) {
+      // Let snapshot prefetch show a still while the MJPEG proxy handshakes.
+      setTimeout(attach, 400);
     } else {
       attach();
     }
@@ -2750,11 +2801,25 @@ function setupCamera(imgId, noSigId, camNum) {
   loadStream(false);
 }
 
+let _cam2StartT = null;
+
+function _maybeStartCam2() {
+  if (_cameraState[2] || _cam2StartT) return;
+  _cam2StartT = setTimeout(() => {
+    _cam2StartT = null;
+    if (!_cameraState[2]) setupCamera('cam2', 'no-sig-2', 2);
+  }, 400);
+}
+
 function startAllCameras() {
   stopAllCameras();
+  if (_cam2StartT) { clearTimeout(_cam2StartT); _cam2StartT = null; }
   setupCamera('cam1', 'no-sig-1', 1);
-  // Stagger Pi connections — opening both USB cameras at once often flakes one feed.
-  setTimeout(() => setupCamera('cam2', 'no-sig-2', 2), 1200);
+  // Arm cam waits for forward first frame (or timeout) — dual USB open often flakes.
+  _cam2StartT = setTimeout(() => {
+    _cam2StartT = null;
+    if (!_cameraState[2]) setupCamera('cam2', 'no-sig-2', 2);
+  }, 4000);
 }
 
 function bindCameraResize() {

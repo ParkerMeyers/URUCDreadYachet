@@ -298,8 +298,6 @@
 
     <span class="control-label">Arm</span>
     <span id="arm-preset-btns" class="arm-preset-btns"></span>
-    <button class="action-btn" id="btn-arm-jog" onclick="armJogTest()">↔ Test J2</button>
-    <button class="action-btn" id="btn-arm-diag" onclick="armDiagnostic()">🔍 Arm Diag</button>
     <button class="action-btn" id="btn-manual-pwm" onclick="showManualPwm()">⌨ Manual AUX</button>
     <button class="action-btn" onclick="showArmPresets()">⚙ Presets</button>
 
@@ -401,6 +399,14 @@
     <div class="telem-cell">
       <span class="tc-label">Arm MAV</span>
       <span class="tc-val" id="tel-arm-mav">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Arm Enc</span>
+      <span class="tc-val" id="tel-arm-enc">--</span>
+    </div>
+    <div class="telem-cell">
+      <span class="tc-label">Arm IMU</span>
+      <span class="tc-val" id="tel-arm-imu">--</span>
     </div>
   </div>
 

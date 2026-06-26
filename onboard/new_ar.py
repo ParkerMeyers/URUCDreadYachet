@@ -13,7 +13,9 @@ Physical arm (4 DOF):
 
 UDP (port 5006 — CSV + JSON; port 5009 — legacy JSON control):
     Test / direct:  {"joint": 1, "pwm": 1400}  |  {"center_all": true}
-    arm_sender CSV: 1400,1500,1500,1500,1600,1500,1425
+    arm_sender CSV (9 fields):
+        J1,J2,J3,Claw,ENC1,ENC2,IMU_STATUS,IMU_ANGLE,GRIP
+    arm_sender CSV (legacy 7-field padded PWM) also accepted.
     Web UI JSON:    {"cmd": "manual_pwm", "joint": 2, "pwm": 1600}
                     {"cmd": "preset_step", "pwm": [7 values]}
                     {"cmd": "arm_enable", "enabled": true}
@@ -38,10 +40,10 @@ from arm_joints import (
     RC_IGNORE,
     build_rc_override,
     clamp_joint_pwm,
-    csv_list_to_joint_pwm,
     default_joint_pwm,
     joint_pwm_to_csv_list,
     joint_to_rc_ch,
+    parse_arm_controller_csv,
 )
 from mavlink_rc import MAVLINK_ONBOARD_ARM, connect_mavlink, send_rc_channels_override
 
@@ -73,6 +75,27 @@ _telem_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 _telem_subscribers: set[tuple[str, int]] = set()
 _telem_sub_lock = threading.Lock()
 _telem_send_failures: dict[tuple[str, int], int] = {}
+
+_arm_sensors: dict = {
+    "encoder1_status": None,
+    "encoder2_status": None,
+    "imu_status": None,
+    "imu_angle_deg": None,
+    "grip_on": None,
+}
+
+
+def _apply_sensors(parsed: dict) -> None:
+    global _arm_sensors
+    with _lock:
+        for key in _arm_sensors:
+            if key in parsed and parsed[key] is not None:
+                _arm_sensors[key] = parsed[key]
+
+
+def _snapshot_sensors() -> dict:
+    with _lock:
+        return dict(_arm_sensors)
 
 
 def _hold_neutral(last_pkt: float) -> bool:
@@ -172,6 +195,7 @@ def _joint_telemetry_rows(pwm: dict[int, int]) -> list[dict]:
 def _telemetry_payload() -> dict:
     pwm, last_pkt, rx_count, armed, manual, preset, mav_ok, claw = _snapshot()
     hold = False if (manual or preset or not armed) else _hold_neutral(last_pkt)
+    sensors = _snapshot_sensors()
     return {
         "type": "arm",
         "arm_enabled": bool(armed),
@@ -183,6 +207,11 @@ def _telemetry_payload() -> dict:
         "arm_preset_motion": bool(preset),
         "arm_joint_us": joint_pwm_to_csv_list(pwm),
         "arm_joints": _joint_telemetry_rows(pwm),
+        "arm_encoder1_status": sensors.get("encoder1_status"),
+        "arm_encoder2_status": sensors.get("encoder2_status"),
+        "arm_imu_status": sensors.get("imu_status"),
+        "arm_imu_angle_deg": sensors.get("imu_angle_deg"),
+        "arm_grip_on": sensors.get("grip_on"),
     }
 
 
@@ -268,17 +297,17 @@ def _handle_csv_line(line: str) -> None:
     if line.startswith("PWM:"):
         line = line[4:]
     parts = line.split(",")
-    if len(parts) < 7:
-        return
-    try:
-        vals = [float(x) for x in parts[:7]]
-    except ValueError:
+    if len(parts) < 4:
         return
     with _lock:
         if _manual_mode or _preset_motion:
             return
         claw = int(_claw_stop)
-    _apply_pwm(csv_list_to_joint_pwm(vals, claw_stop=claw), from_csv=True)
+    parsed = parse_arm_controller_csv(parts, claw_stop=claw)
+    if parsed is None:
+        return
+    _apply_sensors(parsed)
+    _apply_pwm(parsed["joint_pwm"], from_csv=True)
 
 
 def _apply_arm_enable(cmd: dict) -> None:
@@ -326,7 +355,10 @@ def _apply_preset_step(cmd: dict) -> None:
         if not _arm_enabled:
             return
         claw = int(_claw_stop)
-    _apply_pwm(csv_list_to_joint_pwm(pwms, claw_stop=claw))
+    parsed = parse_arm_controller_csv(pwms, claw_stop=claw)
+    if parsed is None:
+        return
+    _apply_pwm(parsed["joint_pwm"])
     with _lock:
         _preset_motion_since = time.time()
 

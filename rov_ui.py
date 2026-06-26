@@ -126,6 +126,7 @@ from topside.util import (
     topside_return_ip,
 )
 from topside.ssh_manager import ssh
+from onboard.arm_joints import parse_arm_controller_csv
 
 _manual_aux_defaults = manual_aux_defaults
 _manual_thr_defaults = manual_thr_defaults
@@ -290,6 +291,32 @@ def _arm_control_ports() -> list[int]:
     return ports
 
 
+def _arm_parse_to_state(parsed: dict) -> dict:
+    """Normalize parse_arm_controller_csv() for STATE / UI."""
+    out = {"pwm": list(parsed["pwm_csv"])}
+    for key in (
+        "encoder1_status", "encoder2_status", "imu_status",
+        "imu_angle_deg", "grip_on",
+    ):
+        if parsed.get(key) is not None:
+            out[key] = parsed[key]
+    return out
+
+
+def _merge_arm_sensors_into_telemetry(parsed: dict) -> None:
+    tel = STATE["telemetry"]
+    mapping = {
+        "encoder1_status": "arm_encoder1_status",
+        "encoder2_status": "arm_encoder2_status",
+        "imu_status": "arm_imu_status",
+        "imu_angle_deg": "arm_imu_angle_deg",
+        "grip_on": "arm_grip_on",
+    }
+    for src, dst in mapping.items():
+        if parsed.get(src) is not None:
+            tel[dst] = parsed[src]
+
+
 def _parse_arm_sent_line(line: str) -> dict | None:
     text = line.strip()
     if not text or text.startswith("BAD "):
@@ -300,14 +327,10 @@ def _parse_arm_sent_line(line: str) -> dict | None:
         return None
     if text.startswith("PWM:"):
         text = text[4:]
-    parts = text.split(",")
-    if len(parts) < 7:
+    parsed = parse_arm_controller_csv(text.split(","))
+    if parsed is None:
         return None
-    try:
-        pwms = clamp_arm_pwm_list(parts)
-        return {"pwm": pwms}
-    except (TypeError, ValueError):
-        return None
+    return _arm_parse_to_state(parsed)
 
 
 def _send_pi_arm_control(payload: dict, ports: list[int] | None = None) -> tuple[bool, str]:
@@ -597,17 +620,21 @@ def _drain_process_output(name: str, proc: subprocess.Popen):
         if not line:
             continue
 
+        arm_parsed = None
         with _state_lock:
             log_list = STATE["logs"].get(name, [])
             log_list.append(line)
             if len(log_list) > MAX_LOG_LINES:
                 del log_list[:-MAX_LOG_LINES]
             if name == "arm":
-                parsed = _parse_arm_sent_line(line)
-                if parsed:
-                    STATE["arm_last_pwm"] = parsed
+                arm_parsed = _parse_arm_sent_line(line)
+                if arm_parsed:
+                    STATE["arm_last_pwm"] = arm_parsed
+                    _merge_arm_sensors_into_telemetry(arm_parsed)
 
         socketio.emit("process_log", {"name": name, "line": line})
+        if arm_parsed:
+            socketio.emit("telemetry", _telemetry_emit_payload())
 
     with _state_lock:
         if name == "thrust":
@@ -752,6 +779,9 @@ def _on_onboard_stack_ready() -> None:
     socketio.emit("telemetry", _telemetry_emit_payload())
     emit_status()
 
+    if STATE.get("onboard_cam"):
+        socketio.start_background_task(_warm_camera_proxies)
+
     def _resync_arm_after_restart():
         for delay in (0.75, 2.0, 5.0):
             time.sleep(delay)
@@ -838,6 +868,15 @@ def _update_arm_telemetry_from_json(pkt: dict):
         tel["arm_preset_motion"] = bool(pkt.get("arm_preset_motion"))
     if pkt.get("arm_claw_stop_us") is not None:
         tel["arm_claw_stop_us"] = int(pkt["arm_claw_stop_us"])
+    for src, dst in (
+        ("arm_encoder1_status", "arm_encoder1_status"),
+        ("arm_encoder2_status", "arm_encoder2_status"),
+        ("arm_imu_status", "arm_imu_status"),
+        ("arm_imu_angle_deg", "arm_imu_angle_deg"),
+        ("arm_grip_on", "arm_grip_on"),
+    ):
+        if pkt.get(src) is not None:
+            tel[dst] = pkt[src]
     STATE["last_arm_telemetry_time"] = time.time()
     if not STATE.get("_arm_telemetry_rx_logged"):
         STATE["_arm_telemetry_rx_logged"] = True
@@ -1129,10 +1168,13 @@ def _monitor_loop():
                 _ssh_was_connected            = True
                 STATE["ssh_connected"]         = True
                 status = ssh.get_onboard_status()
+                was_cam = STATE.get("onboard_cam")
                 STATE["onboard_mavproxy"] = status["mavproxy"]
                 STATE["onboard_stab"]     = status["stab"]
                 STATE["onboard_arm"]      = status["arm"]
                 STATE["onboard_cam"]      = status["cam"]
+                if status["cam"] and not was_cam:
+                    socketio.start_background_task(_warm_camera_proxies)
                 STATE["pixhawk_serial_ok"] = ssh.any_serial_port_exists()
                 if STATE["onboard_mavproxy"]:
                     STATE["mavproxy_detail"] = ""
@@ -1206,8 +1248,11 @@ def emit_status():
 # UI slot 1 = forward, slot 2 = arm
 _CAMERA_UI_URL_KEY = {1: "forward_camera_url", 2: "arm_camera_url"}
 # Pi USB cameras can take >1s to accept a second HTTP client when both feeds start.
-_CAMERA_CONNECT_TIMEOUT = (5, 120)
-_CAMERA_CONNECT_RETRIES = 3
+_CAMERA_CONNECT_TIMEOUT = (3, 120)
+_CAMERA_CONNECT_RETRIES = 5
+_CAMERA_FIRST_CHUNK_TIMEOUT = 10.0
+_camera_warm_lock = threading.Lock()
+_camera_warm_gen = 0
 
 
 def _open_camera_upstream(cam_url: str):
@@ -1221,8 +1266,40 @@ def _open_camera_upstream(cam_url: str):
         except Exception as exc:
             last_exc = exc
             if attempt + 1 < _CAMERA_CONNECT_RETRIES:
-                time.sleep(0.4 * (attempt + 1))
+                time.sleep(0.25 * (attempt + 1))
     raise last_exc
+
+
+def _first_upstream_chunk(upstream, timeout: float = _CAMERA_FIRST_CHUNK_TIMEOUT):
+    """Read until the first body chunk or raise — avoids empty 200 responses."""
+    deadline = time.time() + timeout
+    for chunk in upstream.iter_content(chunk_size=8192):
+        if chunk:
+            return chunk
+        if time.time() >= deadline:
+            break
+    raise TimeoutError("camera stream produced no frames")
+
+
+def _warm_camera_proxies():
+    """Light snapshot pulls so Pi USB/V4L2 is warm before the UI opens MJPEG streams."""
+    global _camera_warm_gen
+    with _camera_warm_lock:
+        _camera_warm_gen += 1
+        gen = _camera_warm_gen
+    load_config_file()
+    for cam_num in (1, 2):
+        if gen != _camera_warm_gen:
+            return
+        url_key = _CAMERA_UI_URL_KEY.get(cam_num, "")
+        base = str(config.get(url_key, "")).rstrip("/")
+        if not base:
+            continue
+        try:
+            _requests.get(f"{base}/snapshot", timeout=4)
+        except Exception:
+            pass
+        time.sleep(0.6)
 
 
 @app.route("/camera/<int:cam_num>")
@@ -1242,16 +1319,9 @@ def camera_stream(cam_num):
     # body that leaves the UI stuck on "No Signal" until the client watchdog fires.
     try:
         upstream = _open_camera_upstream(cam_url)
-        preview = next(upstream.iter_content(chunk_size=8192), None)
+        preview = _first_upstream_chunk(upstream)
     except Exception as exc:
         return Response(str(exc), status=502)
-
-    if not preview:
-        try:
-            upstream.close()
-        except Exception:
-            pass
-        return Response("camera stream empty", status=502)
 
     content_type = upstream.headers.get(
         "Content-Type", "multipart/x-mixed-replace; boundary=frame"
@@ -1875,147 +1945,6 @@ def api_arm_telemetry_subscribe():
         "ok": True,
         "host": host,
         "port": _arm_telemetry_port(),
-    })
-
-
-@app.route("/api/arm_diagnostic", methods=["GET"])
-def api_arm_diagnostic():
-    tel = STATE.get("telemetry", {})
-    rx = tel.get("arm_rx_count")
-    arm_age = _arm_telemetry_age_sec()
-    arm_tel_stale = arm_age is None or arm_age > 5.0
-    hold_neutral = tel.get("arm_hold_neutral")
-    manual_on = bool(
-        STATE.get("manual_pwm_enabled") or tel.get("arm_manual_mode")
-    )
-    tel_port = _arm_telemetry_port()
-    tel_host = topside_return_ip(config) or "this PC"
-    age_txt = "never" if arm_age is None else f"{arm_age}s"
-    checks = [
-        {
-            "name": "ROV mode (DRIVE/ARMED or STABILIZE)",
-            "ok": _robot_armed(),
-            "detail": STATE.get("mode", "disarmed"),
-        },
-        {
-            "name": "arm_sender running (topside)",
-            "ok": bool(STATE.get("arm_running")) or manual_on,
-            "detail": (
-                "Optional — Manual AUX is ON (no USB arm controller needed)"
-                if manual_on and not STATE.get("arm_running")
-                else (
-                    "Not running — OK if using Manual AUX only"
-                    if not STATE.get("arm_running")
-                    else "OK"
-                )
-            ),
-        },
-        {
-            "name": "Onboard arm (new_ar.py on Pi)",
-            "ok": bool(STATE.get("onboard_arm")),
-            "detail": "Start Onboard" if not STATE.get("onboard_arm") else "OK",
-        },
-        {
-            "name": "Pi MAVLink to Pix6",
-            "ok": bool(tel.get("arm_mavlink_ok")),
-            "detail": "Check MAVProxy + onboard arm log" if not tel.get("arm_mavlink_ok") else "OK",
-        },
-        {
-            "name": "Pi arm motion enabled",
-            "ok": bool(tel.get("arm_enabled")),
-            "detail": "Switch to DRIVE/ARMED" if not tel.get("arm_enabled") else "OK",
-        },
-        {
-            "name": f"Arm telemetry from Pi (UDP {tel_port})",
-            "ok": not arm_tel_stale,
-            "detail": (
-                f"No telemetry ({age_txt}) — start Onboard (new_ar.py) and allow inbound "
-                f"UDP {tel_port} on {tel_host}"
-                if arm_tel_stale
-                else f"OK (age {arm_age}s)"
-            ),
-        },
-        {
-            "name": "UDP from arm_sender (Pi rx count)",
-            "ok": not arm_tel_stale and (manual_on or (rx is not None and int(rx) > 0)),
-            "detail": (
-                "Need arm telemetry first"
-                if arm_tel_stale
-                else (
-                    "Manual AUX ON — arm_sender USB not required"
-                    if manual_on and not (rx and int(rx) > 0)
-                    else (
-                        f"rx={rx} — arm USB controller sending to Pi"
-                        if rx and int(rx) > 0
-                        else "rx=0 — use Manual AUX or plug arm USB + arm_sender"
-                    )
-                )
-            ),
-        },
-        {
-            "name": "Not stuck in hold-neutral",
-            "ok": not arm_tel_stale and (manual_on or hold_neutral is False),
-            "detail": (
-                "Unknown — no Pi telemetry"
-                if arm_tel_stale
-                else (
-                    "Manual AUX ON — not using arm_sender hold logic"
-                    if manual_on
-                    else (
-                        "Hold-neutral (no arm_sender UDP yet)"
-                        if hold_neutral
-                        else "OK"
-                    )
-                )
-            ),
-        },
-    ]
-    return jsonify({
-        "ok": True,
-        "checks": checks,
-        "all_ok": all(c["ok"] for c in checks),
-        "hint": f"Mission Planner: {ARM_SERVO_HINT}",
-        "arm_joint_us": tel.get("arm_joint_us"),
-        "arm_joints": tel.get("arm_joints"),
-        "mode": STATE.get("mode"),
-    })
-
-
-@app.route("/api/arm_jog", methods=["POST"])
-def api_arm_jog():
-    """Pulse one joint via Pi manual PWM (connectivity test). Requires DRIVE/ARMED."""
-    if not _robot_armed():
-        return jsonify({"ok": False, "msg": "Switch to DRIVE/ARMED first"}), 403
-    _sync_arm_unlock()
-    data = request.get_json(force=True) or {}
-    try:
-        joint_i = int(data.get("joint", 2))
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "msg": "Invalid joint"}), 400
-    if joint_i not in JOINT_TO_AUX:
-        return jsonify({"ok": False, "msg": "Joint must be 1–4 (J1, J2, J3, Claw)"}), 400
-    aux = JOINT_TO_AUX[joint_i]
-    neutral = JOINT_NEUTRAL_PWM[joint_i]
-    pwm = clamp_joint_pwm_aux(aux, data.get("pwm", neutral))
-    center = clamp_joint_pwm_aux(aux, data.get("center_pwm", neutral))
-    label = ARM_JOINT_NAMES[joint_i - 1]
-    hold_sec = float(data.get("hold_sec", 1.0))
-
-    ok1, msg1 = _send_pi_arm_joint(joint_i, pwm)
-    if not ok1:
-        return jsonify({"ok": False, "msg": msg1}), 500
-
-    def _restore():
-        time.sleep(hold_sec)
-        _send_pi_arm_joint(joint_i, center)
-
-    threading.Thread(target=_restore, daemon=True, name=f"arm-jog-{label}").start()
-    return jsonify({
-        "ok": True,
-        "msg": f"Jog {label} → {pwm} µs for {hold_sec:.1f}s",
-        "joint": joint_i,
-        "aux": aux,
-        "pwm": pwm,
     })
 
 

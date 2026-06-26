@@ -458,13 +458,14 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         interval = 1.0 / max(1, self.__class__._stream.fps)
+        first_frame = True
 
         while True:
             frame = self.__class__._stream.get_frame()
             if frame is None:
                 frame = _placeholder_frame
             if frame is None:
-                time.sleep(0.1)
+                time.sleep(0.05)
                 continue
             try:
                 self.wfile.write(
@@ -476,7 +477,10 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 break
-            time.sleep(interval)
+            if first_frame:
+                first_frame = False
+            else:
+                time.sleep(interval)
 
     def _serve_snapshot(self) -> None:
         frame = self.__class__._stream.get_frame() or _placeholder_frame
@@ -581,6 +585,11 @@ def main() -> None:
         _log("[cam] Starting both capture threads in parallel")
         stream0.start()
         stream1.start()
+        _log("[cam] Waiting for first frames...")
+        r0 = stream0.wait_ready(20.0)
+        r1 = stream1.wait_ready(20.0)
+        if not r0 or not r1:
+            _log(f"[cam] WARNING: capture slow — cam0={r0} cam1={r1} (serving placeholders until ready)")
 
     t0 = threading.Thread(
         target=_serve_camera, args=(stream0, args.port0),

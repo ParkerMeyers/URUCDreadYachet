@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Forward arm-controller serial PWM (motor-native µs) to the Pi over UDP."""
+"""Forward arm-controller serial (motor-native µs + sensors) to the Pi over UDP."""
 
 import socket
 import serial
@@ -10,7 +10,12 @@ from serial.tools import list_ports
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from topside.util import clamp_arm_pwm_list
+from onboard.arm_joints import (
+    ARM_CONTROLLER_FIELDS,
+    format_arm_controller_csv,
+    looks_like_arm_controller_line,
+    parse_arm_controller_csv,
+)
 
 # ── Argument parsing (allows web UI to pass config at launch) ────────────────
 _parser = argparse.ArgumentParser(description="ROV Arm Sender")
@@ -31,35 +36,6 @@ UDP_PORT = _args.udp_port
 PRINT_EVERY = 0.1
 PROBE_TIMEOUT_SEC = max(0.5, float(_args.scan_timeout))
 
-J6_TARGET_MIN_DEG = -90.0
-J6_TARGET_MAX_DEG = 90.0
-
-
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-
-def clamp_angle(x):
-    return clamp(float(x), J6_TARGET_MIN_DEG, J6_TARGET_MAX_DEG)
-
-
-def _looks_like_arm_line(raw: str) -> bool:
-    """True when a serial line matches arm controller PWM CSV output."""
-    line = raw.strip()
-    if not line:
-        return False
-    if line.startswith("PWM:"):
-        line = line[4:]
-    parts = line.split(",")
-    if len(parts) < 7:
-        return False
-    try:
-        for part in parts[:7]:
-            float(part.strip())
-        return True
-    except ValueError:
-        return False
-
 
 def _port_description(port_name: str) -> str:
     for info in list_ports.comports():
@@ -74,7 +50,7 @@ def _port_description(port_name: str) -> str:
 
 
 def _probe_port(port_name: str) -> bool:
-    """Open port briefly and look for arm-controller PWM lines."""
+    """Open port briefly and look for arm-controller CSV lines."""
     try:
         ser = serial.Serial(port_name, BAUD, timeout=0.15)
     except (serial.SerialException, PermissionError, OSError) as e:
@@ -88,9 +64,9 @@ def _probe_port(port_name: str) -> bool:
         deadline = time.time() + PROBE_TIMEOUT_SEC
         while time.time() < deadline:
             raw = ser.readline().decode(errors="ignore").strip()
-            if _looks_like_arm_line(raw):
+            if looks_like_arm_controller_line(raw):
                 return True
-        print(f"  skip {port_name}: no arm PWM data in {PROBE_TIMEOUT_SEC:.1f}s")
+        print(f"  skip {port_name}: no arm controller data in {PROBE_TIMEOUT_SEC:.1f}s")
         return False
     finally:
         ser.close()
@@ -139,9 +115,11 @@ except Exception as e:
 
 print(f"Reading serial: {SERIAL_PORT} @ {BAUD}")
 print(f"Sending UDP to: {PI_IP}:{UDP_PORT}")
-print("Output format: J1,J2,J3,J4,J5,J2,J3,Claw [, angle]  (motor-native µs)")
-print("Active fields: idx0=J1/M13, idx4=J2/M9, idx5=J3/M11, idx6=Claw/M15")
-print("Example: 1400,1500,1500,1500,1600,1500,1425,-12.35")
+print(
+    "Serial format: "
+    "PWM_J1,PWM_J2,PWM_J3,PWM_CLAW,ENCODER1,ENCODER2,IMU_STATUS,IMU_ANGLE,GRIP_ONOFF"
+)
+print(f"Example: 1400,1600,1500,1425,1,1,OK,-12.35,0  ({ARM_CONTROLLER_FIELDS} fields)")
 
 last_print = 0
 
@@ -152,32 +130,15 @@ while True:
         continue
 
     line = raw
-
     if line.startswith("PWM:"):
         line = line[4:]
 
-    parts = line.split(",")
-
-    if len(parts) < 7:
-        print(f"BAD SHORT LINE, need 7+ PWM values: {raw}")
+    parsed = parse_arm_controller_csv(line.split(","))
+    if parsed is None:
+        print(f"BAD LINE (need {ARM_CONTROLLER_FIELDS} fields or legacy 7-field PWM): {raw}")
         continue
 
-    try:
-        pwms = clamp_arm_pwm_list(parts[:7])
-    except (ValueError, TypeError):
-        print(f"BAD NUMBER LINE: {raw}")
-        continue
-
-    # Pi new_ar.py uses 7 joint PWM fields; 8th serial field (angle) is optional.
-    if len(parts) >= 8:
-        try:
-            angle = clamp_angle(parts[7])
-            send_line = ",".join(str(x) for x in pwms) + f",{angle:.2f}"
-        except ValueError:
-            send_line = ",".join(str(x) for x in pwms)
-    else:
-        send_line = ",".join(str(x) for x in pwms)
-
+    send_line = format_arm_controller_csv(parsed)
     sock.sendto(send_line.encode(), (PI_IP, UDP_PORT))
 
     now = time.time()
