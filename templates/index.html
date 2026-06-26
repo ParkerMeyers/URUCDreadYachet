@@ -247,11 +247,6 @@
       </div>
       <img id="cam2" class="cam-img" style="display:none" alt="Arm Camera"/>
       <canvas id="hud2" class="cam-hud"></canvas>
-      <div class="cam-telemetry cam-telemetry-arm" id="cam-arm-tel">
-        <div>GRIP  <span class="val-hi" id="cam-arm-angle">--</span>°</div>
-        <div>TGT   <span id="cam-arm-target">--</span>°</div>
-        <div>IMU   <span id="cam-arm-imu">--</span></div>
-      </div>
       <div class="cam-label">CAM 2 / ARM</div>
     </div>
 
@@ -284,7 +279,6 @@
     <button class="ctrl-flag" id="flag-stab"    onclick="toggleStabilize()">STAB: OFF</button>
     <button class="ctrl-flag" id="flag-depth"   onclick="toggleDepthHold()">DEPTH: OFF</button>
     <button class="ctrl-flag" id="flag-yaw"     onclick="toggleYawHold()">YAW: OFF</button>
-    <button class="ctrl-flag" id="flag-claw" onclick="toggleClawHold()">CLAW: OFF</button>
 
     <div class="ctrl-sep"></div>
 
@@ -321,8 +315,7 @@
 
     <span class="control-label">Arm</span>
     <span id="arm-preset-btns" class="arm-preset-btns"></span>
-    <button class="action-btn" id="btn-arm-imu-zero" onclick="zeroArmIMU()">⊕ ZERO ARM IMU</button>
-    <button class="action-btn" id="btn-arm-jog" onclick="armJogTest()">↔ Test J5</button>
+    <button class="action-btn" id="btn-arm-jog" onclick="armJogTest()">↔ Test J2</button>
     <button class="action-btn" id="btn-arm-diag" onclick="armDiagnostic()">🔍 Arm Diag</button>
     <button class="action-btn" id="btn-manual-pwm" onclick="showManualPwm()">⌨ Manual AUX</button>
     <button class="action-btn" onclick="showArmPresets()">⚙ Presets</button>
@@ -581,8 +574,6 @@
           <div class="field"><label>Display label (optional)</label>
             <input id="arm-preset-label" type="text" placeholder="e.g. Sample Ready"/></div>
           <div class="arm-pwm-grid" id="arm-preset-pwm-grid"></div>
-          <div class="field"><label>J6 target angle (°)</label>
-            <input id="arm-preset-j6" type="number" step="0.1" value="0"/></div>
           <div class="arm-preset-current" id="arm-preset-current">Current: -- (start arm_sender and move arm)</div>
           <div class="arm-preset-form-actions">
             <button class="btn btn-secondary" onclick="recordArmCurrentIntoForm()">⏺ Record current</button>

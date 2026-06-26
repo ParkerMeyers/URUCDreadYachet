@@ -12,19 +12,22 @@ from onboard.ports import (
 
 IS_WINDOWS = platform.system() == "Windows"
 
-# ── Arm (Pix6 AUX) ───────────────────────────────────────────────────────────
-ARM_JOINT_NAMES = ["J1", "J2", "J3", "J4", "J5", "J6", "Claw"]
+# ── Arm (Pix6 AUX) — 4 DOF: J1, J2, J3, Claw ───────────────────────────────
+# arm_sender CSV indices for active joints: 0=J1, 4=J2, 5=J3, 6=Claw
+ARM_JOINT_NAMES = ["J1", "J2", "J3", "Claw"]
+ARM_CSV_INDICES = [0, 4, 5, 6]
+ARM_CSV_TO_NAME = {0: "J1", 4: "J2", 5: "J3", 6: "Claw"}
 ARM_PWM_MIN = 500
 ARM_PWM_MAX = 2500
 ARM_DEFAULT_PWM = [1500, 1500, 1500, 1500, 1500, 1500, 1515]
 
-ARM_PRESET_JOINT_ORDER = (5, 4, 3, 2, 1, 0, 6)
+ARM_PRESET_JOINT_ORDER = (5, 4, 0, 6)  # J3→J2→J1→Claw (CSV indices)
 ARM_PRESET_DELAY_MIN_SEC = 0.45
 ARM_PRESET_DELAY_MAX_SEC = 4.0
 
-MANUAL_AUX_LABELS = ["J5", "J2", "J6", "J1", "J3", "J4", "Claw"]
+MANUAL_AUX_LABELS = ["J2", "—", "J3", "J1", "—", "—", "Claw"]
 MANUAL_AUX_DEFAULTS = [1500, 1500, 1500, 1500, 1500, 1500, 1515]
-JOINT_TO_AUX = {1: 4, 2: 2, 3: 5, 4: 6, 5: 1, 6: 3, 7: 7}
+JOINT_TO_AUX = {1: 4, 2: 1, 3: 3, 4: 7}
 AUX_TO_JOINT = {v: k for k, v in JOINT_TO_AUX.items()}
 
 # ── Thrusters (Pix6 RC1–8) ───────────────────────────────────────────────────
@@ -48,9 +51,9 @@ THR_PWM_MAX = 1900
 NEUTRAL_THR_PWM = 1500
 
 DEFAULT_ARM_PRESETS = {
-    "stow": {"label": "Stow", "pwm": [1500, 1500, 1500, 1500, 1500, 1500, 1515], "j6_angle": 0.0},
-    "sample": {"label": "Sample", "pwm": [1600, 1400, 1550, 1500, 1450, 1500, 1515], "j6_angle": 15.0},
-    "deploy_claw": {"label": "Claw", "pwm": [1500, 1500, 1500, 1500, 1500, 1500, 2000], "j6_angle": 0.0},
+    "stow": {"label": "Stow", "pwm": [1500, 1500, 1500, 1500, 1500, 1500, 1515]},
+    "sample": {"label": "Sample", "pwm": [1600, 1500, 1500, 1500, 1450, 1500, 1515]},
+    "deploy_claw": {"label": "Claw", "pwm": [1500, 1500, 1500, 1500, 1500, 1500, 2000]},
 }
 
 MAVPROXY_TCP_PORT = MAVPROXY_TCP_STAB

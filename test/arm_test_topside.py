@@ -12,19 +12,16 @@ Usage:
 Commands at the prompt:
     1 1600      set J1 to 1600 µs  (AUX4)
     1 1500      set J1 back to center
-    6 1600      set J6 to 1600 µs  (AUX3, continuous rotation)
+    3 1600      set J3 to 1600 µs  (AUX3)
     center      all joints → center PWM  (also: c)
     status      print current PWM state  (also: s)
     q           center all then exit
 
-Joint map (type joint number 1-7 — matches rov_ui / new_ar.py):
-    1  J1         (AUX4 → RC ch 12 → SERVO12)
-    2  J2         (AUX2 → RC ch 10 → SERVO10)
-    3  J3         (AUX5 → RC ch 13 → SERVO13)
-    4  J4         (AUX6 → RC ch 14 → SERVO14)
-    5  J5         (AUX1 → RC ch  9 → SERVO9)
-    6  J6         (AUX3 → RC ch 11 → SERVO11)  continuous rotation, center 1500
-    7  Claw       (AUX7 → RC ch 15 → SERVO15)  continuous rotation, center 1515
+Joint map (type joint number 1-4 — matches rov_ui / new_ar.py):
+    1  J1         (AUX4 → RC ch 12)
+    2  J2         (AUX1 → RC ch  9)
+    3  J3         (AUX3 → RC ch 11)
+    4  Claw       (AUX7 → RC ch 15)  continuous rotation, center 1515
 
 Mission Planner parameters required (set once, write params):
     SERVO9_FUNCTION  = 1   SERVO10_FUNCTION = 1   SERVO11_FUNCTION = 1
@@ -45,25 +42,21 @@ CENTER_US     = 1500
 CLAW_CENTER_US = 1515
 MIN_US        = 500
 MAX_US        = 2500
-NUM_JOINTS    = 7
+NUM_JOINTS    = 4
 # ─────────────────────────────────────────────────────────────────────────────
 
 JOINT_NAMES = {
     1: "J1",
     2: "J2",
     3: "J3",
-    4: "J4",
-    5: "J5",
-    6: "J6",
-    7: "Claw",
+    4: "Claw",
 }
 
-# Joint index → Pix6 AUX port (matches onboard/new_ar.py JOINT_TO_AUX)
-JOINT_TO_AUX = {1: 4, 2: 2, 3: 5, 4: 6, 5: 1, 6: 3, 7: 7}
+JOINT_TO_AUX = {1: 4, 2: 1, 3: 3, 4: 7}
 
 
 def joint_center_us(joint: int) -> int:
-    return CLAW_CENTER_US if joint == 7 else CENTER_US
+    return CLAW_CENTER_US if joint == 4 else CENTER_US
 
 
 def clamp(x, lo, hi):

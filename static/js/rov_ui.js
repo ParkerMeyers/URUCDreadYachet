@@ -398,12 +398,6 @@ function updateArmControlsUI() {
     manualBtn.disabled = !armed || _presetRunning;
     manualBtn.classList.toggle('disabled', !armed || _presetRunning);
   }
-  const armImuZeroBtn = document.getElementById('btn-arm-imu-zero');
-  if (armImuZeroBtn) {
-    const imuOk = armImuAvailable(_tel);
-    armImuZeroBtn.disabled = !imuOk;
-    armImuZeroBtn.classList.toggle('disabled', !imuOk);
-  }
   const armJogBtn = document.getElementById('btn-arm-jog');
   if (armJogBtn) {
     const jogOk = isRobotArmed() && !!_status.onboard_arm;
@@ -537,7 +531,7 @@ async function sendArmPreset(name) {
   if (d.ok && d.sequential) {
     _presetRunning = true;
     updateArmControlsUI();
-    toast(d.msg || `Moving to ${label} (J6→J1→Claw)…`, 'ok');
+    toast(d.msg || `Moving to ${label} (J3→J2→J1→Claw)…`, 'ok');
   } else {
     toast(d.ok ? `Arm preset: ${label}` : d.msg, d.ok ? 'ok' : 'err');
   }
@@ -546,7 +540,8 @@ async function sendArmPreset(name) {
 // ─────────────────────────────────────────────────────────────
 // ARM PRESETS
 // ─────────────────────────────────────────────────────────────
-const ARM_JOINT_NAMES = ['J1', 'J2', 'J3', 'J4', 'J5', 'J6', 'Claw'];
+const ARM_JOINT_NAMES = ['J1', 'J2', 'J3', 'Claw'];
+const ARM_CSV_INDICES = [0, 4, 5, 6];
 let _armPresets = {};
 let _armLastPwm = null;
 let _armPresetEditing = null;
@@ -586,26 +581,23 @@ function buildArmPwmGrid() {
   grid.innerHTML = ARM_JOINT_NAMES.map((jn, i) => `
     <div class="field">
       <label>${jn} µs</label>
-      <input id="arm-pwm-${i}" type="number" min="500" max="2500" step="1" value="1500"/>
+      <input id="arm-pwm-${ARM_CSV_INDICES[i]}" type="number" min="500" max="2500" step="1" value="1500"/>
     </div>
   `).join('');
 }
 
 function getArmFormValues() {
-  const pwm = [];
-  for (let i = 0; i < 7; i++) {
-    const el = document.getElementById('arm-pwm-' + i);
-    pwm.push(el ? parseInt(el.value, 10) || 1500 : 1500);
+  const pwm = [1500, 1500, 1500, 1500, 1500, 1500, 1515];
+  for (const csvIdx of ARM_CSV_INDICES) {
+    const el = document.getElementById('arm-pwm-' + csvIdx);
+    pwm[csvIdx] = el ? parseInt(el.value, 10) || 1500 : 1500;
   }
-  const j6El = document.getElementById('arm-preset-j6');
-  const j6 = j6El ? parseFloat(j6El.value) : 0;
   const nameEl = document.getElementById('arm-preset-name');
   const labelEl = document.getElementById('arm-preset-label');
   return {
     name: nameEl ? nameEl.value.trim() : '',
     label: labelEl ? labelEl.value.trim() : '',
     pwm,
-    j6_angle: Number.isFinite(j6) ? j6 : 0,
   };
 }
 
@@ -615,22 +607,20 @@ function setArmFormValues(preset, name) {
   if (title) title.textContent = name ? `Edit: ${name}` : 'Add preset';
   const nameEl = document.getElementById('arm-preset-name');
   const labelEl = document.getElementById('arm-preset-label');
-  const j6El = document.getElementById('arm-preset-j6');
   if (nameEl) {
     nameEl.value = name || '';
     nameEl.disabled = !!name;
   }
   if (labelEl) labelEl.value = (preset && preset.label) || '';
-  if (j6El) j6El.value = (preset && preset.j6_angle != null) ? preset.j6_angle : 0;
-  for (let i = 0; i < 7; i++) {
-    const el = document.getElementById('arm-pwm-' + i);
-    if (el) el.value = (preset && preset.pwm && preset.pwm[i] != null) ? preset.pwm[i] : 1500;
+  for (const csvIdx of ARM_CSV_INDICES) {
+    const el = document.getElementById('arm-pwm-' + csvIdx);
+    if (el) el.value = (preset && preset.pwm && preset.pwm[csvIdx] != null) ? preset.pwm[csvIdx] : 1500;
   }
 }
 
 function resetArmPresetForm() {
   _armPresetEditing = null;
-  setArmFormValues({ pwm: [1500, 1500, 1500, 1500, 1500, 1500, 1500], j6_angle: 0, label: '' }, '');
+  setArmFormValues({ pwm: [1500, 1500, 1500, 1500, 1500, 1500, 1515], label: '' }, '');
   const nameEl = document.getElementById('arm-preset-name');
   if (nameEl) nameEl.disabled = false;
   const title = document.getElementById('arm-preset-form-title');
@@ -644,7 +634,7 @@ function updateArmCurrentDisplay() {
     el.textContent = 'Current: -- (start arm_sender and move arm to record)';
     return;
   }
-  el.textContent = `Current: ${_armLastPwm.pwm.join(', ')} | J6 ${(_armLastPwm.j6_angle ?? 0).toFixed(1)}°`;
+  el.textContent = `Current: ${ARM_JOINT_NAMES.map((jn, i) => `${jn}=${_armLastPwm.pwm[ARM_CSV_INDICES[i]]}`).join(' ')}`;
 }
 
 function recordArmCurrentIntoForm() {
@@ -657,7 +647,6 @@ function recordArmCurrentIntoForm() {
   setArmFormValues({
     label: keepLabel,
     pwm: _armLastPwm.pwm.slice(),
-    j6_angle: _armLastPwm.j6_angle ?? 0,
   }, _armPresetEditing || keepName);
   toast('Recorded current arm position', 'ok');
 }
@@ -706,7 +695,7 @@ function renderArmPresetList() {
   }
   list.innerHTML = names.map(name => {
     const p = _armPresets[name];
-    const meta = (p.pwm || []).join(', ') + ` | J6 ${(p.j6_angle ?? 0).toFixed(1)}°`;
+    const meta = ARM_JOINT_NAMES.map((jn, i) => `${jn}=${(p.pwm || [])[ARM_CSV_INDICES[i]] ?? 1500}`).join(' ');
     const label = escapeHtml(p.label || name);
     return `<div class="arm-preset-row">
       <div class="arm-preset-row-name">${label}
@@ -743,7 +732,7 @@ function hideArmPresetsOutside(e) {
 }
 
 // ── Manual AUX PWM (direct Pix6 AUX override on Pi) ───────────
-const MANUAL_AUX_LABELS = ['J5', 'J2', 'J6', 'J1', 'J3', 'J4', 'Claw'];
+const MANUAL_AUX_LABELS = ['J2', '—', 'J3', 'J1', '—', '—', 'Claw'];
 const MANUAL_THR_LABELS = ['FL_H', 'BL_H', 'FL_V', 'FR_V', 'FR_H', 'BR_H', 'BR_V', 'BL_V'];
 let _configClawStopUs = 1515;
 
@@ -1124,7 +1113,7 @@ const _CAM_RECORD_META = {
   },
   2: {
     imgId: 'cam2', hudId: 'hud2', wrapId: 'cam-wrap-2', name: 'arm', label: 'CAM 2 / ARM',
-    drawTel: drawArmTelemetryPanel,
+    drawTel: () => {},
   },
 };
 
@@ -1196,26 +1185,7 @@ function drawForwardTelemetryPanel(ctx, W, H, t) {
   ctx.restore();
 }
 
-function drawArmTelemetryPanel(ctx, W, H, t) {
-  const scale = Math.max(0.65, H / 520);
-  const base = 11 * scale;
-  const x = W - 10 * scale;
-  let y = 18 * scale;
-  const lineH = 17 * scale;
-  const armHasAngle = armImuHasAngle(t);
-
-  ctx.save();
-  ctx.textBaseline = 'alphabetic';
-  drawTelemetryLine(ctx, x, y, 'GRIP  ', armHasAngle ? fmtNum(t.arm_imu_angle_deg, 1, '°') : '--',
-    armHasAngle ? 'rgba(0,224,138,0.95)' : 'rgba(255,179,32,0.95)', base, base);
-  y += lineH;
-  drawTelemetryLine(ctx, x, y, 'TGT   ', t.arm_j6_target_deg != null ? fmtNum(t.arm_j6_target_deg, 1, '°') : '--',
-    'rgba(220,230,255,0.85)', base, base);
-  y += lineH;
-  const imuStatus = armImuStatusText(t);
-  drawTelemetryLine(ctx, x, y, 'IMU   ', imuStatus.text, imuStatus.color, base, base);
-  ctx.restore();
-}
+function drawArmTelemetryPanel() {}
 
 function drawRecordBadge(ctx, W, scale) {
   const r = 5 * scale;
@@ -1559,71 +1529,6 @@ function stopMissionPoll() {
 // ─────────────────────────────────────────────────────────────
 // CONTROL FLAG TOGGLES (clickable from control bar + S/D/Y keys)
 // ─────────────────────────────────────────────────────────────
-const ARM_IMU_STALE_SEC = 5.0;
-
-function armImuPacketFresh(t) {
-  return !!(t && (t.arm_telemetry_age_sec == null || t.arm_telemetry_age_sec <= ARM_IMU_STALE_SEC));
-}
-
-function armImuHasAngle(t) {
-  return !!(t && t.arm_imu_ok && t.arm_imu_angle_deg != null && armImuPacketFresh(t));
-}
-
-function armImuStatusText(t) {
-  if (!t) return { text: 'NO DATA', color: 'rgba(255,179,32,0.95)', className: 'val-warn' };
-  if (armImuHasAngle(t)) {
-    if (t.arm_imu_stale) {
-      return { text: 'STALE', color: 'rgba(255,179,32,0.95)', className: 'val-warn' };
-    }
-    if (t.arm_claw_hold_active) {
-      return { text: 'HOLD', color: 'rgba(0,224,138,0.95)', className: 'val-hi' };
-    }
-    return { text: 'LIVE', color: 'rgba(0,224,138,0.95)', className: 'val-hi' };
-  }
-  if (t.arm_bno_ready && !armImuPacketFresh(t)) {
-    return { text: 'LINK', color: 'rgba(255,179,32,0.95)', className: 'val-warn' };
-  }
-  return { text: 'NO DATA', color: 'rgba(255,179,32,0.95)', className: 'val-warn' };
-}
-
-function armImuAvailable(t) {
-  if (!t) return false;
-  if (t.arm_imu_ok && t.arm_imu_angle_deg != null) {
-    if (t.arm_telemetry_age_sec == null || t.arm_telemetry_age_sec <= ARM_IMU_STALE_SEC) {
-      return true;
-    }
-  }
-  return !!t.arm_bno_ready;
-}
-
-function toggleClawHold() {
-  if (!isRobotArmed()) {
-    toast('Claw hold disabled while DISARMED', 'warn');
-    return;
-  }
-  const turningOn = !_ctrlState.claw_hold;
-  if (turningOn && !armImuAvailable(_tel)) {
-    toast('Arm IMU not available — cannot enable rotation hold', 'warn');
-    return;
-  }
-  _ctrlState.claw_hold = !_ctrlState.claw_hold;
-  updateFlagUI();
-  syncClawHoldToPi();
-  toast(
-    `Claw hold: ${_ctrlState.claw_hold ? 'ON' : 'OFF'} (J6 ${_ctrlState.claw_hold ? 'IMU' : 'manual'})`,
-    _ctrlState.claw_hold ? 'ok' : ''
-  );
-}
-
-async function syncClawHoldToPi() {
-  try {
-    await fetch('/api/claw_hold', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: !!_ctrlState.claw_hold }),
-    });
-  } catch (_) {}
-}
 
 function toggleStabilize() {
   if (_currentMode === 'disarmed') { toast('Switch to ARMED or STABILIZE mode first', 'warn'); return; }
@@ -1665,19 +1570,6 @@ function calibrateIMU() {
   toast('IMU zero sent — current pitch/roll set as targets', 'ok');
 }
 
-async function zeroArmIMU() {
-  if (!armImuAvailable(_tel)) {
-    toast('Arm IMU not available', 'warn');
-    return;
-  }
-  const r = await fetch('/api/arm_imu_zero', { method: 'POST' });
-  const d = await r.json();
-  const detail = (d.angle_deg != null)
-    ? ` (${Number(d.angle_deg).toFixed(1)}°)`
-    : '';
-  toast(d.ok ? `Arm IMU zeroed${detail}` : (d.msg || 'Arm IMU zero failed'), d.ok ? 'ok' : 'err');
-}
-
 async function armJogTest() {
   if (!isRobotArmed()) {
     toast('Switch to DRIVE/ARMED first', 'warn');
@@ -1686,7 +1578,7 @@ async function armJogTest() {
   const r = await fetch('/api/arm_jog', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ joint: 5, pwm: 1650, hold_sec: 1.2 }),
+    body: JSON.stringify({ joint: 2, pwm: 1650, hold_sec: 1.2 }),
   });
   const d = await r.json();
   toast(d.ok ? d.msg : (d.msg || 'Arm jog failed'), d.ok ? 'ok' : 'err');
@@ -1713,9 +1605,6 @@ function updateFlagUI() {
   const stabBtn  = document.getElementById('flag-stab');
   const depthBtn = document.getElementById('flag-depth');
   const yawBtn   = document.getElementById('flag-yaw');
-  const clawBtn  = document.getElementById('flag-claw');
-  const imuOk    = armImuAvailable(_tel);
-  const holdActive = !!_tel.arm_claw_hold_active;
 
   if (stabBtn) {
     stabBtn.textContent = `STAB: ${_ctrlState.stabilize ? 'ON' : 'OFF'}`;
@@ -1728,23 +1617,6 @@ function updateFlagUI() {
   if (yawBtn) {
     yawBtn.textContent = `YAW: ${_ctrlState.yaw_hold ? 'ON' : 'OFF'}`;
     yawBtn.className   = 'ctrl-flag' + (_ctrlState.yaw_hold ? ' active-yaw' : '');
-  }
-  if (clawBtn) {
-    if (!isRobotArmed()) {
-      clawBtn.textContent = 'CLAW: --';
-      clawBtn.className = 'ctrl-flag disabled';
-      clawBtn.title = 'Arm disabled while DISARMED';
-    } else if (!imuOk) {
-      clawBtn.textContent = 'CLAW: N/A';
-      clawBtn.className = 'ctrl-flag disabled';
-      clawBtn.title = 'Arm IMU offline — rotation hold unavailable (readout may still show when linked)';
-    } else {
-      clawBtn.textContent = `CLAW: ${_ctrlState.claw_hold ? 'ON' : 'OFF'}`;
-      clawBtn.className = 'ctrl-flag' + (_ctrlState.claw_hold ? ' active-claw' : '');
-      clawBtn.title = holdActive
-        ? 'Rotation hold ON — IMU holds wrist when stick centered'
-        : 'Rotation hold OFF — IMU readout only; J6 stick control';
-    }
   }
 }
 
@@ -1837,7 +1709,6 @@ function updateStatus() {
     updateMosfetUI(_mosfetOn);
   }
   updateMosfetStatusPill(s);
-  if (typeof s.claw_hold === 'boolean') { _ctrlState.claw_hold = s.claw_hold; updateFlagUI(); }
   if (typeof s.arm_claw_stop_us === 'number') { _configClawStopUs = s.arm_claw_stop_us; }
   if (typeof s.preset_running === 'boolean') {
     _presetRunning = s.preset_running;
@@ -2007,17 +1878,6 @@ function updateTelemetry() {
     stabEl.className = t.stabilize ? 'val-hi' : '';
   }
 
-  // Arm camera IMU overlay readouts
-  const armHasAngle = armImuHasAngle(t);
-  setText('cam-arm-angle', armHasAngle ? fmtNum(t.arm_imu_angle_deg, 1) : '--');
-  setText('cam-arm-target', t.arm_j6_target_deg != null ? fmtNum(t.arm_j6_target_deg, 1) : '--');
-  const imuEl = document.getElementById('cam-arm-imu');
-  if (imuEl) {
-    const imuStatus = armImuStatusText(t);
-    imuEl.textContent = imuStatus.text;
-    imuEl.className = imuStatus.className;
-  }
-
   updateFlagUI();
   updateArmControlsUI();
   updateArmPipelineTelemetry(t);
@@ -2103,7 +1963,6 @@ let _ctrlState = {
   stabilize:    false,
   depth_hold:   false,
   yaw_hold:     false,
-  claw_hold:    false,
   gain_percent: CTRL_CFG.GAIN_DEFAULT,
   seq:          0,
 };
@@ -2692,155 +2551,14 @@ function drawHUD(canvasId, t) {
   ctx.fillText(modeLabels[mode] || mode.toUpperCase(), W * 0.5, H - 42);
 }
 
-function armImuLive(t) {
-  if (!t || !t.arm_imu_ok || t.arm_imu_angle_deg == null) return false;
-  if (t.arm_telemetry_age_sec != null && t.arm_telemetry_age_sec > ARM_IMU_STALE_SEC) {
-    return false;
-  }
-  return true;
-}
-
-function armImuStale(t) {
-  return armImuLive(t) && !!t.arm_imu_stale;
-}
-
-function drawArmGripperHUD(ctx, W, H, t) {
-  const live = armImuLive(t);
-  const stale = armImuStale(t);
-  const angleDeg = live ? Number(t.arm_imu_angle_deg) : 0;
-  const targetDeg = (t && t.arm_j6_target_deg != null) ? Number(t.arm_j6_target_deg) : 0;
-  const cx = W * 0.5;
-  const cy = H * 0.5;
-
-  // ── Center rotation arrow (gripper heading in camera frame) ──
-  const shaftLen = Math.min(W, H) * 0.22;
-  const headLen  = Math.max(12, shaftLen * 0.28);
-  const rotRad   = angleDeg * Math.PI / 180;
-
-  ctx.save();
-  ctx.translate(cx, cy);
-
-  // faint crosshair
-  ctx.strokeStyle = 'rgba(0,212,255,0.12)';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(-shaftLen * 1.15, 0);
-  ctx.lineTo(shaftLen * 1.15, 0);
-  ctx.moveTo(0, -shaftLen * 1.15);
-  ctx.lineTo(0, shaftLen * 1.15);
-  ctx.stroke();
-
-  // target ghost arrow
-  if (live && Number.isFinite(targetDeg)) {
-    ctx.save();
-    ctx.rotate(targetDeg * Math.PI / 180);
-    ctx.strokeStyle = 'rgba(255,179,32,0.55)';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([6, 5]);
-    ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(0, -shaftLen * 0.92);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.restore();
-  }
-
-  // gripper arrow
-  ctx.rotate(rotRad);
-  const color = live
-    ? (stale ? 'rgba(255,179,32,0.95)' : 'rgba(0,224,138,0.95)')
-    : 'rgba(255,179,32,0.85)';
-  ctx.strokeStyle = color;
-  ctx.fillStyle = color;
-  ctx.lineWidth = 3;
-  ctx.lineCap = 'round';
-  ctx.beginPath();
-  ctx.moveTo(0, shaftLen * 0.12);
-  ctx.lineTo(0, -shaftLen);
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.moveTo(0, -shaftLen);
-  ctx.lineTo(-headLen * 0.55, -shaftLen + headLen);
-  ctx.lineTo(headLen * 0.55, -shaftLen + headLen);
-  ctx.closePath();
-  ctx.fill();
-
-  ctx.beginPath();
-  ctx.arc(0, 0, 4, 0, Math.PI * 2);
-  ctx.fillStyle = live ? 'rgba(0,212,255,0.95)' : 'rgba(255,179,32,0.85)';
-  ctx.fill();
-  ctx.restore();
-
-  // ── Bottom compass dial ──
-  const dialR = Math.min(W, H) * 0.11;
-  const dcx = W * 0.5;
-  const dcy = H - dialR - 18;
-
-  ctx.fillStyle = 'rgba(0,0,0,0.55)';
-  ctx.beginPath();
-  ctx.arc(dcx, dcy, dialR + 10, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(0,212,255,0.35)';
-  ctx.lineWidth = 1.5;
-  ctx.stroke();
-
-  for (let deg = 0; deg < 360; deg += 30) {
-    const a = -Math.PI / 2 + deg * Math.PI / 180;
-    const major = deg % 90 === 0;
-    const tick = major ? 8 : 4;
-    ctx.strokeStyle = deg === 0
-      ? 'rgba(0,224,138,0.85)'
-      : (major ? 'rgba(0,212,255,0.55)' : 'rgba(0,212,255,0.25)');
-    ctx.lineWidth = major ? 2 : 1;
-    ctx.beginPath();
-    ctx.moveTo(dcx + (dialR - tick) * Math.cos(a), dcy + (dialR - tick) * Math.sin(a));
-    ctx.lineTo(dcx + dialR * Math.cos(a), dcy + dialR * Math.sin(a));
-    ctx.stroke();
-  }
-
-  ctx.save();
-  ctx.translate(dcx, dcy);
-  ctx.rotate(rotRad);
-  ctx.fillStyle = live ? 'rgba(0,224,138,0.95)' : 'rgba(255,179,32,0.85)';
-  ctx.beginPath();
-  ctx.moveTo(0, -dialR + 4);
-  ctx.lineTo(-7, -dialR + 18);
-  ctx.lineTo(7, -dialR + 18);
-  ctx.closePath();
-  ctx.fill();
-  ctx.restore();
-
-  ctx.font = `bold ${Math.max(9, H * 0.022)}px sans-serif`;
-  drawLegibleText(ctx, 'GRIP', dcx, dcy - dialR - 14, 'rgba(0,212,255,0.85)', 'center');
-
-  const label = live
-    ? `${angleDeg.toFixed(1)}°${stale ? ' ~' : ''}`
-    : 'NO IMU';
-  ctx.font = `bold ${Math.max(10, H * 0.024)}px monospace`;
-  drawLegibleText(
-    ctx, label, dcx, dcy + dialR + 16,
-    live ? (stale ? 'rgba(255,179,32,0.95)' : 'rgba(0,224,138,0.95)') : 'rgba(255,179,32,0.95)', 'center'
-  );
-
-  if (live && Number.isFinite(targetDeg)) {
-    ctx.font = `bold ${Math.max(8, H * 0.02)}px monospace`;
-    drawLegibleText(
-      ctx, `TGT ${targetDeg.toFixed(1)}°`, dcx, dcy + dialR + 32,
-      'rgba(255,179,32,0.9)', 'center'
-    );
-  }
-}
-
-function drawArmHUD(canvasId, t) {
+function drawArmHUD(canvasId) {
   const canvas = document.getElementById(canvasId);
   if (!canvas) return;
   const wrap = canvas.parentElement;
   canvas.width  = wrap.clientWidth;
   canvas.height = wrap.clientHeight;
-
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  drawArmGripperHUD(ctx, canvas.width, canvas.height, t);
 }
 
 function drawArrow(ctx, x1, y1, x2, y2, color, opacity) {
@@ -3203,7 +2921,7 @@ function resizeHUDs() {
     c.height = c.parentElement.clientHeight;
   });
   drawHUD('hud1', _tel);
-  drawArmHUD('hud2', _tel);
+  drawArmHUD('hud2');
 }
 
 let _hudLoop = null;
@@ -3211,7 +2929,7 @@ function startHUDLoop() {
   if (_hudLoop) return;
   _hudLoop = setInterval(() => {
     drawHUD('hud1', _tel);
-    drawArmHUD('hud2', _tel);
+    drawArmHUD('hud2');
   }, 100);
 }
 

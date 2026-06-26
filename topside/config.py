@@ -34,10 +34,7 @@ DEFAULT_CONFIG = {
     "arm_control_port": 5009,
     "mosfet_enabled": True,
     "arm_telemetry_port": 5008,
-    "arm_imu_sign": -1.0,
-    "arm_imu_zero_offset": -154.0,
     "arm_claw_stop_us": 1515,
-    "claw_hold": False,
     "colmap_command": "python3 colmap_run.py",
     "crabs_command": "python3 crabs.py",
     "mavproxy_bin": "/home/uruc/mav_env/bin/mavproxy.py",
@@ -47,7 +44,7 @@ DEFAULT_CONFIG = {
     "mavproxy_out2": MAVPROXY_ONBOARD_OUT,
     "mavproxy_out3": MAVPROXY_ARM_ONBOARD_OUT,
     "arm_presets": {
-        k: {"label": v["label"], "pwm": list(v["pwm"]), "j6_angle": float(v["j6_angle"])}
+        k: {"label": v["label"], "pwm": list(v["pwm"])}
         for k, v in DEFAULT_ARM_PRESETS.items()
     },
 }
@@ -87,8 +84,7 @@ def normalize_preset_entry(raw) -> dict | None:
             return None
         try:
             pwms = [clamp_arm_pwm(x) for x in parts[:7]]
-            angle = float(parts[7]) if len(parts) >= 8 else 0.0
-            return {"label": "Preset", "pwm": pwms, "j6_angle": angle}
+            return {"label": "Preset", "pwm": pwms}
         except (TypeError, ValueError):
             return None
     if not isinstance(raw, dict):
@@ -98,11 +94,10 @@ def normalize_preset_entry(raw) -> dict | None:
         return None
     try:
         pwms = [clamp_arm_pwm(x) for x in pwm_in[:7]]
-        angle = float(raw.get("j6_angle", 0.0))
     except (TypeError, ValueError):
         return None
     label = str(raw.get("label") or raw.get("name") or "Preset").strip() or "Preset"
-    return {"label": label, "pwm": pwms, "j6_angle": angle}
+    return {"label": label, "pwm": pwms}
 
 
 def normalize_arm_presets() -> None:
@@ -118,7 +113,7 @@ def normalize_arm_presets() -> None:
                 cleaned[slug] = norm
     if not cleaned:
         cleaned = {
-            k: {"label": v["label"], "pwm": list(v["pwm"]), "j6_angle": float(v["j6_angle"])}
+            k: {"label": v["label"], "pwm": list(v["pwm"])}
             for k, v in DEFAULT_ARM_PRESETS.items()
         }
     config["arm_presets"] = cleaned

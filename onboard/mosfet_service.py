@@ -32,8 +32,8 @@ ARM_CONTROL_PORT = 5009
 
 # Legacy: topside used to send manual AUX / preset JSON to the MOSFET port (5007).
 _ARM_FORWARD_CMDS = frozenset({
-    "manual_pwm", "preset_motion", "preset_step", "claw_hold",
-    "arm_imu_cal", "arm_claw_stop", "arm_imu_zero", "arm_enable", "arm_telemetry",
+    "manual_pwm", "preset_motion", "preset_step",
+    "arm_claw_stop", "arm_enable", "arm_telemetry",
 })
 
 

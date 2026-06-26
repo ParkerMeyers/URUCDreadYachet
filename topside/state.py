@@ -60,7 +60,6 @@ STATE: dict = {
     "manual_pwm_enabled": False,
     "manual_aux_pwm": list(manual_aux_defaults()),
     "manual_thr_pwm": list(manual_thr_defaults()),
-    "claw_hold": bool(config.get("claw_hold", False)),
     "telemetry": {
         "rx_state": "NO_TELEMETRY",
         "gain_percent": 100,
@@ -77,10 +76,9 @@ STATE: dict = {
         "mavlink_link_dead": False, "mavlink_last_rx_age_sec": None,
         "attitude_age_sec": None,
         "depth_recapture_pending": False, "yaw_recapture_pending": False,
-        "arm_imu_ok": False, "arm_bno_ready": False, "arm_imu_stale": False,
-        "arm_imu_angle_deg": None, "arm_j6_target_deg": None, "arm_j6_pwm_out": None,
-        "arm_claw_hold_request": False, "arm_claw_hold_active": False,
-        "arm_j6_manual": True,
+        "arm_hold_neutral": None, "arm_rx_count": None, "arm_enabled": None,
+        "arm_mavlink_ok": None, "arm_joint_us": None,
+        "arm_manual_mode": None, "arm_preset_motion": None,
     },
     "logs": {
         "thrust": [], "arm": [], "onboard_stab": [], "onboard_arm": [],

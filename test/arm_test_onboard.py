@@ -5,7 +5,7 @@ Arm joint test — ONBOARD  (runs on the Raspberry Pi)
 Listens for joint/PWM commands from the topside test script over UDP,
 then forwards them to the Pix6 via MAVLink RC_CHANNELS_OVERRIDE.
 
-Command numbers are joint indices 1-7 (J1..J6, Claw) — same as rov_ui /
+Command numbers are joint indices 1-4 (J1, J2, J3, Claw) — same as rov_ui /
 new_ar.py, not raw AUX port numbers.
 
 DIAGNOSTIC mode: reads back SERVO_OUTPUT_RAW (servo9-servo16) from
@@ -48,27 +48,23 @@ OVERRIDE_HZ   = 20
 DIAG_INTERVAL = 2.0   # seconds between diagnostic prints
 SPARE_RC_CH   = 16    # AUX8 — always centered
 
-NUM_JOINTS = 7
+NUM_JOINTS = 4
 
 JOINT_NAMES = {
     1: "J1",
     2: "J2",
     3: "J3",
-    4: "J4",
-    5: "J5",
-    6: "J6",
-    7: "Claw",
+    4: "Claw",
 }
 
-# Joint index → Pix6 AUX port (matches onboard/new_ar.py JOINT_TO_AUX)
-JOINT_TO_AUX = {1: 4, 2: 2, 3: 5, 4: 6, 5: 1, 6: 3, 7: 7}
+JOINT_TO_AUX = {1: 4, 2: 1, 3: 3, 4: 7}
 
 IGNORE = 65535
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def joint_center_us(joint: int) -> int:
-    return CLAW_CENTER_US if joint == 7 else CENTER_US
+    return CLAW_CENTER_US if joint == 4 else CENTER_US
 
 
 def joint_to_rc_ch(joint: int) -> int:
@@ -112,7 +108,7 @@ def main():
     sock.setblocking(False)
 
     print(f"[arm-onboard] Listening for commands on UDP port {LISTEN_PORT}")
-    print("[arm-onboard] Joint numbers 1-7 (J1..J6, Claw) — see topside map")
+    print("[arm-onboard] Joint numbers 1-4 (J1, J2, J3, Claw) — see topside map")
     print("[arm-onboard] All joints → center PWM")
     print("[arm-onboard] ── DIAGNOSTIC OUTPUT every 2 s ────────────────────────────")
     print("[arm-onboard]   RC_CHANNELS ch9-16 = what FC thinks AUX RC inputs are")
