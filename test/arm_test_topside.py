@@ -10,22 +10,21 @@ Usage:
     python test/arm_test_topside.py --ip 192.168.69.100
 
 Commands at the prompt:
-    1 1600      set AUX1 (J1) to 1600 µs
-    1 1500      set AUX1 (J1) back to center
-    3 800       set AUX3 (J3) to 800 µs
-    center      all joints → 1500 µs  (also: c)
+    1 1600      set J1 to 1600 µs  (AUX4)
+    1 1500      set J1 back to center
+    6 1600      set J6 to 1600 µs  (AUX3, continuous rotation)
+    center      all joints → center PWM  (also: c)
     status      print current PWM state  (also: s)
     q           center all then exit
 
-Joint map (AUX1-8 → Pix6 AUX outputs, RC channels 9-16):
-    1  J5         (AUX1 → RC ch 9  → SERVO9)
+Joint map (type joint number 1-7 — matches rov_ui / new_ar.py):
+    1  J1         (AUX4 → RC ch 12 → SERVO12)
     2  J2         (AUX2 → RC ch 10 → SERVO10)
-    3  J6_cont    (AUX3 → RC ch 11 → SERVO11)  continuous rotation, center 1500
-    4  J1         (AUX4 → RC ch 12 → SERVO12)
-    5  J3         (AUX5 → RC ch 13 → SERVO13)
-    6  J4         (AUX6 → RC ch 14 → SERVO14)
+    3  J3         (AUX5 → RC ch 13 → SERVO13)
+    4  J4         (AUX6 → RC ch 14 → SERVO14)
+    5  J5         (AUX1 → RC ch  9 → SERVO9)
+    6  J6         (AUX3 → RC ch 11 → SERVO11)  continuous rotation, center 1500
     7  Claw       (AUX7 → RC ch 15 → SERVO15)  continuous rotation, center 1515
-    8  spare      (AUX8 → RC ch 16 → SERVO16)  unused
 
 Mission Planner parameters required (set once, write params):
     SERVO9_FUNCTION  = 1   SERVO10_FUNCTION = 1   SERVO11_FUNCTION = 1
@@ -43,21 +42,28 @@ import sys
 DEFAULT_PI_IP = "192.168.69.100"
 TEST_PORT     = 5011          # Must match arm_test_onboard.py
 CENTER_US     = 1500
+CLAW_CENTER_US = 1515
 MIN_US        = 500
 MAX_US        = 2500
-AUX_CHANNELS  = 8
+NUM_JOINTS    = 7
 # ─────────────────────────────────────────────────────────────────────────────
 
 JOINT_NAMES = {
-    1: "J5",          # AUX1 → RC ch 9
-    2: "J2",          # AUX2 → RC ch 10
-    3: "J6_cont",     # AUX3 → RC ch 11  (continuous rotation, center 1500)
-    4: "J1",          # AUX4 → RC ch 12
-    5: "J3",          # AUX5 → RC ch 13
-    6: "J4",          # AUX6 → RC ch 14
-    7: "Claw",        # AUX7 → RC ch 15  (continuous rotation, center 1515)
-    8: "spare",       # AUX8 → RC ch 16  (unused)
+    1: "J1",
+    2: "J2",
+    3: "J3",
+    4: "J4",
+    5: "J5",
+    6: "J6",
+    7: "Claw",
 }
+
+# Joint index → Pix6 AUX port (matches onboard/new_ar.py JOINT_TO_AUX)
+JOINT_TO_AUX = {1: 4, 2: 2, 3: 5, 4: 6, 5: 1, 6: 3, 7: 7}
+
+
+def joint_center_us(joint: int) -> int:
+    return CLAW_CENTER_US if joint == 7 else CENTER_US
 
 
 def clamp(x, lo, hi):
@@ -70,8 +76,8 @@ def send(sock, addr, payload):
 
 def print_state(current):
     cols = "  ".join(
-        f"AUX{aux}({JOINT_NAMES[aux]})={current[aux]}"
-        for aux in sorted(current)
+        f"{JOINT_NAMES[j]}(AUX{JOINT_TO_AUX[j]})={current[j]}"
+        for j in sorted(current)
     )
     print(f"  State: {cols}")
 
@@ -90,13 +96,15 @@ def main():
     print(f"Arm joint test — sending to {args.ip}:{args.port}")
     print("Make sure arm_test_onboard.py is running on the Pi first.\n")
     print("Joint map:")
-    for aux, name in JOINT_NAMES.items():
+    for joint, name in JOINT_NAMES.items():
+        aux = JOINT_TO_AUX[joint]
         rc_ch = aux + 8
-        print(f"  {aux}  {name:<6}  AUX{aux} → RC ch {rc_ch} → SERVO{rc_ch}")
-    print(f"\nPWM range: {MIN_US}–{MAX_US} µs   center = {CENTER_US}")
-    print("Commands:  <joint 1-8> <pwm>  |  center (c)  |  status (s)  |  q\n")
+        ctr = joint_center_us(joint)
+        print(f"  {joint}  {name:<6}  AUX{aux} → RC ch {rc_ch} → SERVO{rc_ch}  (center {ctr})")
+    print(f"\nPWM range: {MIN_US}–{MAX_US} µs")
+    print("Commands:  <joint 1-7> <pwm>  |  center (c)  |  status (s)  |  q\n")
 
-    current = {aux: CENTER_US for aux in range(1, AUX_CHANNELS + 1)}
+    current = {j: joint_center_us(j) for j in range(1, NUM_JOINTS + 1)}
 
     try:
         while True:
@@ -112,10 +120,10 @@ def main():
                 break
 
             if line in ("c", "center"):
-                for aux in current:
-                    current[aux] = CENTER_US
+                for joint in current:
+                    current[joint] = joint_center_us(joint)
                 send(sock, pi, {"center_all": True})
-                print("  → All joints → 1500 µs")
+                print("  → All joints centered")
                 print_state(current)
                 continue
 
@@ -126,14 +134,14 @@ def main():
             parts = line.split()
             if len(parts) == 2:
                 try:
-                    aux = int(parts[0])
-                    us  = int(parts[1])
+                    joint = int(parts[0])
+                    us    = int(parts[1])
                 except ValueError:
-                    print(f"  Bad input — expected: <joint 1-{AUX_CHANNELS}> <pwm {MIN_US}-{MAX_US}>")
+                    print(f"  Bad input — expected: <joint 1-{NUM_JOINTS}> <pwm {MIN_US}-{MAX_US}>")
                     continue
 
-                if not (1 <= aux <= AUX_CHANNELS):
-                    print(f"  Joint must be 1-{AUX_CHANNELS}")
+                if not (1 <= joint <= NUM_JOINTS):
+                    print(f"  Joint must be 1-{NUM_JOINTS}")
                     continue
 
                 clamped = clamp(us, MIN_US, MAX_US)
@@ -141,14 +149,15 @@ def main():
                     print(f"  (PWM clamped to {clamped})")
                 us = clamped
 
-                current[aux] = us
-                send(sock, pi, {"joint": aux, "pwm": us})
-                name   = JOINT_NAMES[aux]
-                rc_ch  = aux + 8
-                print(f"  → AUX{aux} ({name}) = {us} µs  [RC ch {rc_ch}]")
+                current[joint] = us
+                send(sock, pi, {"joint": joint, "pwm": us})
+                name  = JOINT_NAMES[joint]
+                aux   = JOINT_TO_AUX[joint]
+                rc_ch = aux + 8
+                print(f"  → {name} (AUX{aux}) = {us} µs  [RC ch {rc_ch}]")
                 print_state(current)
             else:
-                print(f"  Usage:  <joint 1-{AUX_CHANNELS}> <pwm>   e.g.  1 1600")
+                print(f"  Usage:  <joint 1-{NUM_JOINTS}> <pwm>   e.g.  1 1600")
 
     except KeyboardInterrupt:
         pass
