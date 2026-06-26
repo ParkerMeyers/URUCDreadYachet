@@ -12,14 +12,10 @@ DIAGNOSTIC mode: reads back SERVO_OUTPUT_RAW (servo9-servo16) from
 the FC every 2 s so you can see exactly where the pipeline is stalling.
 
 Setup in Mission Planner first:
-    SERVO9_FUNCTION  = 1  (RCPassThru)  ← AUX1
-    SERVO10_FUNCTION = 1  (RCPassThru)  ← AUX2
-    SERVO11_FUNCTION = 1  (RCPassThru)  ← AUX3
-    SERVO12_FUNCTION = 1  (RCPassThru)  ← AUX4
-    SERVO13_FUNCTION = 1  (RCPassThru)  ← AUX5
-    SERVO14_FUNCTION = 1  (RCPassThru)  ← AUX6
-    SERVO15_FUNCTION = 1  (RCPassThru)  ← AUX7
-    SERVO16_FUNCTION = 1  (RCPassThru)  ← AUX8
+    SERVO9_FUNCTION  = 59   (RCPassThru9  → J2 / AUX1)
+    SERVO11_FUNCTION = 61   (RCPassThru11 → J3 / AUX3)
+    SERVO12_FUNCTION = 62   (RCPassThru12 → J1 / AUX4)
+    SERVO15_FUNCTION = 65   (RCPassThru15 → Claw / AUX7)
     BRD_SAFETYENABLE = 0
 
 Start MAVProxy first, then run this script:
@@ -33,15 +29,17 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "onboard"))
-from mavlink_rc import MAVLINK_ONBOARD, connect_mavlink, send_rc_channels_override
+from mavlink_rc import MAVLINK_ONBOARD_ARM, connect_mavlink, send_rc_channels_override
 
 from pymavlink import mavutil
 
 # ── Config ────────────────────────────────────────────────────────────────────
 LISTEN_PORT   = 5011
-MAVLINK_URL   = MAVLINK_ONBOARD
+MAVLINK_URL   = MAVLINK_ONBOARD_ARM
 CENTER_US     = 1500
-CLAW_CENTER_US = 1515
+CLAW_CENTER_US = 1425
+CLAW_MIN_US = 1325
+CLAW_MAX_US = 1525
 MIN_US        = 500
 MAX_US        = 2500
 OVERRIDE_HZ   = 20

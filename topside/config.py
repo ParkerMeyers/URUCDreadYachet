@@ -30,11 +30,9 @@ DEFAULT_CONFIG = {
     "thrust_udp_port": 5005,
     "telemetry_port": 5006,
     "arm_udp_port": 5006,
-    "mosfet_control_port": 5007,
     "arm_control_port": 5009,
-    "mosfet_enabled": True,
     "arm_telemetry_port": 5008,
-    "arm_claw_stop_us": 1515,
+    "arm_claw_stop_us": 1425,
     "colmap_command": "python3 colmap_run.py",
     "crabs_command": "python3 crabs.py",
     "mavproxy_bin": "/home/uruc/mav_env/bin/mavproxy.py",
@@ -76,14 +74,14 @@ def slug_preset_name(name: str) -> str:
 
 
 def normalize_preset_entry(raw) -> dict | None:
-    from topside.util import clamp_arm_pwm
+    from topside.util import clamp_arm_pwm_list
 
     if isinstance(raw, str):
         parts = raw.replace("PWM:", "").split(",")
         if len(parts) < 7:
             return None
         try:
-            pwms = [clamp_arm_pwm(x) for x in parts[:7]]
+            pwms = clamp_arm_pwm_list(parts)
             return {"label": "Preset", "pwm": pwms}
         except (TypeError, ValueError):
             return None
@@ -93,7 +91,7 @@ def normalize_preset_entry(raw) -> dict | None:
     if not isinstance(pwm_in, (list, tuple)) or len(pwm_in) < 7:
         return None
     try:
-        pwms = [clamp_arm_pwm(x) for x in pwm_in[:7]]
+        pwms = clamp_arm_pwm_list(list(pwm_in))
     except (TypeError, ValueError):
         return None
     label = str(raw.get("label") or raw.get("name") or "Preset").strip() or "Preset"
@@ -132,10 +130,6 @@ def normalize_onboard_config() -> None:
         config["arm_udp_port"] = 5006
     if config["arm_control_port"] == config["arm_udp_port"]:
         config["arm_control_port"] = 5009
-    try:
-        config["mosfet_control_port"] = int(config.get("mosfet_control_port", 5007))
-    except (TypeError, ValueError):
-        config["mosfet_control_port"] = 5007
     out2 = str(config.get("mavproxy_out2", "")).strip()
     if "tcpin" not in out2.lower() or str(MAVPROXY_TCP_PORT) not in out2:
         config["mavproxy_out2"] = MAVPROXY_ONBOARD_OUT

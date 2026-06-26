@@ -62,8 +62,6 @@
         <input id="cfg-telemetry_port" type="text" value="5006"/></div>
       <div class="field"><label>Arm UDP Port (→ Pi)</label>
         <input id="cfg-arm_udp_port" type="text" value="5006"/></div>
-      <div class="field"><label>MOSFET Control Port</label>
-        <input id="cfg-mosfet_control_port" type="text" value="5007"/></div>
       <div class="field"><label>Arm Control Port (JSON → Pi)</label>
         <input id="cfg-arm_control_port" type="text" value="5009"/></div>
     </div>
@@ -97,12 +95,10 @@
     <!-- Onboard panel -->
     <div class="panel">
       <h2>🔵 Onboard Programs <small style="font-size:.7rem;color:var(--dim)">(Pi)</small></h2>
-      <p class="panel-desc">Launches MAVProxy, <code>mosfet_service.py</code> (servo power),
-        <code>stabilization.py</code> (thruster control), and
+      <p class="panel-desc">Launches MAVProxy, <code>stabilization.py</code> (thruster control), and
         <code>new_ar.py</code> (arm) on the ROV Pi via SSH.</p>
       <div class="program-status">
         <div class="prog-row"><div class="dot" id="dot-mavproxy"></div><span>mavproxy (UDP bridge)</span></div>
-        <div class="prog-row"><div class="dot" id="dot-mosfet"></div><span>mosfet_service.py</span></div>
         <div class="prog-row"><div class="dot" id="dot-stab"></div><span>stabilization.py</span></div>
         <div class="prog-row"><div class="dot" id="dot-arm"></div><span>new_ar.py</span></div>
         <div class="prog-row"><div class="dot" id="dot-cam"></div><span>camera_stream.py</span></div>
@@ -147,7 +143,6 @@
     <ul class="checklist" id="checklist-items">
       <li id="chk-ssh"><span class="chk-icon">○</span> SSH connected to Pi</li>
       <li id="chk-mavproxy"><span class="chk-icon">○</span> MAVProxy / Pixhawk link</li>
-      <li id="chk-mosfet"><span class="chk-icon">○</span> mosfet_service.py running</li>
       <li id="chk-stab"><span class="chk-icon">○</span> stabilization.py running</li>
       <li id="chk-arm-onboard"><span class="chk-icon">○</span> new_ar.py running</li>
       <li id="chk-cam"><span class="chk-icon">○</span> camera_stream.py running</li>
@@ -183,9 +178,6 @@
     </span>
     <span id="pill-mode" class="status-pill">
       <span class="status-dot"></span> Mode: --
-    </span>
-    <span id="pill-mosfet" class="status-pill" title="MOSFET service + servo power rail">
-      <span class="status-dot"></span> MOSFET: --
     </span>
     <span id="pill-gamepad" class="status-pill err">
       <span class="status-dot"></span> GP: NONE
@@ -254,16 +246,6 @@
 
   <!-- Control bar -->
   <div class="controlbar">
-
-    <div id="mosfet-section">
-    <span class="control-label">Power</span>
-    <div class="mosfet-toggle" id="mosfet-toggle" onclick="toggleMosfet()">
-      <div class="mosfet-indicator"></div>
-      <span id="mosfet-label">MOSFET OFF</span>
-    </div>
-
-    <div class="ctrl-sep"></div>
-    </div>
 
     <span class="control-label">Mode</span>
     <button class="mode-btn active-disarmed" id="mode-disarmed"
@@ -408,10 +390,6 @@
       <span class="tc-val" id="tel-cmd-v">--</span>
     </div>
     <div class="telem-cell">
-      <span class="tc-label">MOSFET</span>
-      <span class="tc-val" id="tel-mosfet">--</span>
-    </div>
-    <div class="telem-cell">
       <span class="tc-label">Arm →Pi</span>
       <span class="tc-val" id="tel-arm-proc">--</span>
     </div>
@@ -433,7 +411,6 @@
     PROCESS LOGS
       <div class="log-tabs">
       <div class="log-tab active" onclick="switchLog('arm')" id="lt-arm">Arm Sender</div>
-      <div class="log-tab" onclick="switchLog('onboard_mosfet')" id="lt-mosfet">MOSFET</div>
       <div class="log-tab" onclick="switchLog('onboard_stab')" id="lt-stab">Onboard Stab</div>
       <div class="log-tab" onclick="switchLog('onboard_arm')" id="lt-arm2">Onboard Arm</div>
       <div class="log-tab" onclick="switchLog('onboard_cam')" id="lt-cam">Cameras</div>
@@ -521,14 +498,6 @@
         </table>
       </div>
 
-      <div class="kb-section">
-        <h3>MOSFET Toggle</h3>
-        <table class="kb-table">
-          <tr><td>MOSFET OFF</td><td>Physical power cut to servos / accessories. Does NOT disarm thrusters.</td></tr>
-          <tr><td>MOSFET ON</td><td>Power enabled. Set mode to ARMED or STABILIZE to move thrusters.</td></tr>
-        </table>
-      </div>
-
     </div>
   </div>
 </div>
@@ -598,9 +567,9 @@
     </div>
     <div class="modal-body">
       <p class="manual-pwm-desc">
-        Direct PWM to Pix6 outputs. Arm AUX1–7 (500–2500 µs) and thrusters M1–8
-        (1100–1900 µs). When enabled, overrides gamepad mixer and
-        <code>arm_sender.py</code> UDP commands.
+        Direct PWM to Pix6 arm outputs (J1, J2, J3, Claw) and thrusters M1–8.
+        Joints: 500–2500 µs. Claw: 1325–1525 µs (stop 1425). Thrusters: 1100–1900 µs.
+        When enabled, overrides gamepad mixer and <code>arm_sender.py</code>.
       </p>
       <div class="manual-pwm-toggle-row">
         <button class="btn btn-danger" id="btn-manual-pwm-off" onclick="setManualPwmEnabled(false)">Manual OFF</button>
@@ -609,7 +578,7 @@
       </div>
       <div class="manual-pwm-cmd-row">
         <label for="manual-pwm-input">Command</label>
-        <input id="manual-pwm-input" type="text" placeholder="claw 1510  |  J1 1500  |  M3 1600  |  flh 1600"
+        <input id="manual-pwm-input" type="text" placeholder="claw 1425  |  J1 1500  |  M3 1600  |  flh 1600"
                onkeydown="if(event.key==='Enter')sendManualPwmLine()"/>
         <button class="btn btn-primary" onclick="sendManualPwmLine()">Send</button>
         <button class="btn btn-secondary" onclick="centerManualPwm()">Center all</button>
@@ -617,8 +586,9 @@
       </div>
       <div class="manual-pwm-grid" id="manual-pwm-grid"></div>
       <p class="manual-pwm-hint">
-        Arm: <strong>claw 1510</strong>, <strong>J1 1500</strong>, or <strong>4 1500</strong> (AUX4).
-        Thrusters: <strong>M3 1600</strong> or <strong>flh 1600</strong> (motor names: flh, blh, flv, frv, frh, brh, brv, blv).
+        Arm: <strong>J1 1500</strong>, <strong>J2 1500</strong>, <strong>J3 1500</strong>,
+        <strong>claw 1425</strong> (stop; 1325–1525). Joint numbers 1–4 also work
+        (<strong>1 1600</strong> = J1). Thrusters: <strong>M3 1600</strong> or <strong>flh 1600</strong>.
         Tune claw until no drift, then <strong>Save claw stop</strong>.
       </p>
     </div>

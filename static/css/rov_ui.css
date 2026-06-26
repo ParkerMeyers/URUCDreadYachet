@@ -365,35 +365,13 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 .ctrl-flag.disabled:hover,
 .ctrl-flag:disabled:hover { border-color:var(--border); }
 
-.mosfet-toggle.hidden,
 .hidden { display: none !important; }
-.mosfet-toggle.disabled {
-  opacity: 0.38;
-  cursor: not-allowed;
-  pointer-events: none;
-}
 .action-btn.disabled,
 .action-btn:disabled {
   opacity: 0.38;
   cursor: not-allowed;
   pointer-events: none;
 }
-.mosfet-toggle {
-  display:flex; align-items:center; gap:8px;
-  padding:5px 12px; border-radius:6px;
-  border:1px solid var(--border); background:var(--bg3);
-  cursor:pointer; transition:all .2s;
-}
-.mosfet-toggle.on { border-color:var(--green); background:rgba(0,224,138,.1); }
-.mosfet-toggle .mosfet-indicator {
-  width:10px; height:10px; border-radius:50%;
-  background:var(--dim); transition:background .2s;
-}
-.mosfet-toggle.on .mosfet-indicator {
-  background:var(--green); box-shadow:0 0 8px var(--green);
-}
-.mosfet-toggle span { font-size:0.78rem; font-weight:600; color:var(--dim); }
-.mosfet-toggle.on span { color:var(--green); }
 
 .action-btn {
   padding:6px 14px; border-radius:6px; border:1px solid var(--border2);

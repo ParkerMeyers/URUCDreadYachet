@@ -1,6 +1,6 @@
 {
   "arm_camera_url": "http://192.168.69.100:8160",
-  "arm_claw_stop_us": 1515,
+  "arm_claw_stop_us": 1425,
   "arm_control_port": 5009,
   "arm_presets": {
     "sample": {
@@ -12,7 +12,7 @@
         1500,
         1450,
         1500,
-        1515
+        1525
       ]
     },
     "stow": {
@@ -24,7 +24,7 @@
         1500,
         1500,
         1500,
-        1515
+        1425
       ]
     }
   },
@@ -41,8 +41,6 @@
   "mavproxy_out2": "tcpin:127.0.0.1:5762",
   "mavproxy_out3": "tcpin:127.0.0.1:5763",
   "mavproxy_serial": "/dev/ttyACM0",
-  "mosfet_control_port": 5007,
-  "mosfet_enabled": true,
   "pi_ip": "192.168.69.100",
   "pi_password": "yahboom",
   "pi_rov_path": "/home/uruc/URUCDreadYachet",

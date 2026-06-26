@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from topside.config import ROV_ROOT, config
-from topside.constants import MAX_LOG_LINES, NEUTRAL_THR_PWM
+from topside.constants import CLAW_STOP_US_DEFAULT, MAX_LOG_LINES, NEUTRAL_THR_PWM
 
 LOGS_DIR = ROV_ROOT / "logs"
 VIDEO_DIR = LOGS_DIR / "videos"
@@ -17,7 +17,7 @@ _telemetry_rate_counter = {"count": 0, "window_start": time.time()}
 
 
 def manual_aux_defaults() -> list[int]:
-    claw_stop = int(config.get("arm_claw_stop_us", 1515))
+    claw_stop = int(config.get("arm_claw_stop_us", CLAW_STOP_US_DEFAULT))
     return [1500, 1500, 1500, 1500, 1500, 1500, claw_stop]
 
 
@@ -32,11 +32,9 @@ STATE: dict = {
     "onboard_arm": False,
     "onboard_cam": False,
     "onboard_mavproxy": False,
-    "onboard_mosfet": False,
     "ssh_connected": False,
     "ssh_error": "",
     "mode": "disarmed",
-    "mosfet_on": False,
     "last_telemetry_time": 0.0,
     "last_arm_telemetry_time": 0.0,
     "telemetry_packets": 0,

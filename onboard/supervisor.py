@@ -24,12 +24,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 SERVICES: dict[str, dict] = {
-    "mosfet": {
-        "script": "onboard/mosfet_service.py",
-        "log": "/tmp/rov_mosfet.log",
-        "pidfile": "/tmp/rov_mosfet.pid",
-        "ready_re": r"\[mosfet-svc\] Listening on UDP",
-    },
     "stab": {
         "script": "onboard/stabilization.py",
         "log": "/tmp/rov_stab.log",
@@ -199,6 +193,20 @@ def cmd_start(name: str, extra_args: str = "") -> dict:
     return {"ok": True, "name": name, "pid": pid}
 
 
+def cmd_start_all(extra_args: str = "") -> dict:
+    """Start onboard services in dependency order (stab → arm → cam)."""
+    order = ("stab", "arm", "cam")
+    started = []
+    for name in order:
+        result = cmd_start(name, extra_args if name == "cam" else "")
+        started.append(result)
+        if name == "stab":
+            time.sleep(1.0)
+        elif name == "arm":
+            time.sleep(0.5)
+    return {"ok": True, "started": started}
+
+
 def cmd_stop(name: str) -> dict:
     _stop_service(SERVICES[name])
     return {"ok": True, "name": name}
@@ -248,7 +256,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_start = sub.add_parser("start")
-    p_start.add_argument("name", choices=SERVICES.keys())
+    p_start.add_argument("name", choices=[*SERVICES.keys(), "all"])
     p_start.add_argument("--extra-args", default="")
 
     p_stop = sub.add_parser("stop")
@@ -263,7 +271,11 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.cmd == "start":
-        result = cmd_start(args.name, args.extra_args)
+        result = (
+            cmd_start_all(args.extra_args)
+            if args.name == "all"
+            else cmd_start(args.name, args.extra_args)
+        )
     elif args.cmd == "stop":
         result = cmd_stop_all() if args.name == "all" else cmd_stop(args.name)
     elif args.cmd == "wait":

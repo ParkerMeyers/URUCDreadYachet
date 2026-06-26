@@ -9,9 +9,6 @@ UDP_THRUST = 5005
 UDP_ARM_CSV = 5006
 UDP_TELEMETRY = 5006
 
-# Pi MOSFET service
-UDP_MOSFET = 5007
-
 # Pi arm JSON control (web UI presets, manual AUX)
 UDP_ARM_CONTROL = 5009
 

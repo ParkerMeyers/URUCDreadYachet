@@ -1,1 +1,1 @@
-"""Segment package — thrust, arm, mosfet, camera, vision."""
+"""Segment package — thrust, arm, camera, vision."""

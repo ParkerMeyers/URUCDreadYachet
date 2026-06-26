@@ -21,12 +21,13 @@ Joint map (type joint number 1-4 — matches rov_ui / new_ar.py):
     1  J1         (AUX4 → RC ch 12)
     2  J2         (AUX1 → RC ch  9)
     3  J3         (AUX3 → RC ch 11)
-    4  Claw       (AUX7 → RC ch 15)  continuous rotation, center 1515
+    4  Claw       (AUX7 → RC ch 15)  continuous rotation, stop 1425 (1325–1525)
 
 Mission Planner parameters required (set once, write params):
-    SERVO9_FUNCTION  = 1   SERVO10_FUNCTION = 1   SERVO11_FUNCTION = 1
-    SERVO12_FUNCTION = 1   SERVO13_FUNCTION = 1   SERVO14_FUNCTION = 1
-    SERVO15_FUNCTION = 1   SERVO16_FUNCTION = 1
+    SERVO9_FUNCTION  = 59   (RCPassThru9  → J2 / AUX1)
+    SERVO11_FUNCTION = 61   (RCPassThru11 → J3 / AUX3)
+    SERVO12_FUNCTION = 62   (RCPassThru12 → J1 / AUX4)
+    SERVO15_FUNCTION = 65   (RCPassThru15 → Claw / AUX7)
     BRD_SAFETYENABLE = 0
 """
 
@@ -39,7 +40,9 @@ import sys
 DEFAULT_PI_IP = "192.168.69.100"
 TEST_PORT     = 5011          # Must match arm_test_onboard.py
 CENTER_US     = 1500
-CLAW_CENTER_US = 1515
+CLAW_CENTER_US = 1425
+CLAW_MIN_US = 1325
+CLAW_MAX_US = 1525
 MIN_US        = 500
 MAX_US        = 2500
 NUM_JOINTS    = 4
@@ -95,7 +98,7 @@ def main():
         ctr = joint_center_us(joint)
         print(f"  {joint}  {name:<6}  AUX{aux} → RC ch {rc_ch} → SERVO{rc_ch}  (center {ctr})")
     print(f"\nPWM range: {MIN_US}–{MAX_US} µs")
-    print("Commands:  <joint 1-7> <pwm>  |  center (c)  |  status (s)  |  q\n")
+    print("Commands:  <joint 1-4> <pwm>  |  center (c)  |  status (s)  |  q\n")
 
     current = {j: joint_center_us(j) for j in range(1, NUM_JOINTS + 1)}
 

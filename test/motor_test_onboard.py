@@ -37,14 +37,14 @@ DIAG_INTERVAL = 2.0   # seconds between diagnostic prints
 # ─────────────────────────────────────────────────────────────────────────────
 
 MOTOR_NAMES = {
-    1: "front_left_h",
-    2: "back_left_h",
-    3: "front_left_v",
-    4: "front_right_v",
-    5: "front_right_h",
-    6: "back_right_h",
-    7: "back_right_v",
-    8: "back_left_v",
+    1: "front_right_h",
+    2: "back_right_v",
+    3: "back_right_h",
+    4: "back_left_v",
+    5: "front_right_v",
+    6: "front_left_h",
+    7: "front_left_v",
+    8: "back_left_h",
 }
 
 

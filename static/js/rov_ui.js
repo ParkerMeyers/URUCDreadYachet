@@ -4,13 +4,12 @@
 let _tel    = {};
 let _status = {};
 let _currentLog  = 'arm';
-const _logs = { thrust: [], arm: [], onboard_mosfet: [], onboard_stab: [], onboard_arm: [], onboard_cam: [], colmap: [], crabs: [] };
+const _logs = { thrust: [], arm: [], onboard_stab: [], onboard_arm: [], onboard_cam: [], colmap: [], crabs: [] };
 let _onboardPollTimer = null;
 const _onboardProgressSeen = new Set();
 const _dotStarting = {};
 const ONBOARD_DOT_BY_STEP = {
   mavproxy: 'dot-mavproxy',
-  mosfet: 'dot-mosfet',
   stabilization: 'dot-stab',
   arm_ctrl: 'dot-arm',
   camera: 'dot-cam',
@@ -132,7 +131,6 @@ function startOnboardPoll() {
         if (_onboardPollTimer) _onboardPollTimer._lastCount = d.events.length;
       }
       if (d.onboard_mavproxy) setDot('dot-mavproxy', true);
-      if (d.onboard_mosfet)   setDot('dot-mosfet', true);
       if (d.onboard_stab)     setDot('dot-stab', true);
       if (d.onboard_arm)      setDot('dot-arm', true);
       if (d.onboard_cam)      setDot('dot-cam', true);
@@ -160,7 +158,7 @@ function getCfg() {
                  'serial_port','forward_camera_url','arm_camera_url',
                  'camera0_device','camera1_device',
                  'thrust_udp_port','telemetry_port','arm_udp_port',
-                 'mosfet_control_port','arm_control_port','colmap_command','crabs_command',
+                 'arm_control_port','colmap_command','crabs_command',
                  'mavproxy_bin','mavproxy_serial','mavproxy_baud',
                  'mavproxy_out1','mavproxy_out2'];
   const obj = {};
@@ -282,104 +280,6 @@ async function stopTopside() {
 // ─────────────────────────────────────────────────────────────
 // CONTROL ACTIONS
 // ─────────────────────────────────────────────────────────────
-let _mosfetOn = false;
-let _mosfetEnabled = true;
-
-async function toggleMosfet() {
-  if (!_mosfetEnabled) {
-    toast('MOSFET control disabled in config', 'warn');
-    return;
-  }
-  _mosfetOn = !_mosfetOn;
-  try {
-    const r = await fetch('/api/mosfet', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ state: _mosfetOn }),
-    });
-    const d = await r.json();
-    if (!d.ok) {
-      _mosfetOn = !_mosfetOn;
-      toast(d.msg || 'MOSFET command failed', 'err');
-      return;
-    }
-    updateMosfetUI(_mosfetOn);
-    const detail = d.msg ? ` (${d.msg})` : '';
-    toast('MOSFET ' + (_mosfetOn ? 'ON' : 'OFF') + detail, _mosfetOn ? 'ok' : '');
-    if (_tel.arm_mosfet_gpio_ok === false) {
-      toast('Pi reports MOSFET GPIO unavailable — check /tmp/rov_mosfet.log', 'warn');
-    }
-  } catch (e) {
-    _mosfetOn = !_mosfetOn;
-    toast('MOSFET command failed', 'err');
-  }
-}
-
-function updateMosfetUI(on) {
-  const section = document.getElementById('mosfet-section');
-  const toggle = document.getElementById('mosfet-toggle');
-  const label  = document.getElementById('mosfet-label');
-  if (section) {
-    section.classList.toggle('hidden', !_mosfetEnabled);
-  }
-  if (!toggle || !label) return;
-  if (on) { toggle.classList.add('on');    label.textContent = 'MOSFET ON'; }
-  else    { toggle.classList.remove('on'); label.textContent = 'MOSFET OFF'; }
-  updateMosfetStatusPill(_status);
-}
-
-function updateMosfetStatusPill(s) {
-  const pill = document.getElementById('pill-mosfet');
-  const cell = document.getElementById('tel-mosfet');
-  if (!pill && !cell) return;
-
-  const status = s || _status || {};
-  const enabled = status.mosfet_enabled !== false;
-  const svcUp = !!status.onboard_mosfet;
-  const railOn = !!status.mosfet_on;
-
-  let label = '--';
-  let cls = '';
-  let title = 'MOSFET servo power rail';
-
-  if (!enabled) {
-    label = 'N/A';
-    cls = '';
-    title = 'MOSFET disabled in config';
-  } else if (!svcUp) {
-    label = 'SVC DOWN';
-    cls = 'err';
-    title = 'mosfet_service.py not running — Start Onboard';
-  } else if (railOn) {
-    label = 'ON';
-    cls = 'ok';
-    title = 'Servo power rail ON';
-  } else {
-    label = 'OFF';
-    cls = 'warn';
-    title = 'Servo power rail OFF';
-  }
-
-  if (pill) {
-    pill.innerHTML = `<span class="status-dot"></span> MOSFET: ${label}`;
-    pill.className = 'status-pill' + (cls ? ` ${cls}` : '');
-    pill.title = title;
-  }
-  if (cell) {
-    if (!enabled) {
-      cell.textContent = 'N/A';
-      cell.className = 'tc-val';
-    } else if (!svcUp) {
-      cell.textContent = 'DOWN';
-      cell.className = 'tc-val bad';
-    } else {
-      cell.textContent = railOn ? 'ON' : 'OFF';
-      cell.className = 'tc-val ' + (railOn ? 'good' : 'warn');
-    }
-    cell.title = title;
-  }
-}
-
 let _currentMode = 'disarmed';
 
 function isRobotArmed() {
@@ -587,7 +487,7 @@ function buildArmPwmGrid() {
 }
 
 function getArmFormValues() {
-  const pwm = [1500, 1500, 1500, 1500, 1500, 1500, 1515];
+  const pwm = [1500, 1500, 1500, 1500, 1500, 1500, 1425];
   for (const csvIdx of ARM_CSV_INDICES) {
     const el = document.getElementById('arm-pwm-' + csvIdx);
     pwm[csvIdx] = el ? parseInt(el.value, 10) || 1500 : 1500;
@@ -620,7 +520,7 @@ function setArmFormValues(preset, name) {
 
 function resetArmPresetForm() {
   _armPresetEditing = null;
-  setArmFormValues({ pwm: [1500, 1500, 1500, 1500, 1500, 1500, 1515], label: '' }, '');
+  setArmFormValues({ pwm: [1500, 1500, 1500, 1500, 1500, 1500, 1425], label: '' }, '');
   const nameEl = document.getElementById('arm-preset-name');
   if (nameEl) nameEl.disabled = false;
   const title = document.getElementById('arm-preset-form-title');
@@ -732,9 +632,16 @@ function hideArmPresetsOutside(e) {
 }
 
 // ── Manual AUX PWM (direct Pix6 AUX override on Pi) ───────────
+// Active arm DOF: J1, J2, J3, Claw (maps to AUX4, AUX1, AUX3, AUX7)
+const ARM_MANUAL_JOINTS = [
+  { joint: 1, name: 'J1', aux: 4, pwmIdx: 3 },
+  { joint: 2, name: 'J2', aux: 1, pwmIdx: 0 },
+  { joint: 3, name: 'J3', aux: 3, pwmIdx: 2 },
+  { joint: 4, name: 'Claw', aux: 7, pwmIdx: 6 },
+];
 const MANUAL_AUX_LABELS = ['J2', '—', 'J3', 'J1', '—', '—', 'Claw'];
-const MANUAL_THR_LABELS = ['FL_H', 'BL_H', 'FL_V', 'FR_V', 'FR_H', 'BR_H', 'BR_V', 'BL_V'];
-let _configClawStopUs = 1515;
+const MANUAL_THR_LABELS = ['FR_H', 'BR_V', 'BR_H', 'BL_V', 'FR_V', 'FL_H', 'FL_V', 'BL_H'];
+let _configClawStopUs = 1425;
 
 function manualAuxDefaults() {
   return [1500, 1500, 1500, 1500, 1500, 1500, _configClawStopUs];
@@ -751,7 +658,11 @@ let _manualThrPwm = manualThrDefaults();
 function applyManualPwmPayload(d) {
   if (typeof d.enabled !== 'undefined') _manualPwmEnabled = !!d.enabled;
   if (Array.isArray(d.aux_pwm) && d.aux_pwm.length >= 7) {
-    _manualAuxPwm = d.aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
+    _manualAuxPwm = d.aux_pwm.slice(0, 7).map((v, i) => {
+      const n = parseInt(v, 10);
+      if (!Number.isNaN(n)) return n;
+      return i === 6 ? _configClawStopUs : 1500;
+    });
   }
   if (Array.isArray(d.thr_pwm) && d.thr_pwm.length >= 8) {
     _manualThrPwm = d.thr_pwm.slice(0, 8).map(v => parseInt(v, 10) || 1500);
@@ -765,16 +676,17 @@ function buildManualPwmGrid() {
 
   const armHead = document.createElement('div');
   armHead.className = 'manual-pwm-section';
-  armHead.textContent = 'Arm (AUX1–7)';
+  armHead.textContent = 'Arm (J1, J2, J3, Claw)';
   grid.appendChild(armHead);
 
-  for (let i = 0; i < 7; i++) {
+  for (const j of ARM_MANUAL_JOINTS) {
     const cell = document.createElement('div');
     cell.className = 'manual-pwm-cell';
-    cell.id = 'manual-pwm-cell-' + (i + 1);
+    cell.id = 'manual-pwm-joint-' + j.joint;
+    const pwm = _manualAuxPwm[j.pwmIdx];
     cell.innerHTML =
-      `<span class="aux-name">AUX${i + 1} ${MANUAL_AUX_LABELS[i]}</span>` +
-      `<span class="aux-val">${_manualAuxPwm[i]}</span>`;
+      `<span class="aux-name">${j.name} (AUX${j.aux})</span>` +
+      `<span class="aux-val">${pwm}</span>`;
     grid.appendChild(cell);
   }
 
@@ -806,11 +718,11 @@ function updateManualPwmUI() {
   if (barBtn) barBtn.classList.toggle('manual-active', _manualPwmEnabled);
   if (onBtn) onBtn.disabled = _manualPwmEnabled;
   if (offBtn) offBtn.disabled = !_manualPwmEnabled;
-  for (let i = 0; i < 7; i++) {
-    const cell = document.getElementById('manual-pwm-cell-' + (i + 1));
+  for (const j of ARM_MANUAL_JOINTS) {
+    const cell = document.getElementById('manual-pwm-joint-' + j.joint);
     if (cell) {
       const valEl = cell.querySelector('.aux-val');
-      if (valEl) valEl.textContent = _manualAuxPwm[i];
+      if (valEl) valEl.textContent = _manualAuxPwm[j.pwmIdx];
     }
   }
   for (let i = 0; i < 8; i++) {
@@ -897,7 +809,7 @@ async function sendManualPwmLine() {
     toast(`${who} → ${d.pwm} µs`, 'ok');
     if (inp) inp.value = '';
   } else {
-    toast(d.msg || 'Invalid command — use: claw 1510, M3 1600, or flh 1600', 'err');
+    toast(d.msg || 'Invalid command — use: claw 1425, M3 1600, or flh 1600', 'err');
   }
 }
 
@@ -1652,7 +1564,6 @@ function updateStatus() {
   const s = _status;
 
   setDot('dot-mavproxy', s.onboard_mavproxy);
-  setDot('dot-mosfet',   s.onboard_mosfet);
   setDot('dot-stab',     s.onboard_stab);
   setDot('dot-arm',      s.onboard_arm);
   setDot('dot-cam',      s.onboard_cam);
@@ -1699,16 +1610,6 @@ function updateStatus() {
   }
 
   if (s.mode) { _currentMode = s.mode; updateModeUI(s.mode); }
-  if (typeof s.mosfet_enabled === 'boolean') {
-    _mosfetEnabled = s.mosfet_enabled;
-  }
-  if (typeof s.mosfet_on !== 'undefined') {
-    _mosfetOn = !!s.mosfet_on;
-    updateMosfetUI(_mosfetOn);
-  } else {
-    updateMosfetUI(_mosfetOn);
-  }
-  updateMosfetStatusPill(s);
   if (typeof s.arm_claw_stop_us === 'number') { _configClawStopUs = s.arm_claw_stop_us; }
   if (typeof s.preset_running === 'boolean') {
     _presetRunning = s.preset_running;
@@ -1787,7 +1688,6 @@ function updatePreDiveChecklist(s) {
   const items = [
     { id: 'chk-ssh', ok: s.ssh_connected },
     { id: 'chk-mavproxy', ok: s.onboard_mavproxy },
-    { id: 'chk-mosfet', ok: s.mosfet_enabled === false || s.onboard_mosfet },
     { id: 'chk-stab', ok: s.onboard_stab },
     { id: 'chk-arm-onboard', ok: s.onboard_arm },
     { id: 'chk-cam', ok: s.onboard_cam },
@@ -2821,7 +2721,6 @@ function unbindCameraResize() {
 // ─────────────────────────────────────────────────────────────
 const _ONBOARD_SYSTEMS = [
   { key: 'onboard_mavproxy', label: 'mavproxy (UDP bridge)' },
-  { key: 'onboard_mosfet',   label: 'mosfet_service.py' },
   { key: 'onboard_stab',     label: 'stabilization.py' },
   { key: 'onboard_arm',      label: 'new_ar.py' },
   { key: 'onboard_cam',      label: 'camera_stream.py' },
@@ -2829,10 +2728,7 @@ const _ONBOARD_SYSTEMS = [
 
 function getOfflineOnboardSystems(status) {
   const s = status || _status || {};
-  return _ONBOARD_SYSTEMS.filter(sys => {
-    if (sys.key === 'onboard_mosfet' && s.mosfet_enabled === false) return false;
-    return !s[sys.key];
-  }).map(sys => sys.label);
+  return _ONBOARD_SYSTEMS.filter(sys => !s[sys.key]).map(sys => sys.label);
 }
 
 function updateOpenControlButton(status) {
@@ -2954,7 +2850,7 @@ let _logRefreshTimer = null;
 
 // Map JS log name → API endpoint name for onboard (Pi-side) logs
 const _onboardLogNames = {
-  onboard_mosfet: 'mosfet', onboard_stab: 'stab', onboard_arm: 'arm', onboard_cam: 'cam',
+  onboard_stab: 'stab', onboard_arm: 'arm', onboard_cam: 'cam',
   colmap: 'colmap', crabs: 'crabs',
 };
 
@@ -2972,7 +2868,7 @@ function toggleLog() {
 function switchLog(name) {
   _currentLog = name;
   const tabMap = {
-    arm: 'lt-arm', onboard_mosfet: 'lt-mosfet', onboard_stab: 'lt-stab', onboard_arm: 'lt-arm2',
+    arm: 'lt-arm', onboard_stab: 'lt-stab', onboard_arm: 'lt-arm2',
     onboard_cam: 'lt-cam', colmap: 'lt-colmap', crabs: 'lt-crabs',
   };
   Object.entries(tabMap).forEach(([n, id]) => {

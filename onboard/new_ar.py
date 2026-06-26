@@ -28,7 +28,6 @@ Manual AUX PWM (web UI, JSON on UDP port 5006 or 5009):
     {"cmd": "manual_pwm", "center": true}
 
 Thruster manual PWM is handled by stabilization.py (UDP 5005).
-MOSFET is handled by onboard/mosfet_service.py (UDP 5007).
 """
 
 import json
@@ -66,7 +65,9 @@ CLAW_RC_CH   = 15
 SPARE_RC_CH  = 16
 REMOVED_RC_CHS = (10, 13, 14)  # AUX2, AUX5, AUX6 — no hardware
 
-CLAW_STOP_US_DEFAULT = 1515
+CLAW_MIN_US = 1325
+CLAW_MAX_US = 1525
+CLAW_STOP_US_DEFAULT = 1425
 CLAW_IN_DEADBAND = 10
 _claw_stop_pwm = CLAW_STOP_US_DEFAULT
 
@@ -82,6 +83,10 @@ def _clamp_us(x):
     return int(_clamp(float(x), MIN_US, MAX_US))
 
 
+def _clamp_claw_us(x):
+    return int(_clamp(float(x), CLAW_MIN_US, CLAW_MAX_US))
+
+
 def _claw_stop_us() -> int:
     with _lock:
         return int(_claw_stop_pwm)
@@ -89,7 +94,7 @@ def _claw_stop_us() -> int:
 
 def _claw_output_pwm(claw_input_us):
     """Claw continuous rotation — centered stick/input → configured stop PWM."""
-    us = _clamp_us(claw_input_us)
+    us = _clamp_claw_us(claw_input_us)
     if abs(us - CENTER_US) <= CLAW_IN_DEADBAND:
         return _claw_stop_us()
     return us
@@ -216,7 +221,7 @@ def _apply_arm_enable_cmd(cmd: dict) -> None:
 
 def _apply_arm_claw_stop_cmd(cmd: dict) -> None:
     global _claw_stop_pwm
-    stop = _clamp_us(cmd.get("stop_us", CLAW_STOP_US_DEFAULT))
+    stop = _clamp_claw_us(cmd.get("stop_us", CLAW_STOP_US_DEFAULT))
     with _lock:
         _claw_stop_pwm = stop
     print(f"[arm] Claw stop PWM → {stop} µs", flush=True)
@@ -266,7 +271,27 @@ def _apply_preset_step_cmd(cmd: dict) -> None:
 
 
 def _apply_manual_pwm_cmd(cmd: dict) -> None:
-    global _manual_mode, _manual_aux_pwm
+    global _manual_mode, _manual_aux_pwm, _arm_enabled
+
+    turning_off = (
+        "enabled" in cmd
+        and not cmd.get("enabled")
+        and cmd.get("aux") is None
+        and cmd.get("joint") is None
+        and not cmd.get("center")
+    )
+    has_pwm = (
+        cmd.get("center")
+        or cmd.get("aux") is not None
+        or cmd.get("joint") is not None
+    )
+
+    # Topside only sends manual PWM while DRIVE/ARMED — recover if arm_enable UDP was lost.
+    if has_pwm or (cmd.get("enabled") and not turning_off):
+        with _lock:
+            if not _arm_enabled:
+                _arm_enabled = True
+                print("[arm] Arm auto-enabled for manual AUX command", flush=True)
 
     with _lock:
         if not _arm_enabled:
@@ -299,7 +324,7 @@ def _apply_manual_pwm_cmd(cmd: dict) -> None:
         return
     try:
         aux_i = int(aux)
-        pwm_i = _clamp_us(pwm)
+        pwm_i = _clamp_claw_us(pwm) if aux_i == 7 else _clamp_us(pwm)
     except (TypeError, ValueError):
         return
     if not (1 <= aux_i <= 7):
@@ -322,6 +347,7 @@ def _handle_arm_control_json(cmd: dict, addr) -> None:
         _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
     elif cmd.get("cmd") == "manual_pwm":
         _apply_manual_pwm_cmd(cmd)
+        _flush_rc_override_now()
         _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
     elif cmd.get("cmd") == "arm_telemetry" and cmd.get("subscribe"):
         port = int(cmd.get("port", ARM_TELEM_PORT))
@@ -333,6 +359,7 @@ def _handle_arm_control_json(cmd: dict, addr) -> None:
         _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
     elif cmd.get("cmd") == "arm_enable":
         _apply_arm_enable_cmd(cmd)
+        _flush_rc_override_now()
         _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
 
 
@@ -369,7 +396,8 @@ def _build_rc_manual(aux_vals=None):
         with _lock:
             aux_vals = list(_manual_aux_pwm)
     for aux_i in range(1, 8):
-        rc[8 + aux_i - 1] = _clamp_us(aux_vals[aux_i - 1])
+        val = aux_vals[aux_i - 1]
+        rc[8 + aux_i - 1] = _clamp_claw_us(val) if aux_i == 7 else _clamp_us(val)
     rc[SPARE_RC_CH - 1] = CENTER_US
     return rc
 
@@ -405,6 +433,17 @@ def _build_rc_array():
 
 def _send_override(master):
     _send_rc_override(master, _build_rc_array())
+
+
+def _flush_rc_override_now() -> None:
+    """Push RC override immediately after a manual/control command."""
+    master = _get_mavlink_master()
+    if master is None:
+        return
+    try:
+        _send_override(master)
+    except OSError as e:
+        _drop_mavlink_master(str(e))
 
 
 def _send_heartbeat(master):
@@ -534,7 +573,7 @@ def _maybe_warn_servo_mismatch(rc: list, fc_rc: dict, fc_srv: dict, hold_neutral
     if not srv_ok:
         print(
             "[arm] *** FC RC changed but AUX servo output did not — "
-            "set SERVO9-16_FUNCTION=1 (RCPassThru), BRD_SAFETYENABLE=0 ***",
+            "set SERVO9=59 SERVO11=61 SERVO12=62 SERVO15=65 (RCPassThru), BRD_SAFETYENABLE=0 ***",
             flush=True,
         )
 

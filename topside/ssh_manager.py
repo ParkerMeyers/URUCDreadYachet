@@ -15,7 +15,6 @@ from topside.constants import (
     MAVPROXY_ONBOARD_OUT,
     MAVPROXY_TCP_PORT,
 )
-from topside.segments import mosfet
 
 try:
     import paramiko
@@ -186,9 +185,6 @@ class SSHManager:
         log_file = f"/tmp/rov_{log_name}.log"
         out, _, _ = self.exec(f"tail -n {lines} {log_file} 2>/dev/null || echo ''")
         return out
-
-    def send_mosfet(self, state: bool):
-        return mosfet.send_command(bool(state))
 
     def _release_serial_port(self, ser: str) -> None:
         if not ser:
@@ -377,10 +373,9 @@ class SSHManager:
     def get_onboard_status(self):
         st = self.supervisor_status()
         if not st:
-            return {"mavproxy": False, "mosfet": False, "stab": False, "arm": False, "cam": False}
+            return {"mavproxy": False, "stab": False, "arm": False, "cam": False}
         return {
             "mavproxy": self.is_mavproxy_running() and self.is_mavproxy_fc_connected(),
-            "mosfet": bool(st.get("mosfet", {}).get("alive")),
             "stab": bool(st.get("stab", {}).get("alive")),
             "arm": bool(st.get("arm", {}).get("alive")),
             "cam": bool(st.get("cam", {}).get("alive")),

@@ -9,19 +9,18 @@ import time
 # Select the v20 dialect before pymavlink loads message definitions.
 os.environ.setdefault("MAVLINK20", "1")
 
-from pymavlink.dialects.v20 import ardupilotmega as mav_v20
-
 RC_IGNORE = 65535
 
 # MAVProxy tcpin accepts ONE TCP client per port — use separate ports:
 #   stabilization.py → 5762   new_ar.py → 5763
-# See onboard/ports.py for the full port map.
-from onboard.ports import MAVPROXY_ONBOARD_ARM, MAVPROXY_ONBOARD_STAB
+# See ports.py for the full port map.
+try:
+    from ports import MAVPROXY_ONBOARD_ARM, MAVPROXY_ONBOARD_STAB
+except ImportError:
+    from onboard.ports import MAVPROXY_ONBOARD_ARM, MAVPROXY_ONBOARD_STAB
 
 MAVLINK_ONBOARD = MAVPROXY_ONBOARD_STAB.replace("tcpin:", "tcp:")
 MAVLINK_ONBOARD_ARM = MAVPROXY_ONBOARD_ARM.replace("tcpin:", "tcp:")
-
-_ENCODER = mav_v20.MAVLink(None, srcSystem=255, srcComponent=190)
 
 
 def normalize_mavlink_url(url: str) -> str:
@@ -60,8 +59,29 @@ def send_rc_channels_override(master, channels, *, ignore: int = RC_IGNORE) -> N
     """Send RC_CHANNELS_OVERRIDE for up to 18 channels (MAVLink 2 encoding)."""
     ts, tc = _targets(master)
     ch = _pad_channels(channels, ignore=ignore)
-    msg = _ENCODER.rc_channels_override_encode(ts, tc, *ch)
-    master.write(msg.pack(_ENCODER))
+    # Use the connection's mavlink encoder so sequence/CRC match the open link.
+    master.mav.rc_channels_override_send(
+        ts,
+        tc,
+        ch[0],
+        ch[1],
+        ch[2],
+        ch[3],
+        ch[4],
+        ch[5],
+        ch[6],
+        ch[7],
+        ch[8],
+        ch[9],
+        ch[10],
+        ch[11],
+        ch[12],
+        ch[13],
+        ch[14],
+        ch[15],
+        ch[16],
+        ch[17],
+    )
 
 
 def connect_mavlink(url: str | None = None, *, source_system: int = 255, timeout: float = 45.0):

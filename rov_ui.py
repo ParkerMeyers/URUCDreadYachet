@@ -11,7 +11,6 @@ holds Flask routes and segment wiring.
 Robot segments (each debuggable independently):
   THRUST   — browser gamepad → UDP 5005 → onboard/stabilization.py
   ARM      — arm_sender.py → UDP 5006 → onboard/new_ar.py
-  MOSFET   — UDP 5007 → onboard/mosfet_service.py
   CAMERA   — HTTP MJPEG ← onboard/camera_stream.py (:8160/:8161)
   SSH      — Pi process supervisor (onboard/supervisor.py)
 
@@ -20,7 +19,6 @@ Package layout:
   topside/state.py       — runtime STATE dict
   topside/constants.py   — PWM limits, joint maps, ports
   topside/ssh_manager.py — SSH + MAVProxy + onboard start
-  topside/segments/mosfet.py — MOSFET UDP commands
   onboard/ports.py       — shared UDP/TCP port map
 
 Usage:
@@ -94,7 +92,7 @@ _ctrl_keepalive_seq = 0
 CTRL_SEND_HZ = 50
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SHARED MODULES (config, state, constants, SSH, MOSFET segment)
+# SHARED MODULES (config, state, constants, SSH)
 # ─────────────────────────────────────────────────────────────────────────────
 
 from topside.config import (
@@ -118,17 +116,15 @@ from topside.state import (
     manual_aux_defaults,
     manual_thr_defaults,
 )
-from topside.util import clamp_arm_pwm, clamp_thr_pwm
+from topside.util import clamp_arm_pwm, clamp_arm_pwm_list, clamp_claw_pwm, clamp_thr_pwm
 from topside.ssh_manager import ssh
-from topside.segments import mosfet
 
 _manual_aux_defaults = manual_aux_defaults
 _manual_thr_defaults = manual_thr_defaults
 _clamp_arm_pwm = clamp_arm_pwm
+_clamp_claw_pwm = clamp_claw_pwm
 _clamp_thr_pwm = clamp_thr_pwm
 _slug_preset_name = slug_preset_name
-_mosfet_enabled = mosfet.is_enabled
-_send_mosfet_command = mosfet.send_command
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ARM SEGMENT — presets, UDP control, manual PWM parsing
@@ -139,24 +135,19 @@ _preset_lock = threading.Lock()
 
 
 def _pwm_to_csv(pwms: list) -> str:
-    vals = [_clamp_arm_pwm(v) for v in pwms[:7]]
-    while len(vals) < 7:
-        vals.append(1500)
+    vals = clamp_arm_pwm_list(pwms)
     return ",".join(str(x) for x in vals) + ",0.00"
 
 
 def _preset_to_csv(preset: dict) -> str:
-    pwms = [_clamp_arm_pwm(v) for v in preset["pwm"][:7]]
-    while len(pwms) < 7:
-        pwms.append(1500)
-    return _pwm_to_csv(pwms)
+    return _pwm_to_csv(preset["pwm"])
 
 
 def _current_arm_pose() -> list[int]:
     """Last known arm_sender PWM (7 values) from telemetry."""
     raw = STATE.get("arm_last_pwm")
     if isinstance(raw, dict) and isinstance(raw.get("pwm"), list) and len(raw["pwm"]) >= 7:
-        return [_clamp_arm_pwm(x) for x in raw["pwm"][:7]]
+        return clamp_arm_pwm_list(raw["pwm"])
     return list(ARM_DEFAULT_PWM)
 
 
@@ -181,9 +172,7 @@ def _emit_preset_progress(payload: dict) -> None:
 def _run_preset_sequence(preset_name: str, preset: dict) -> None:
     """Move joints one at a time J3→J2→J1→Claw with distance-based pauses."""
     label = str(preset.get("label") or preset_name)
-    target_pwms = [_clamp_arm_pwm(v) for v in preset["pwm"][:7]]
-    while len(target_pwms) < 7:
-        target_pwms.append(1500)
+    target_pwms = clamp_arm_pwm_list(preset["pwm"])
 
     try:
         _send_pi_arm_control({"cmd": "preset_motion", "enabled": True})
@@ -307,7 +296,7 @@ def _parse_arm_sent_line(line: str) -> dict | None:
     if len(parts) < 7:
         return None
     try:
-        pwms = [_clamp_arm_pwm(x) for x in parts[:7]]
+        pwms = clamp_arm_pwm_list(parts)
         return {"pwm": pwms}
     except (TypeError, ValueError):
         return None
@@ -331,6 +320,13 @@ def _send_pi_arm_control(payload: dict) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _send_pi_arm_manual(payload: dict) -> tuple[bool, str]:
+    """Unlock arm motion on the Pi, then send a manual_pwm command."""
+    if _robot_armed():
+        _send_pi_arm_control({"cmd": "arm_enable", "enabled": True})
+    return _send_pi_arm_control(payload)
+
+
 def _send_pi_stab_control(payload: dict) -> tuple[bool, str]:
     """Send JSON control command to stabilization.py on the thrust UDP port."""
     load_config_file()
@@ -347,18 +343,8 @@ def _send_pi_stab_control(payload: dict) -> tuple[bool, str]:
         return False, str(e)
 
 
-def _sync_arm_power():
-    """Push current MOSFET state to mosfet_service.py on the Pi."""
-    if not _mosfet_enabled():
-        return
-    # Servo rail needs power for any arm motion — auto-enable when armed.
-    if _robot_armed() and not STATE.get("mosfet_on"):
-        STATE["mosfet_on"] = True
-    _send_mosfet_command(bool(STATE.get("mosfet_on", False)))
-
-
 def _apply_disarmed_arm_lockout():
-    """Stop arm motion and overrides when the ROV is disarmed (MOSFET unchanged)."""
+    """Stop arm motion and overrides when the ROV is disarmed."""
     if _robot_armed():
         _sync_arm_unlock()
         return
@@ -428,20 +414,30 @@ def _parse_manual_pwm_line(line: str) -> tuple[str, int, int, str] | None:
         return "motor", motor_i, pwm, label
 
     # Arm AUX / joint
-    try:
-        pwm = _clamp_arm_pwm(pwm_raw)
-    except (TypeError, ValueError):
-        return None
+    def _parse_aux_pwm(aux: int, pwm_raw: str) -> int | None:
+        try:
+            return _clamp_claw_pwm(pwm_raw) if aux == 7 else _clamp_arm_pwm(pwm_raw)
+        except (TypeError, ValueError):
+            return None
 
     if token in ("claw",):
+        pwm = _parse_aux_pwm(7, pwm_raw)
+        if pwm is None:
+            return None
         return "aux", 7, pwm, "Claw"
     if token in ("j6", "wrist", "j3"):
+        pwm = _parse_aux_pwm(JOINT_TO_AUX[3], pwm_raw)
+        if pwm is None:
+            return None
         return "aux", JOINT_TO_AUX[3], pwm, "J3"
     if token.startswith("j") and token[1:].isdigit():
         joint_i = int(token[1:])
         if joint_i not in JOINT_TO_AUX:
             return None
         aux = JOINT_TO_AUX[joint_i]
+        pwm = _parse_aux_pwm(aux, pwm_raw)
+        if pwm is None:
+            return None
         label = ARM_JOINT_NAMES[joint_i - 1] if joint_i <= len(ARM_JOINT_NAMES) else "Claw"
         return "aux", aux, pwm, label
     try:
@@ -449,6 +445,9 @@ def _parse_manual_pwm_line(line: str) -> tuple[str, int, int, str] | None:
     except (TypeError, ValueError):
         return None
     if not (1 <= aux <= 7):
+        return None
+    pwm = _parse_aux_pwm(aux, pwm_raw)
+    if pwm is None:
         return None
     label = f"AUX{aux} ({MANUAL_AUX_LABELS[aux - 1]})"
     return "aux", aux, pwm, label
@@ -677,23 +676,17 @@ def _on_onboard_stack_ready() -> None:
     _subscribe_arm_telemetry()
     _sync_arm_claw_stop()
     _apply_disarmed_arm_lockout()
-    if STATE.get("onboard_mosfet"):
-        _sync_arm_power()
     socketio.emit("telemetry", _telemetry_emit_payload())
     emit_status()
 
     def _resync_arm_after_restart():
         for delay in (0.75, 2.0, 5.0):
             time.sleep(delay)
-            if STATE.get("onboard_mosfet"):
-                _sync_arm_power()
             if not STATE.get("onboard_arm"):
                 continue
             _subscribe_arm_telemetry()
             _sync_arm_claw_stop()
             _sync_arm_enable()
-            if STATE.get("onboard_mosfet"):
-                _sync_arm_power()
 
     socketio.start_background_task(_resync_arm_after_restart)
 
@@ -772,10 +765,6 @@ def _update_arm_telemetry_from_json(pkt: dict):
         tel["arm_preset_motion"] = bool(pkt.get("arm_preset_motion"))
     if pkt.get("arm_claw_stop_us") is not None:
         tel["arm_claw_stop_us"] = int(pkt["arm_claw_stop_us"])
-    if pkt.get("arm_mosfet_on") is not None:
-        tel["arm_mosfet_on"] = bool(pkt.get("arm_mosfet_on"))
-    if pkt.get("arm_mosfet_gpio_ok") is not None:
-        tel["arm_mosfet_gpio_ok"] = bool(pkt.get("arm_mosfet_gpio_ok"))
     STATE["last_arm_telemetry_time"] = time.time()
     socketio.emit("telemetry", _telemetry_emit_payload())
 
@@ -784,7 +773,7 @@ def _sync_arm_claw_stop():
     """Push persisted claw stop PWM to new_ar.py."""
     _send_pi_arm_control({
         "cmd": "arm_claw_stop",
-        "stop_us": int(config.get("arm_claw_stop_us", 1515)),
+        "stop_us": int(config.get("arm_claw_stop_us", CLAW_STOP_US_DEFAULT)),
     })
 
 def _subscribe_arm_telemetry():
@@ -811,9 +800,8 @@ def _start_arm_telemetry_subscribe_loop():
     def _loop():
         while True:
             _subscribe_arm_telemetry()
-            _sync_arm_claw_stop()
-            _sync_arm_enable()
-            _sync_arm_power()
+            # Do not re-send arm_enable / claw_stop here — that fights Pi CLI
+            # bench testing and repeats disarm lockout every 5 s while UI is disarmed.
             time.sleep(5.0)
 
     threading.Thread(target=_loop, daemon=True, name="arm-tel-sub").start()
@@ -836,9 +824,9 @@ def _start_arm_telemetry_listener():
 
         print(f"[INFO] Arm telemetry listener active on UDP port {port}")
         _subscribe_arm_telemetry()
-        _sync_arm_claw_stop()
-        _sync_arm_enable()
-        _sync_arm_power()
+        if _robot_armed():
+            _sync_arm_claw_stop()
+            _sync_arm_enable()
         while True:
             try:
                 data, _ = s.recvfrom(4096)
@@ -1017,14 +1005,12 @@ def _monitor_loop():
                 STATE["ssh_connected"]         = True
                 status = ssh.get_onboard_status()
                 STATE["onboard_mavproxy"] = status["mavproxy"]
-                STATE["onboard_mosfet"]   = status["mosfet"]
                 STATE["onboard_stab"]     = status["stab"]
                 STATE["onboard_arm"]      = status["arm"]
                 STATE["onboard_cam"]      = status["cam"]
             else:
                 STATE["ssh_connected"]    = False
                 STATE["onboard_mavproxy"] = False
-                STATE["onboard_mosfet"]   = False
                 STATE["onboard_stab"]     = False
                 STATE["onboard_arm"]      = False
                 STATE["onboard_cam"]      = False
@@ -1051,15 +1037,12 @@ def emit_status():
         "thrust_running":        STATE["thrust_running"],
         "arm_running":           STATE["arm_running"],
         "onboard_stab":          STATE["onboard_stab"],
-        "onboard_mosfet":        STATE["onboard_mosfet"],
         "onboard_arm":           STATE["onboard_arm"],
         "onboard_cam":           STATE["onboard_cam"],
         "onboard_mavproxy":      STATE["onboard_mavproxy"],
         "ssh_connected":         STATE["ssh_connected"],
         "ssh_error":             STATE["ssh_error"],
         "mode":                  STATE["mode"],
-        "mosfet_on":             STATE["mosfet_on"],
-        "mosfet_enabled":        _mosfet_enabled(),
         "telemetry_listener_ok": STATE["telemetry_listener_ok"],
         "onboard_starting":      STATE["onboard_starting"],
         "onboard_progress":      progress,
@@ -1076,7 +1059,7 @@ def emit_status():
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
         "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(_manual_aux_defaults())),
         "manual_thr_pwm":        STATE.get("manual_thr_pwm", list(_manual_thr_defaults())),
-        "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", 1515)),
+        "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", CLAW_STOP_US_DEFAULT)),
         "arm_motion_enabled":    _robot_armed(),
         "arm_pi_enabled":        STATE.get("telemetry", {}).get("arm_enabled"),
     })
@@ -1576,13 +1559,11 @@ def api_start_onboard():
             cam_args = f"--cam0 {cam0_dev} --cam1 {cam1_dev}"
 
             service_specs = [
-                ("mosfet", "mosfet", "onboard_mosfet", 15.0, ""),
                 ("stabilization", "stab", "onboard_stab", 75.0, ""),
                 ("arm_ctrl", "arm", "onboard_arm", 45.0, ""),
                 ("camera", "cam", "onboard_cam", 30.0, cam_args),
             ]
             service_labels = {
-                "mosfet": "mosfet_service.py (servo power rail)",
                 "stabilization": "stabilization.py",
                 "arm_ctrl": "new_ar.py (arm controller)",
                 "camera": "camera_stream.py (MJPEG feeds)",
@@ -1603,23 +1584,13 @@ def api_start_onboard():
                 _emit_onboard_progress(step, "done" if ok else "error", msg)
                 emit_status()
 
-            ok_mos, msg_mos = service_results.get("mosfet", (False, "missing result"))
             ok_s, msg_s = service_results.get("stabilization", (False, "missing result"))
             ok_a, msg_a = service_results.get("arm_ctrl", (False, "missing result"))
             ok_c, msg_c = service_results.get("camera", (False, "missing result"))
 
             core_ok = ok_m and ok_s
-            if core_ok and ok_mos and ok_a and ok_c:
-                summary = "✓ All onboard programs running (MAVProxy, MOSFET, stabilization, new_ar, cameras)"
-            elif core_ok and ok_a and ok_c:
-                parts_warn = []
-                if not ok_mos:
-                    parts_warn.append("MOSFET service")
-                summary = (
-                    "✓ ROV ready — optional failed: " + ", ".join(parts_warn)
-                    if parts_warn
-                    else "✓ ROV ready — cameras unavailable (check device paths / opencv install)"
-                )
+            if core_ok and ok_a and ok_c:
+                summary = "✓ All onboard programs running (MAVProxy, stabilization, new_ar, cameras)"
             elif core_ok and ok_a:
                 summary = "✓ ROV ready — cameras unavailable (check device paths / opencv install)"
             elif core_ok:
@@ -1668,7 +1639,6 @@ def api_stop_onboard():
     ssh.stop_mavproxy()
     ssh.exec("sleep 0.75", timeout=5)
     STATE["onboard_stab"]     = False
-    STATE["onboard_mosfet"]   = False
     STATE["onboard_arm"]      = False
     STATE["onboard_cam"]      = False
     STATE["onboard_mavproxy"] = False
@@ -1763,24 +1733,6 @@ def api_arm_diagnostic():
             "detail": "Start Onboard" if not STATE.get("onboard_arm") else "OK",
         },
         {
-            "name": "MOSFET service (Pi)",
-            "ok": not _mosfet_enabled() or bool(STATE.get("onboard_mosfet")),
-            "detail": (
-                "Start Onboard"
-                if _mosfet_enabled() and not STATE.get("onboard_mosfet")
-                else ("N/A" if not _mosfet_enabled() else "OK")
-            ),
-        },
-        {
-            "name": "Servo power rail (MOSFET ON)",
-            "ok": not _mosfet_enabled() or bool(STATE.get("mosfet_on")),
-            "detail": (
-                "Toggle MOSFET ON in control bar"
-                if _mosfet_enabled() and not STATE.get("mosfet_on")
-                else ("N/A" if not _mosfet_enabled() else "OK")
-            ),
-        },
-        {
             "name": "Pi MAVLink to Pix6",
             "ok": bool(tel.get("arm_mavlink_ok")),
             "detail": "Check MAVProxy + onboard arm log" if not tel.get("arm_mavlink_ok") else "OK",
@@ -1817,7 +1769,7 @@ def api_arm_diagnostic():
         "ok": True,
         "checks": checks,
         "all_ok": all(c["ok"] for c in checks),
-        "hint": "Mission Planner: SERVO9–16_FUNCTION=1 (RCPassThru), BRD_SAFETYENABLE=0",
+        "hint": "Mission Planner: SERVO9=59 SERVO11=61 SERVO12=62 SERVO15=65 (RCPassThru), BRD_SAFETYENABLE=0",
         "arm_joint_us": tel.get("arm_joint_us"),
         "mode": STATE.get("mode"),
     })
@@ -1828,6 +1780,7 @@ def api_arm_jog():
     """Pulse one joint via Pi manual PWM (connectivity test). Requires DRIVE/ARMED."""
     if not _robot_armed():
         return jsonify({"ok": False, "msg": "Switch to DRIVE/ARMED first"}), 403
+    _sync_arm_unlock()
     data = request.get_json(force=True) or {}
     try:
         joint_i = int(data.get("joint", 2))
@@ -1841,7 +1794,7 @@ def api_arm_jog():
     label = ARM_JOINT_NAMES[joint_i - 1]
     hold_sec = float(data.get("hold_sec", 1.0))
 
-    ok1, msg1 = _send_pi_arm_control({
+    ok1, msg1 = _send_pi_arm_manual({
         "cmd": "manual_pwm", "enabled": True, "aux": aux, "pwm": pwm,
     })
     if not ok1:
@@ -1849,7 +1802,7 @@ def api_arm_jog():
 
     def _restore():
         time.sleep(hold_sec)
-        _send_pi_arm_control({
+        _send_pi_arm_manual({
             "cmd": "manual_pwm", "enabled": True, "aux": aux, "pwm": center,
         })
         time.sleep(0.05)
@@ -1870,7 +1823,7 @@ def api_arm_claw_stop():
     if request.method == "GET":
         return jsonify({
             "ok": True,
-            "stop_us": int(config.get("arm_claw_stop_us", 1515)),
+            "stop_us": int(config.get("arm_claw_stop_us", CLAW_STOP_US_DEFAULT)),
         })
 
     if not _robot_armed():
@@ -1884,9 +1837,9 @@ def api_arm_claw_stop():
             return jsonify({"ok": False, "msg": "No manual AUX7 (Claw) value"}), 400
         stop_us = aux[6]
     try:
-        stop_us = _clamp_arm_pwm(stop_us)
+        stop_us = _clamp_claw_pwm(stop_us)
     except (TypeError, ValueError):
-        return jsonify({"ok": False, "msg": "stop_us must be 500–2500"}), 400
+        return jsonify({"ok": False, "msg": "stop_us must be 1325–1525"}), 400
 
     config["arm_claw_stop_us"] = int(stop_us)
     save_config_file()
@@ -1899,25 +1852,6 @@ def api_arm_claw_stop():
     })
 
 
-@app.route("/api/mosfet", methods=["POST"])
-def api_mosfet():
-    if not _mosfet_enabled():
-        return jsonify({
-            "ok": False,
-            "msg": "MOSFET disabled — hardware not installed",
-            "mosfet_on": False,
-            "mosfet_enabled": False,
-        }), 400
-    data = request.get_json(force=True) or {}
-    state = bool(data.get("state", False))
-    ok, msg = _send_mosfet_command(state)
-    if not ok:
-        return jsonify({"ok": False, "msg": msg, "mosfet_on": STATE.get("mosfet_on", False)}), 500
-    STATE["mosfet_on"] = state
-    emit_status()
-    return jsonify({"ok": True, "msg": msg, "mosfet_on": state, "mosfet_enabled": True})
-
-
 @app.route("/api/manual_pwm", methods=["GET"])
 def api_manual_pwm_get():
     return jsonify({
@@ -1926,6 +1860,7 @@ def api_manual_pwm_get():
         "aux_pwm": list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults()))),
         "thr_pwm": list(STATE.get("manual_thr_pwm", list(_manual_thr_defaults()))),
         "aux_labels": MANUAL_AUX_LABELS,
+        "arm_joints": ARM_MANUAL_JOINTS,
         "thr_labels": MANUAL_THR_LABELS,
     })
 
@@ -1959,9 +1894,9 @@ def api_manual_pwm():
 
     if action == "toggle":
         enabled = bool(data.get("enabled"))
-        ok_arm, msg_arm = _send_pi_arm_control({"cmd": "manual_pwm", "enabled": enabled})
+        ok_arm, msg_arm = _send_pi_arm_manual({"cmd": "manual_pwm", "enabled": enabled})
         ok_stab, msg_stab = _send_pi_stab_control({"cmd": "manual_pwm", "enabled": enabled})
-        ok = ok_arm and ok_stab
+        ok = ok_arm if enabled else (ok_arm and ok_stab)
         msg = "; ".join(filter(None, [msg_arm if ok_arm else f"arm: {msg_arm}",
                                       msg_stab if ok_stab else f"stab: {msg_stab}"]))
         if ok_arm or ok_stab:
@@ -1970,7 +1905,7 @@ def api_manual_pwm():
         return jsonify({"ok": ok, "msg": msg, **_manual_pwm_json()})
 
     if action == "center":
-        ok_arm, msg_arm = _send_pi_arm_control({
+        ok_arm, msg_arm = _send_pi_arm_manual({
             "cmd": "manual_pwm", "center": True, "enabled": True,
         })
         ok_stab, msg_stab = _send_pi_stab_control({
@@ -1994,7 +1929,7 @@ def api_manual_pwm():
         if aux is not None and pwm is not None:
             try:
                 aux_i = int(aux)
-                pwm_i = _clamp_arm_pwm(pwm)
+                pwm_i = _clamp_claw_pwm(pwm) if aux_i == 7 else _clamp_arm_pwm(pwm)
                 if 1 <= aux_i <= 7:
                     parsed = ("aux", aux_i, pwm_i,
                               f"AUX{aux_i} ({MANUAL_AUX_LABELS[aux_i - 1]})")
@@ -2016,14 +1951,14 @@ def api_manual_pwm():
             return jsonify({
                 "ok": False,
                 "msg": (
-                    "Use AUX 1–7 / J1–J3 / claw, or M1–M8 / flh etc. plus PWM "
-                    "(e.g. 'J1 1500', 'M3 1600', 'flh 1600')"
+                    "Use J1–J3 / claw / joint 1–4, or M1–M8 / flh etc. plus PWM "
+                    "(e.g. 'J1 1500', 'claw 1425', 'M3 1600', 'flh 1600')"
                 ),
             })
 
         kind, idx, pwm_i, label = parsed
         if kind == "aux":
-            ok, msg = _send_pi_arm_control({
+            ok, msg = _send_pi_arm_manual({
                 "cmd": "manual_pwm",
                 "enabled": True,
                 "aux": idx,
@@ -2089,8 +2024,6 @@ def api_mode():
         STATE["manual_thr_pwm"] = list(_manual_thr_defaults())
     _apply_disarmed_arm_lockout()
     if mode in ("armed", "stabilize"):
-        if _mosfet_enabled():
-            _sync_arm_power()
         _sync_arm_claw_stop()
         _subscribe_arm_telemetry()
     emit_status()
@@ -2167,7 +2100,7 @@ def api_arm_presets_save():
     try:
         preset = {
             "label": str(data.get("label") or name.replace("_", " ").title()).strip(),
-            "pwm": [_clamp_arm_pwm(x) for x in pwm_in[:7]],
+            "pwm": clamp_arm_pwm_list(pwm_in),
         }
     except (TypeError, ValueError):
         return jsonify({"ok": False, "msg": "Invalid PWM values"}), 400
@@ -2316,14 +2249,11 @@ def api_status():
         "thrust_running":        STATE["thrust_running"],
         "arm_running":           STATE["arm_running"],
         "onboard_stab":          STATE["onboard_stab"],
-        "onboard_mosfet":        STATE["onboard_mosfet"],
         "onboard_arm":           STATE["onboard_arm"],
         "onboard_cam":           STATE["onboard_cam"],
         "onboard_mavproxy":      STATE["onboard_mavproxy"],
         "ssh_connected":         STATE["ssh_connected"],
         "mode":                  STATE["mode"],
-        "mosfet_on":             STATE["mosfet_on"],
-        "mosfet_enabled":        _mosfet_enabled(),
         "telemetry_listener_ok": STATE["telemetry_listener_ok"],
         "onboard_starting":      STATE["onboard_starting"],
         "onboard_progress":      progress,
@@ -2341,7 +2271,7 @@ def api_status():
         "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
         "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(_manual_aux_defaults())),
         "manual_thr_pwm":        STATE.get("manual_thr_pwm", list(_manual_thr_defaults())),
-        "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", 1515)),
+        "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", CLAW_STOP_US_DEFAULT)),
         "arm_motion_enabled":    _robot_armed(),
         "arm_pi_enabled":        STATE.get("telemetry", {}).get("arm_enabled"),
     })
@@ -2369,7 +2299,6 @@ def api_onboard_progress():
             "starting": STATE["onboard_starting"],
             "events": list(STATE["onboard_progress"]),
             "onboard_mavproxy": STATE["onboard_mavproxy"],
-            "onboard_mosfet": STATE["onboard_mosfet"],
             "onboard_stab": STATE["onboard_stab"],
             "onboard_arm": STATE["onboard_arm"],
             "onboard_cam": STATE["onboard_cam"],
@@ -2378,7 +2307,7 @@ def api_onboard_progress():
 
 @app.route("/api/onboard_log/<name>")
 def api_onboard_log(name):
-    allowed = {"mosfet", "stab", "arm", "cam", "colmap", "crabs"}
+    allowed = {"stab", "arm", "cam", "colmap", "crabs"}
     if name not in allowed:
         return jsonify({"lines": []})
     out = ssh.get_onboard_log(name)
@@ -2442,7 +2371,6 @@ def main():
     _start_arm_telemetry_listener()
     _start_arm_telemetry_subscribe_loop()
     _start_control_sender()
-    _sync_arm_power()
     _apply_disarmed_arm_lockout()
     threading.Thread(target=_monitor_loop, daemon=True).start()
 
@@ -2452,7 +2380,7 @@ def main():
     print(f"  Open: {url}")
     print(f"  Telemetry listening on UDP port {config['telemetry_port']}")
     print(f"  Arm IMU telemetry on UDP port {config.get('arm_telemetry_port', 5008)}")
-    print(f"  Control packets → Pi UDP port {config['thrust_udp_port']}")
+    print(f"  Control packets -> Pi UDP port {config['thrust_udp_port']}")
     print(f"{'='*55}\n")
 
     if not args.no_browser:
