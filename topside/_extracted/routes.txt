@@ -1,0 +1,1075 @@
+# FLASK API ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/favicon.ico")
+def favicon():
+    return Response(status=204)
+
+
+@app.context_processor
+def _inject_static_ver():
+    def static_ver(path: str) -> str:
+        full = ROV_ROOT / "static" / path
+        try:
+            return str(int(full.stat().st_mtime))
+        except OSError:
+            return "0"
+
+    return {"static_ver": static_ver}
+
+
+@app.after_request
+def _no_cache_static(response):
+    if request.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/config", methods=["GET", "POST"])
+def api_config():
+    global config
+    if request.method == "POST":
+        data = request.get_json(force=True) or {}
+        if "camera1_url" in data:
+            data["arm_camera_url"] = data["camera1_url"]
+        if "camera2_url" in data:
+            data["forward_camera_url"] = data["camera2_url"]
+        for k, v in data.items():
+            if k in config:
+                config[k] = v
+        normalize_onboard_config()
+        save_config_file()
+        return jsonify({"ok": True, "config": config})
+    normalize_onboard_config()
+    return jsonify(config)
+
+
+@app.route("/api/ssh/connect", methods=["POST"])
+def api_ssh_connect():
+    data = request.get_json(force=True) or {}
+    for k in ("pi_ip", "pi_user", "pi_password", "pi_ssh_port", "pi_rov_path"):
+        if k in data:
+            config[k] = data[k]
+
+    ok, msg = ssh.connect(
+        config["pi_ip"], config["pi_user"], config["pi_password"],
+        port=int(config["pi_ssh_port"])
+    )
+    STATE["ssh_connected"] = ok
+    STATE["ssh_error"] = "" if ok else msg
+    emit_status()
+    return jsonify({"ok": ok, "msg": msg})
+
+
+@app.route("/api/ssh/disconnect", methods=["POST"])
+def api_ssh_disconnect():
+    global _ssh_was_connected
+    _ssh_was_connected = False   # don't auto-reconnect after deliberate disconnect
+    ssh.disconnect()
+    STATE["ssh_connected"] = False
+    STATE["ssh_error"] = ""
+    emit_status()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/onboard/start", methods=["POST"])
+def api_start_onboard():
+    if not ssh.is_connected():
+        return jsonify({"ok": False, "msg": "SSH not connected"})
+
+    if STATE["onboard_starting"]:
+        return jsonify({
+            "ok": True,
+            "in_progress": True,
+            "msg": "Onboard start already in progress — see progress log below",
+        })
+
+    STATE["onboard_starting"] = True
+    STATE["onboard_progress"] = []
+    emit_status()
+
+    def _do_start():
+        try:
+            # Step 0: push local onboard/*.py to the Pi so edits take effect immediately.
+            _emit_onboard_progress("sync", "starting", "Uploading onboard scripts to Pi...")
+            ok_sync, msg_sync = ssh.sync_onboard_files()
+            _emit_onboard_progress("sync", "done" if ok_sync else "error", msg_sync)
+
+            # Step 1: MAVProxy (try configured port, then auto-detect ttyACM/ttyUSB)
+            normalize_onboard_config()
+            preferred_serial = config.get("mavproxy_serial", "/dev/ttyACM0")
+            serial_candidates = ssh.mavproxy_serial_candidates()
+            if not serial_candidates:
+                diag = ssh.mavproxy_diagnosis()
+                _emit_onboard_progress("mavproxy", "error", diag)
+                _emit_onboard_progress(
+                    "complete", "error",
+                    f"✕ Pix6 USB missing — {diag}",
+                )
+                emit_status()
+                return
+
+            ok_m = False
+            msg_m = ""
+            for attempt, ser in enumerate(serial_candidates):
+                config["mavproxy_serial"] = ser
+                auto_note = ""
+                if ser != preferred_serial:
+                    auto_note = f" (auto-selected; {preferred_serial} not found)"
+
+                if attempt == 0:
+                    _emit_onboard_progress(
+                        "mavproxy", "starting",
+                        f"Launching MAVProxy on {ser}{auto_note}...",
+                    )
+                    ok_m, msg_m = ssh._start_mavproxy_fresh()
+                    if ok_m:
+                        ok_m, msg_m = _wait_onboard_running(
+                            ssh.is_mavproxy_running, "MAVProxy", timeout_sec=30.0
+                        )
+                else:
+                    _emit_onboard_progress(
+                        "mavproxy", "wait",
+                        f"No FC on previous port — trying {ser}...",
+                    )
+                    ok_m, msg_m = ssh._start_mavproxy_fresh()
+                    if ok_m:
+                        ok_m, msg_m = _wait_onboard_running(
+                            ssh.is_mavproxy_running, "MAVProxy", timeout_sec=30.0
+                        )
+
+                if not ok_m:
+                    break
+
+                fc_ok, fc_msg = ssh.wait_for_mavproxy_fc(
+                    on_wait=lambda w: _emit_onboard_progress("mavproxy", "wait", w),
+                )
+                ok_m = fc_ok
+                msg_m = fc_msg
+                if ok_m:
+                    if ser != preferred_serial:
+                        msg_m += f" — saved {ser} for this session (update launch config to keep)"
+                    break
+
+                if attempt + 1 < len(serial_candidates):
+                    ssh.exec(
+                        "pkill -f mavproxy 2>/dev/null; "
+                        "pkill -f MAVProxy 2>/dev/null; sleep 0.5"
+                    )
+
+            if not ok_m:
+                mav_log = ssh.get_mavproxy_log(lines=5)
+                if mav_log:
+                    last_line = mav_log.strip().splitlines()[-1][:150]
+                    msg_m = f"{msg_m} | Log: {last_line}"
+                STATE["onboard_mavproxy"] = ok_m
+                _emit_onboard_progress("mavproxy", "error", msg_m)
+                _emit_onboard_progress(
+                    "complete", "error",
+                    "✕ Failed: MAVProxy / Pix6 — fix serial link then retry",
+                )
+                emit_status()
+                return
+
+            if not ssh.wait_mavproxy_tcp_ready(timeout_sec=20.0):
+                ok_m = False
+                msg_m = (
+                    f"MAVProxy TCP :{MAVPROXY_TCP_PORT} / :{MAVPROXY_ARM_TCP_PORT} not listening — "
+                    f"need {MAVPROXY_ONBOARD_OUT} and {MAVPROXY_ARM_ONBOARD_OUT}"
+                )
+            STATE["onboard_mavproxy"] = ok_m
+            _emit_onboard_progress(
+                "mavproxy", "done" if ok_m else "error", msg_m
+            )
+            emit_status()
+            if not ok_m:
+                _emit_onboard_progress(
+                    "complete", "error",
+                    "✕ Failed: MAVProxy / Pix6 — fix serial link then retry",
+                )
+                emit_status()
+                return
+
+            # Step 2–4: stab → arm → cam sequentially (SSH lock + MAVProxy tcpin = 1 client/port)
+            cam0_dev = config.get("camera0_device", "/dev/video0")
+            cam1_dev = config.get("camera1_device", "/dev/video2")
+            cam_args = f"--cam0 {cam0_dev} --cam1 {cam1_dev}"
+
+            service_specs = [
+                ("mosfet", "mosfet", "onboard_mosfet", 15.0, ""),
+                ("stabilization", "stab", "onboard_stab", 75.0, ""),
+                ("arm_ctrl", "arm", "onboard_arm", 45.0, ""),
+                ("camera", "cam", "onboard_cam", 30.0, cam_args),
+            ]
+            service_labels = {
+                "mosfet": "mosfet_service.py (servo power rail)",
+                "stabilization": "stabilization.py",
+                "arm_ctrl": "new_ar.py (arm controller)",
+                "camera": "camera_stream.py (MJPEG feeds)",
+            }
+            service_results: dict[str, tuple[bool, str]] = {}
+
+            for step, svc, state_key, timeout, extra_args in service_specs:
+                _emit_onboard_progress(
+                    step, "starting",
+                    f"Launching {service_labels[step]}...",
+                )
+                ok, msg = ssh.supervisor_start_and_wait(
+                    svc, timeout_sec=timeout, extra_args=extra_args,
+                )
+                service_results[step] = (ok, msg)
+                with _state_lock:
+                    STATE[state_key] = ok
+                _emit_onboard_progress(step, "done" if ok else "error", msg)
+                emit_status()
+
+            ok_mos, msg_mos = service_results.get("mosfet", (False, "missing result"))
+            ok_s, msg_s = service_results.get("stabilization", (False, "missing result"))
+            ok_a, msg_a = service_results.get("arm_ctrl", (False, "missing result"))
+            ok_c, msg_c = service_results.get("camera", (False, "missing result"))
+
+            core_ok = ok_m and ok_s
+            if core_ok and ok_mos and ok_a and ok_c:
+                summary = "✓ All onboard programs running (MAVProxy, MOSFET, stabilization, new_ar, cameras)"
+            elif core_ok and ok_a and ok_c:
+                parts_warn = []
+                if not ok_mos:
+                    parts_warn.append("MOSFET service")
+                summary = (
+                    "✓ ROV ready — optional failed: " + ", ".join(parts_warn)
+                    if parts_warn
+                    else "✓ ROV ready — cameras unavailable (check device paths / opencv install)"
+                )
+            elif core_ok and ok_a:
+                summary = "✓ ROV ready — cameras unavailable (check device paths / opencv install)"
+            elif core_ok:
+                parts_warn = []
+                if not ok_a:
+                    parts_warn.append("arm controller")
+                if not ok_c:
+                    parts_warn.append("cameras")
+                summary = (
+                    "✓ Thruster control ready. Optional component(s) failed: "
+                    + ", ".join(parts_warn) + " — see Logs"
+                )
+            else:
+                parts = []
+                if not ok_m:
+                    parts.append("MAVProxy")
+                if not ok_s:
+                    parts.append("stabilization")
+                if not ok_a:
+                    parts.append("new_ar")
+                if not ok_c:
+                    parts.append("cameras")
+                summary = "✕ Failed: " + ", ".join(parts) + " — open Logs for details"
+
+            _emit_onboard_progress(
+                "complete",
+                "done" if core_ok else "error",
+                summary,
+            )
+            if core_ok:
+                _on_onboard_stack_ready()
+            else:
+                emit_status()
+        except Exception as e:
+            _emit_onboard_progress("complete", "error", f"Onboard start error: {e}")
+            STATE["onboard_starting"] = False
+            emit_status()
+
+    socketio.start_background_task(_do_start)
+    return jsonify({"ok": True, "msg": "Starting onboard programs..."})
+
+
+@app.route("/api/onboard/stop", methods=["POST"])
+def api_stop_onboard():
+    ssh.supervisor_stop_all()
+    ssh.stop_mavproxy()
+    ssh.exec("sleep 0.75", timeout=5)
+    STATE["onboard_stab"]     = False
+    STATE["onboard_mosfet"]   = False
+    STATE["onboard_arm"]      = False
+    STATE["onboard_cam"]      = False
+    STATE["onboard_mavproxy"] = False
+    STATE["onboard_starting"] = False
+    _reset_onboard_telemetry_state()
+    emit_status()
+    socketio.emit("telemetry", _telemetry_emit_payload())
+    return jsonify({"ok": True})
+
+
+@app.route("/api/topside/start", methods=["POST"])
+def api_start_topside():
+    """Start arm_sender.py on topside. Gamepad control is built into the web UI."""
+    data = request.get_json(force=True) or {}
+    for k in ("pi_ip", "serial_port"):
+        if k in data:
+            config[k] = data[k]
+
+    results = {}
+
+    if not is_local_running("arm"):
+        if not HAVE_PYSERIAL:
+            pip_cmd = f'"{PYTHON}" -m pip install pyserial'
+            results["arm_sender"] = {
+                "ok": False,
+                "msg": (
+                    f"pyserial not installed for {PYTHON}. "
+                    f"Run in a terminal: {pip_cmd}"
+                ),
+            }
+            STATE["arm_running"] = False
+            emit_status()
+            return jsonify({"ok": False, "results": results})
+
+        cmd = [
+            PYTHON, str(ROV_ROOT / "topside" / "arm_sender.py"),
+            "--ip",   config["pi_ip"],
+            "--port", config["serial_port"],
+            "--udp-port", str(int(config.get("arm_udp_port", 5006))),
+        ]
+        ok, msg = start_local_process("arm", cmd, cwd=ROV_ROOT)
+        results["arm_sender"] = {"ok": ok, "msg": msg}
+        STATE["arm_running"] = ok
+
+        if ok:
+            # Re-check after 1 s — if arm_sender crashed immediately (e.g. COM3
+            # denied) this will flip the dot to red before the user notices a
+            # false "running" state.
+            def _arm_confirm():
+                time.sleep(1.0)
+                STATE["arm_running"] = is_local_running("arm")
+                emit_status()
+            socketio.start_background_task(_arm_confirm)
+    else:
+        results["arm_sender"] = {"ok": True, "msg": "already running"}
+
+    emit_status()
+    return jsonify({"ok": True, "results": results})
+
+
+@app.route("/api/topside/stop", methods=["POST"])
+def api_stop_topside():
+    stop_local_process("thrust")
+    stop_local_process("arm")
+    STATE["thrust_running"] = False
+    STATE["arm_running"]    = False
+    emit_status()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/arm_diagnostic", methods=["GET"])
+def api_arm_diagnostic():
+    tel = STATE.get("telemetry", {})
+    rx = tel.get("arm_rx_count")
+    arm_age = _arm_telemetry_age_sec()
+    arm_tel_stale = arm_age is None or arm_age > 5.0
+    hold_neutral = tel.get("arm_hold_neutral")
+    checks = [
+        {
+            "name": "ROV mode (DRIVE/ARMED or STABILIZE)",
+            "ok": _robot_armed(),
+            "detail": STATE.get("mode", "disarmed"),
+        },
+        {
+            "name": "arm_sender running (topside)",
+            "ok": bool(STATE.get("arm_running")),
+            "detail": "Start via Open Control" if not STATE.get("arm_running") else "OK",
+        },
+        {
+            "name": "Onboard arm (new_ar.py on Pi)",
+            "ok": bool(STATE.get("onboard_arm")),
+            "detail": "Start Onboard" if not STATE.get("onboard_arm") else "OK",
+        },
+        {
+            "name": "MOSFET service (Pi)",
+            "ok": not _mosfet_enabled() or bool(STATE.get("onboard_mosfet")),
+            "detail": (
+                "Start Onboard"
+                if _mosfet_enabled() and not STATE.get("onboard_mosfet")
+                else ("N/A" if not _mosfet_enabled() else "OK")
+            ),
+        },
+        {
+            "name": "Servo power rail (MOSFET ON)",
+            "ok": not _mosfet_enabled() or bool(STATE.get("mosfet_on")),
+            "detail": (
+                "Toggle MOSFET ON in control bar"
+                if _mosfet_enabled() and not STATE.get("mosfet_on")
+                else ("N/A" if not _mosfet_enabled() else "OK")
+            ),
+        },
+        {
+            "name": "Pi MAVLink to Pix6",
+            "ok": bool(tel.get("arm_mavlink_ok")),
+            "detail": "Check MAVProxy + onboard arm log" if not tel.get("arm_mavlink_ok") else "OK",
+        },
+        {
+            "name": "Pi arm motion enabled",
+            "ok": bool(tel.get("arm_enabled")),
+            "detail": "Switch to DRIVE/ARMED" if not tel.get("arm_enabled") else "OK",
+        },
+        {
+            "name": "UDP from arm_sender (Pi rx count)",
+            "ok": not arm_tel_stale and rx is not None and int(rx) > 0,
+            "detail": (
+                "Waiting for arm telemetry from Pi"
+                if arm_tel_stale
+                else f"rx={rx if rx is not None else '?'} — plug in arm USB if 0"
+            ),
+        },
+        {
+            "name": "Arm BNO055 read fresh",
+            "ok": not arm_tel_stale and bool(tel.get("arm_imu_ok")) and not bool(tel.get("arm_imu_stale")),
+            "detail": (
+                f"IMU read age {tel.get('arm_imu_read_age_sec')}s — check BNO055 wiring/I2C"
+                if tel.get("arm_imu_stale")
+                else (
+                    "Waiting for BNO055"
+                    if not tel.get("arm_imu_ok")
+                    else "OK"
+                )
+            ),
+        },
+        {
+            "name": "Not stuck in hold-neutral",
+            "ok": not arm_tel_stale and hold_neutral is False,
+            "detail": (
+                f"Arm telemetry stale ({arm_age}s) — restart onboard or check UDP 5008"
+                if arm_tel_stale
+                else (
+                    "Waiting for arm_sender packets"
+                    if hold_neutral
+                    else "OK"
+                )
+            ),
+        },
+    ]
+    return jsonify({
+        "ok": True,
+        "checks": checks,
+        "all_ok": all(c["ok"] for c in checks),
+        "hint": "Mission Planner: SERVO9–16_FUNCTION=1 (RCPassThru), BRD_SAFETYENABLE=0",
+        "arm_joint_us": tel.get("arm_joint_us"),
+        "mode": STATE.get("mode"),
+    })
+
+
+@app.route("/api/arm_jog", methods=["POST"])
+def api_arm_jog():
+    """Pulse one joint via Pi manual PWM (connectivity test). Requires DRIVE/ARMED."""
+    if not _robot_armed():
+        return jsonify({"ok": False, "msg": "Switch to DRIVE/ARMED first"}), 403
+    data = request.get_json(force=True) or {}
+    try:
+        joint_i = int(data.get("joint", 5))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "Invalid joint"}), 400
+    if joint_i not in JOINT_TO_AUX:
+        return jsonify({"ok": False, "msg": "Joint must be 1–7"}), 400
+    aux = JOINT_TO_AUX[joint_i]
+    pwm = _clamp_arm_pwm(data.get("pwm", 1600))
+    center = _clamp_arm_pwm(data.get("center_pwm", 1500))
+    label = ARM_JOINT_NAMES[joint_i - 1]
+    hold_sec = float(data.get("hold_sec", 1.0))
+
+    ok1, msg1 = _send_pi_arm_control({
+        "cmd": "manual_pwm", "enabled": True, "aux": aux, "pwm": pwm,
+    })
+    if not ok1:
+        return jsonify({"ok": False, "msg": msg1}), 500
+
+    def _restore():
+        time.sleep(hold_sec)
+        _send_pi_arm_control({
+            "cmd": "manual_pwm", "enabled": True, "aux": aux, "pwm": center,
+        })
+        time.sleep(0.05)
+        _send_pi_arm_control({"cmd": "manual_pwm", "enabled": False})
+
+    threading.Thread(target=_restore, daemon=True, name=f"arm-jog-{label}").start()
+    return jsonify({
+        "ok": True,
+        "msg": f"Jog {label} → {pwm} µs for {hold_sec:.1f}s",
+        "joint": joint_i,
+        "aux": aux,
+        "pwm": pwm,
+    })
+
+
+@app.route("/api/arm_imu_zero", methods=["POST"])
+def api_arm_imu_zero():
+    ok, msg = _send_pi_arm_control({"cmd": "arm_imu_zero"})
+    if not ok:
+        return jsonify({"ok": False, "msg": msg}), 500
+    time.sleep(0.25)
+    tel = STATE.get("telemetry", {})
+    offset = tel.get("arm_imu_zero_offset")
+    angle = tel.get("arm_imu_angle_deg")
+    if offset is not None:
+        config["arm_imu_zero_offset"] = float(offset)
+        save_config_file()
+    emit_status()
+    return jsonify({
+        "ok": True,
+        "msg": "Arm IMU zeroed — flat is now 0°",
+        "offset_deg": offset,
+        "angle_deg": angle,
+    })
+
+
+@app.route("/api/arm_claw_stop", methods=["GET", "POST"])
+def api_arm_claw_stop():
+    if request.method == "GET":
+        return jsonify({
+            "ok": True,
+            "stop_us": int(config.get("arm_claw_stop_us", 1515)),
+        })
+
+    if not _robot_armed():
+        return jsonify({"ok": False, "msg": "Arm disabled while DISARMED"}), 403
+
+    data = request.get_json(force=True) or {}
+    stop_us = data.get("stop_us")
+    if stop_us is None and data.get("from_manual"):
+        aux = list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults())))
+        if len(aux) < 7:
+            return jsonify({"ok": False, "msg": "No manual AUX7 (Claw) value"}), 400
+        stop_us = aux[6]
+    try:
+        stop_us = _clamp_arm_pwm(stop_us)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "stop_us must be 500–2500"}), 400
+
+    config["arm_claw_stop_us"] = int(stop_us)
+    save_config_file()
+    ok, msg = _send_pi_arm_control({"cmd": "arm_claw_stop", "stop_us": int(stop_us)})
+    emit_status()
+    return jsonify({
+        "ok": ok,
+        "msg": msg or f"Claw stop PWM set to {int(stop_us)} µs",
+        "stop_us": int(stop_us),
+    })
+
+
+@app.route("/api/claw_hold", methods=["GET", "POST"])
+def api_claw_hold():
+    if request.method == "GET":
+        return jsonify({
+            "ok": True,
+            "enabled": bool(STATE.get("claw_hold", False)),
+        })
+
+    if not _robot_armed():
+        return jsonify({
+            "ok": False,
+            "msg": "Claw hold disabled while DISARMED",
+        }), 403
+
+    data = request.get_json(force=True) or {}
+    enabled = bool(data.get("enabled", False))
+    STATE["claw_hold"] = enabled
+    config["claw_hold"] = enabled
+    save_config_file()
+    ok, msg = _send_pi_arm_control({"cmd": "claw_hold", "enabled": enabled})
+    emit_status()
+    return jsonify({"ok": ok, "msg": msg, "enabled": enabled})
+
+
+@app.route("/api/mosfet", methods=["POST"])
+def api_mosfet():
+    if not _mosfet_enabled():
+        return jsonify({
+            "ok": False,
+            "msg": "MOSFET disabled — hardware not installed",
+            "mosfet_on": False,
+            "mosfet_enabled": False,
+        }), 400
+    data = request.get_json(force=True) or {}
+    state = bool(data.get("state", False))
+    ok, msg = _send_mosfet_command(state)
+    if not ok:
+        return jsonify({"ok": False, "msg": msg, "mosfet_on": STATE.get("mosfet_on", False)}), 500
+    STATE["mosfet_on"] = state
+    emit_status()
+    return jsonify({"ok": True, "msg": msg, "mosfet_on": state, "mosfet_enabled": True})
+
+
+@app.route("/api/manual_pwm", methods=["GET"])
+def api_manual_pwm_get():
+    return jsonify({
+        "ok": True,
+        "enabled": bool(STATE.get("manual_pwm_enabled")),
+        "aux_pwm": list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults()))),
+        "thr_pwm": list(STATE.get("manual_thr_pwm", list(_manual_thr_defaults()))),
+        "aux_labels": MANUAL_AUX_LABELS,
+        "thr_labels": MANUAL_THR_LABELS,
+    })
+
+
+def _manual_pwm_json(extra: dict | None = None) -> dict:
+    """Common manual PWM fields for API responses."""
+    payload = {
+        "enabled": STATE.get("manual_pwm_enabled", False),
+        "aux_pwm": list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults()))),
+        "thr_pwm": list(STATE.get("manual_thr_pwm", list(_manual_thr_defaults()))),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+@app.route("/api/manual_pwm", methods=["POST"])
+def api_manual_pwm():
+    if not _robot_armed():
+        return jsonify({
+            "ok": False,
+            "msg": "Manual AUX disabled while DISARMED",
+            "enabled": False,
+        }), 403
+
+    # Ensure Pi arm motion is unlocked before manual override commands.
+    _sync_arm_unlock()
+
+    data = request.get_json(force=True) or {}
+    action = (data.get("action") or "").strip().lower()
+
+    if action == "toggle":
+        enabled = bool(data.get("enabled"))
+        ok_arm, msg_arm = _send_pi_arm_control({"cmd": "manual_pwm", "enabled": enabled})
+        ok_stab, msg_stab = _send_pi_stab_control({"cmd": "manual_pwm", "enabled": enabled})
+        ok = ok_arm and ok_stab
+        msg = "; ".join(filter(None, [msg_arm if ok_arm else f"arm: {msg_arm}",
+                                      msg_stab if ok_stab else f"stab: {msg_stab}"]))
+        if ok_arm or ok_stab:
+            STATE["manual_pwm_enabled"] = enabled
+        emit_status()
+        return jsonify({"ok": ok, "msg": msg, **_manual_pwm_json()})
+
+    if action == "center":
+        ok_arm, msg_arm = _send_pi_arm_control({
+            "cmd": "manual_pwm", "center": True, "enabled": True,
+        })
+        ok_stab, msg_stab = _send_pi_stab_control({
+            "cmd": "manual_pwm", "center": True, "enabled": True,
+        })
+        ok = ok_arm and ok_stab
+        msg = "; ".join(filter(None, [msg_arm if ok_arm else f"arm: {msg_arm}",
+                                      msg_stab if ok_stab else f"stab: {msg_stab}"]))
+        if ok_arm or ok_stab:
+            STATE["manual_pwm_enabled"] = True
+            STATE["manual_aux_pwm"] = list(_manual_aux_defaults())
+            STATE["manual_thr_pwm"] = list(_manual_thr_defaults())
+        emit_status()
+        return jsonify({"ok": ok, "msg": msg, **_manual_pwm_json()})
+
+    if action == "set":
+        parsed = None
+        aux = data.get("aux")
+        motor = data.get("motor")
+        pwm = data.get("pwm")
+        if aux is not None and pwm is not None:
+            try:
+                aux_i = int(aux)
+                pwm_i = _clamp_arm_pwm(pwm)
+                if 1 <= aux_i <= 7:
+                    parsed = ("aux", aux_i, pwm_i,
+                              f"AUX{aux_i} ({MANUAL_AUX_LABELS[aux_i - 1]})")
+            except (TypeError, ValueError):
+                parsed = None
+        elif motor is not None and pwm is not None:
+            try:
+                motor_i = int(motor)
+                pwm_i = _clamp_thr_pwm(pwm)
+                if 1 <= motor_i <= 8:
+                    parsed = ("motor", motor_i, pwm_i,
+                              f"M{motor_i} ({MANUAL_THR_LABELS[motor_i - 1]})")
+            except (TypeError, ValueError):
+                parsed = None
+        elif data.get("line"):
+            parsed = _parse_manual_pwm_line(str(data.get("line")))
+
+        if not parsed:
+            return jsonify({
+                "ok": False,
+                "msg": (
+                    "Use AUX 1–7 / J1–J6 / claw, or M1–M8 / flh etc. plus PWM "
+                    "(e.g. 'J1 1500', 'M3 1600', 'flh 1600')"
+                ),
+            })
+
+        kind, idx, pwm_i, label = parsed
+        if kind == "aux":
+            ok, msg = _send_pi_arm_control({
+                "cmd": "manual_pwm",
+                "enabled": True,
+                "aux": idx,
+                "pwm": pwm_i,
+            })
+            if ok:
+                STATE["manual_pwm_enabled"] = True
+                aux_list = list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults())))
+                while len(aux_list) < 7:
+                    aux_list.append(1500)
+                aux_list[idx - 1] = pwm_i
+                STATE["manual_aux_pwm"] = aux_list
+            emit_status()
+            return jsonify({
+                "ok": ok,
+                "msg": msg,
+                "kind": kind,
+                "aux": idx,
+                "pwm": pwm_i,
+                "label": label,
+                **_manual_pwm_json(),
+            })
+
+        ok, msg = _send_pi_stab_control({
+            "cmd": "manual_pwm",
+            "enabled": True,
+            "motor": idx,
+            "pwm": pwm_i,
+        })
+        if ok:
+            STATE["manual_pwm_enabled"] = True
+            thr_list = list(STATE.get("manual_thr_pwm", list(_manual_thr_defaults())))
+            while len(thr_list) < 8:
+                thr_list.append(NEUTRAL_THR_PWM)
+            thr_list[idx - 1] = pwm_i
+            STATE["manual_thr_pwm"] = thr_list
+        emit_status()
+        return jsonify({
+            "ok": ok,
+            "msg": msg,
+            "kind": kind,
+            "motor": idx,
+            "pwm": pwm_i,
+            "label": label,
+            **_manual_pwm_json(),
+        })
+
+    return jsonify({"ok": False, "msg": "action must be toggle, set, or center"})
+
+
+@app.route("/api/mode", methods=["POST"])
+def api_mode():
+    data = request.get_json(force=True) or {}
+    mode = data.get("mode", "disarmed")
+    if mode not in ("disarmed", "armed", "stabilize"):
+        return jsonify({"ok": False, "msg": "invalid mode"})
+    STATE["mode"] = mode
+    if mode == "disarmed":
+        STATE["ctrl_stabilize"] = False
+        STATE["ctrl_depth_hold"] = False
+        STATE["ctrl_yaw_hold"] = False
+        STATE["manual_pwm_enabled"] = False
+        STATE["manual_thr_pwm"] = list(_manual_thr_defaults())
+    _apply_disarmed_arm_lockout()
+    if mode in ("armed", "stabilize"):
+        if _mosfet_enabled():
+            _sync_arm_power()
+        _sync_arm_claw_hold()
+        _sync_arm_imu_cal()
+        _sync_arm_claw_stop()
+        _subscribe_arm_telemetry()
+    emit_status()
+    return jsonify({"ok": True, "mode": mode})
+
+
+@app.route("/api/colmap", methods=["POST"])
+def api_colmap():
+    if not ssh.is_connected():
+        return jsonify({"ok": False, "msg": "SSH not connected"})
+    ok, msg = ssh.run_colmap()
+    return jsonify({"ok": ok, "msg": msg})
+
+
+@app.route("/api/crabs", methods=["POST"])
+def api_crabs():
+    if not ssh.is_connected():
+        return jsonify({"ok": False, "msg": "SSH not connected"})
+    ok, msg = ssh.run_crabs()
+    return jsonify({"ok": ok, "msg": msg})
+
+
+def _mission_script_status(name: str, cmd_fragment: str) -> dict:
+    """Check if a mission script process is running and return log tail."""
+    if not ssh.is_connected():
+        return {"running": False, "log_tail": "", "last_line": ""}
+    out, _, _ = ssh.exec(
+        f"pgrep -f '{cmd_fragment}' >/dev/null 2>&1 && echo running || echo stopped"
+    )
+    running = "running" in (out or "")
+    log_tail = ssh.get_onboard_log(name, lines=12)
+    lines = [ln for ln in (log_tail or "").splitlines() if ln.strip()]
+    return {
+        "running": running,
+        "log_tail": log_tail or "",
+        "last_line": lines[-1] if lines else "",
+    }
+
+
+@app.route("/api/mission_status")
+def api_mission_status():
+    colmap_cmd = Path(config.get("colmap_command", "colmap_run.py")).name
+    crabs_cmd = Path(config.get("crabs_command", "crabs.py")).name
+    return jsonify({
+        "colmap": _mission_script_status("colmap", colmap_cmd),
+        "crabs":  _mission_script_status("crabs", crabs_cmd),
+    })
+
+
+@app.route("/api/arm_presets", methods=["GET"])
+def api_arm_presets_list():
+    normalize_arm_presets()
+    with _state_lock:
+        current = STATE.get("arm_last_pwm")
+    return jsonify({
+        "ok": True,
+        "presets": config.get("arm_presets", {}),
+        "current": current,
+        "joint_names": ARM_JOINT_NAMES,
+    })
+
+
+@app.route("/api/arm_presets", methods=["POST"])
+def api_arm_presets_save():
+    data = request.get_json(force=True) or {}
+    name = _slug_preset_name(data.get("name", ""))
+    if not name:
+        return jsonify({"ok": False, "msg": "Preset name required"}), 400
+
+    pwm_in = data.get("pwm")
+    if not isinstance(pwm_in, (list, tuple)) or len(pwm_in) < 7:
+        return jsonify({"ok": False, "msg": "Need 7 PWM values (J1–Claw)"}), 400
+
+    try:
+        preset = {
+            "label": str(data.get("label") or name.replace("_", " ").title()).strip(),
+            "pwm": [_clamp_arm_pwm(x) for x in pwm_in[:7]],
+            "j6_angle": float(data.get("j6_angle", 0.0)),
+        }
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "Invalid PWM or J6 angle"}), 400
+
+    normalize_arm_presets()
+    config["arm_presets"][name] = preset
+    save_config_file()
+    return jsonify({"ok": True, "name": name, "preset": preset})
+
+
+@app.route("/api/arm_presets/<name>", methods=["DELETE"])
+def api_arm_presets_delete(name):
+    slug = _slug_preset_name(name)
+    normalize_arm_presets()
+    if slug not in config.get("arm_presets", {}):
+        return jsonify({"ok": False, "msg": f"Unknown preset: {name}"}), 404
+    del config["arm_presets"][slug]
+    save_config_file()
+    return jsonify({"ok": True, "name": slug})
+
+
+@app.route("/api/arm_preset/<name>", methods=["POST"])
+def api_arm_preset(name):
+    if not _robot_armed():
+        return jsonify({"ok": False, "msg": "Arm presets disabled while DISARMED"}), 403
+    normalize_arm_presets()
+    preset = config.get("arm_presets", {}).get(_slug_preset_name(name))
+    if not preset:
+        return jsonify({"ok": False, "msg": f"Unknown preset: {name}"}), 404
+    try:
+        ok, msg = _start_preset_sequence(_slug_preset_name(name), preset)
+        if not ok:
+            return jsonify({"ok": False, "msg": msg}), 409
+        return jsonify({
+            "ok": True,
+            "msg": msg,
+            "preset": name,
+            "sequential": True,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/telemetry_record", methods=["POST"])
+def api_telemetry_record():
+    data = request.get_json(force=True) or {}
+    action = data.get("action", "toggle")
+
+    if action == "start" or (action == "toggle" and not STATE["telemetry_recording"]):
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = LOGS_DIR / f"dive_{stamp}.csv"
+        header = ",".join(TELEMETRY_CSV_FIELDS) + "\n"
+        try:
+            path.write_text(header, encoding="utf-8")
+        except Exception as e:
+            return jsonify({"ok": False, "msg": str(e)}), 500
+        STATE["telemetry_recording"] = True
+        STATE["telemetry_record_file"] = str(path)
+        emit_status()
+        return jsonify({"ok": True, "recording": True, "file": str(path), "session": stamp})
+
+    STATE["telemetry_recording"] = False
+    prev = STATE.get("telemetry_record_file", "")
+    emit_status()
+    return jsonify({"ok": True, "recording": False, "file": prev})
+
+
+@app.route("/api/video_record", methods=["POST"])
+def api_video_record():
+    data = request.get_json(force=True) or {}
+    action = data.get("action", "toggle")
+    mode = str(data.get("mode", "overlay")).strip().lower()
+    if mode not in ("overlay", "raw", "both"):
+        return jsonify({"ok": False, "msg": f"Unknown video mode: {mode}"}), 400
+
+    if action == "start" or (action == "toggle" and not STATE["video_recording"]):
+        VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        STATE["video_recording"] = True
+        STATE["video_record_session"] = stamp
+        STATE["video_record_mode"] = mode
+        STATE["video_record_files"] = []
+        emit_status()
+        return jsonify({
+            "ok": True,
+            "recording": True,
+            "session": stamp,
+            "mode": mode,
+        })
+
+    session = STATE.get("video_record_session", "")
+    video_files = list(STATE.get("video_record_files", []))
+    prev_mode = STATE.get("video_record_mode", "")
+    STATE["video_recording"] = False
+    STATE["video_record_mode"] = ""
+    emit_status()
+    return jsonify({
+        "ok": True,
+        "recording": False,
+        "session": session,
+        "mode": prev_mode,
+        "video_files": video_files,
+    })
+
+
+@app.route("/api/video_record/upload", methods=["POST"])
+def api_video_record_upload():
+    session = (request.form.get("session") or "").strip()
+    camera = (request.form.get("camera") or "unknown").strip().lower()
+    variant = (request.form.get("variant") or "overlay").strip().lower()
+    upload = request.files.get("video")
+    if not session or not upload:
+        return jsonify({"ok": False, "msg": "Missing session or video payload"}), 400
+    if camera not in ("forward", "arm"):
+        return jsonify({"ok": False, "msg": f"Unknown camera: {camera}"}), 400
+    if variant not in ("overlay", "raw"):
+        return jsonify({"ok": False, "msg": f"Unknown variant: {variant}"}), 400
+
+    ext = Path(upload.filename or "").suffix.lower()
+    if ext not in (".webm", ".mp4", ".mkv"):
+        ext = ".webm"
+
+    try:
+        VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+        path = VIDEO_DIR / f"dive_{session}_{camera}_{variant}{ext}"
+        upload.save(str(path))
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+    saved = str(path)
+    with _state_lock:
+        files = list(STATE.get("video_record_files", []))
+        if saved not in files:
+            files.append(saved)
+        STATE["video_record_files"] = files
+    emit_status()
+    return jsonify({"ok": True, "file": saved, "camera": camera, "variant": variant, "session": session})
+
+
+@app.route("/api/status")
+def api_status():
+    with _state_lock:
+        progress = list(STATE["onboard_progress"])
+    return jsonify({
+        "thrust_running":        STATE["thrust_running"],
+        "arm_running":           STATE["arm_running"],
+        "onboard_stab":          STATE["onboard_stab"],
+        "onboard_mosfet":        STATE["onboard_mosfet"],
+        "onboard_arm":           STATE["onboard_arm"],
+        "onboard_cam":           STATE["onboard_cam"],
+        "onboard_mavproxy":      STATE["onboard_mavproxy"],
+        "ssh_connected":         STATE["ssh_connected"],
+        "mode":                  STATE["mode"],
+        "mosfet_on":             STATE["mosfet_on"],
+        "mosfet_enabled":        _mosfet_enabled(),
+        "telemetry_listener_ok": STATE["telemetry_listener_ok"],
+        "onboard_starting":      STATE["onboard_starting"],
+        "onboard_progress":      progress,
+        "telemetry":             STATE["telemetry"],
+        "telemetry_recording":   STATE["telemetry_recording"],
+        "telemetry_record_file": STATE.get("telemetry_record_file", ""),
+        "video_recording":       STATE["video_recording"],
+        "video_record_session":  STATE.get("video_record_session", ""),
+        "video_record_mode":     STATE.get("video_record_mode", ""),
+        "video_record_files":    list(STATE.get("video_record_files", [])),
+        "link_health":           _compute_link_health(),
+        "arm_last_pwm":          STATE.get("arm_last_pwm"),
+        "preset_running":        STATE.get("preset_running", False),
+        "preset_active_name":    STATE.get("preset_active_name", ""),
+        "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
+        "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(_manual_aux_defaults())),
+        "manual_thr_pwm":        STATE.get("manual_thr_pwm", list(_manual_thr_defaults())),
+        "claw_hold":             STATE.get("claw_hold", False),
+        "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", 1515)),
+        "arm_motion_enabled":    _robot_armed(),
+        "arm_pi_enabled":        STATE.get("telemetry", {}).get("arm_enabled"),
+    })
+
+
+@app.route("/api/ctrl", methods=["POST"])
+def api_ctrl():
+    """HTTP fallback for gamepad control (when WebSocket is unavailable)."""
+    data = request.get_json(force=True) or {}
+    _apply_browser_ctrl(data)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/logs/<name>")
+def api_logs(name):
+    with _state_lock:
+        lines = list(STATE["logs"].get(name, []))
+    return jsonify({"lines": lines})
+
+
+@app.route("/api/onboard/progress")
+def api_onboard_progress():
+    with _state_lock:
+        return jsonify({
+            "starting": STATE["onboard_starting"],
+            "events": list(STATE["onboard_progress"]),
+            "onboard_mavproxy": STATE["onboard_mavproxy"],
+            "onboard_mosfet": STATE["onboard_mosfet"],
+            "onboard_stab": STATE["onboard_stab"],
+            "onboard_arm": STATE["onboard_arm"],
+            "onboard_cam": STATE["onboard_cam"],
+        })
+
+
+@app.route("/api/onboard_log/<name>")
+def api_onboard_log(name):
+    allowed = {"mosfet", "stab", "arm", "cam", "colmap", "crabs"}
+    if name not in allowed:
+        return jsonify({"lines": []})
+    out = ssh.get_onboard_log(name)
+    return jsonify({"lines": out.splitlines() if out else []})
+
+
+# ─────────────────────────────────────────────────────────────────────────────

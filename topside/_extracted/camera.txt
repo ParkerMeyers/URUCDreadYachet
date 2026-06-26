@@ -1,0 +1,93 @@
+# CAMERA PROXY
+# ─────────────────────────────────────────────────────────────────────────────
+
+# UI slot 1 = forward, slot 2 = arm
+_CAMERA_UI_URL_KEY = {1: "forward_camera_url", 2: "arm_camera_url"}
+# Pi USB cameras can take >1s to accept a second HTTP client when both feeds start.
+_CAMERA_CONNECT_TIMEOUT = (5, 120)
+_CAMERA_CONNECT_RETRIES = 3
+
+
+def _open_camera_upstream(cam_url: str):
+    """Open one MJPEG upstream with short retries before returning 502 to the browser."""
+    last_exc = None
+    for attempt in range(_CAMERA_CONNECT_RETRIES):
+        try:
+            resp = _requests.get(cam_url, stream=True, timeout=_CAMERA_CONNECT_TIMEOUT)
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < _CAMERA_CONNECT_RETRIES:
+                time.sleep(0.4 * (attempt + 1))
+    raise last_exc
+
+
+@app.route("/camera/<int:cam_num>")
+def camera_stream(cam_num):
+    if cam_num not in (1, 2):
+        return "", 404
+
+    url_key = _CAMERA_UI_URL_KEY.get(cam_num, f"camera{cam_num}_url")
+    cam_url = str(config.get(url_key, "")).strip()
+    if not HAVE_REQUESTS:
+        return Response("requests not installed", status=503)
+    if not cam_url:
+        return Response("camera URL not configured", status=503)
+
+    # One browser request == one upstream connection. Connect before streaming so
+    # unreachable cameras return 502 (img.onerror) instead of 200 with an empty
+    # body that leaves the UI stuck on "No Signal" until the client watchdog fires.
+    try:
+        upstream = _open_camera_upstream(cam_url)
+    except Exception as exc:
+        return Response(str(exc), status=502)
+
+    content_type = upstream.headers.get(
+        "Content-Type", "multipart/x-mixed-replace; boundary=frame"
+    )
+
+    def _gen(resp=upstream):
+        # If the upstream drops, end the response and let the browser reconnect
+        # with a fresh request (client watchdog/retry). Do not loop server-side:
+        # aborted browser feeds used to leak threads and starve camera_stream.py.
+        try:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    return Response(
+        stream_with_context(_gen()),
+        mimetype=content_type,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+@app.route("/camera/<int:cam_num>/snapshot")
+def camera_snapshot(cam_num):
+    if cam_num not in (1, 2):
+        return "", 404
+    if not HAVE_REQUESTS:
+        return jsonify({"ok": False, "msg": "requests not installed"}), 503
+
+    url_key = _CAMERA_UI_URL_KEY.get(cam_num, f"camera{cam_num}_url")
+    base = str(config.get(url_key, "")).rstrip("/")
+    if not base:
+        return "", 404
+
+    snap_url = f"{base}/snapshot"
+    try:
+        r = _requests.get(snap_url, timeout=5)
+        r.raise_for_status()
+        ctype = r.headers.get("Content-Type", "image/jpeg")
+        return Response(r.content, mimetype=ctype)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 502
+
+
+# ─────────────────────────────────────────────────────────────────────────────

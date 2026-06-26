@@ -1,0 +1,35 @@
+# SOCKETIO EVENTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@socketio.on("connect")
+def on_connect():
+    emit_status()
+    socketio.emit("telemetry", _telemetry_emit_payload())
+    with _state_lock:
+        for entry in STATE["onboard_progress"]:
+            socketio.emit("onboard_progress", entry)
+
+
+@socketio.on("request_status")
+def on_request_status(_data=None):
+    emit_status()
+
+
+@socketio.on("ctrl_packet")
+def on_ctrl_packet(data):
+    """Receive gamepad control packet from browser, forward to Pi via UDP."""
+    _apply_browser_ctrl(data)
+
+
+def _apply_browser_ctrl(data: dict):
+    global _last_browser_ctrl, _last_browser_ctrl_time
+    with _ctrl_lock:
+        _last_browser_ctrl = data
+        _last_browser_ctrl_time = time.time()
+    STATE["last_ctrl_time"] = time.time()
+    STATE["ctrl_stabilize"] = bool(data.get("stabilize", False))
+    STATE["ctrl_depth_hold"] = bool(data.get("depth_hold", False))
+    STATE["ctrl_yaw_hold"] = bool(data.get("yaw_hold", False))
+
+
+# ─────────────────────────────────────────────────────────────────────────────

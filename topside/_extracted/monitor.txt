@@ -1,0 +1,123 @@
+# BACKGROUND MONITOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ssh_monitor_counter  = 0      # only query SSH process status every 5 s
+_ssh_was_connected    = False  # True once user has successfully connected
+_ssh_reconnect_active = False  # guard: only one auto-reconnect attempt at a time
+
+
+def _trigger_ssh_reconnect():
+    """Spawn a background thread that attempts one quick SSH reconnect (5 s
+    timeout).  Only fires if the user previously had a working connection and
+    no reconnect is already in flight."""
+    global _ssh_reconnect_active
+    if _ssh_reconnect_active:
+        return
+    if not config.get("pi_ip") or not config.get("pi_user"):
+        return
+    _ssh_reconnect_active = True
+
+    def _do():
+        global _ssh_reconnect_active
+        try:
+            ok, _ = ssh.connect(
+                config["pi_ip"], config["pi_user"], config["pi_password"],
+                port=int(config["pi_ssh_port"]),
+                connect_timeout=5,
+            )
+            if ok:
+                STATE["ssh_connected"] = True
+                STATE["ssh_error"]     = ""
+                emit_status()
+        finally:
+            _ssh_reconnect_active = False
+
+    threading.Thread(target=_do, daemon=True, name="ssh-auto-reconnect").start()
+
+
+def _monitor_loop():
+    global _ssh_monitor_counter, _ssh_was_connected
+    while True:
+        time.sleep(1.0)
+        STATE["thrust_running"] = is_local_running("thrust")
+        STATE["arm_running"]    = is_local_running("arm")
+
+        _ssh_monitor_counter += 1
+        # Skip heavy SSH polling while the startup sequence is running —
+        # it and _wait_onboard_running are already making SSH calls and
+        # competing for the channel can drop the connection.
+        # Between startup sequences, check every 5 s via a single batched exec.
+        if not STATE["onboard_starting"] and _ssh_monitor_counter >= 5:
+            _ssh_monitor_counter = 0
+            if ssh.is_connected():
+                _ssh_was_connected            = True
+                STATE["ssh_connected"]         = True
+                status = ssh.get_onboard_status()
+                STATE["onboard_mavproxy"] = status["mavproxy"]
+                STATE["onboard_mosfet"]   = status["mosfet"]
+                STATE["onboard_stab"]     = status["stab"]
+                STATE["onboard_arm"]      = status["arm"]
+                STATE["onboard_cam"]      = status["cam"]
+            else:
+                STATE["ssh_connected"]    = False
+                STATE["onboard_mavproxy"] = False
+                STATE["onboard_mosfet"]   = False
+                STATE["onboard_stab"]     = False
+                STATE["onboard_arm"]      = False
+                STATE["onboard_cam"]      = False
+                # Auto-reconnect only if the user had a working session before.
+                if _ssh_was_connected:
+                    _trigger_ssh_reconnect()
+
+        tel_age = time.time() - STATE["last_telemetry_time"]
+        if tel_age > 2.0:
+            STATE["telemetry"]["rx_state"] = "NO_TELEMETRY"
+
+        arm_age = _arm_telemetry_age_sec()
+        if arm_age is not None and arm_age > 3.0:
+            _subscribe_arm_telemetry()
+
+        emit_status()
+
+
+def emit_status():
+    with _state_lock:
+        progress = list(STATE["onboard_progress"])
+    link = _compute_link_health()
+    socketio.emit("status", {
+        "thrust_running":        STATE["thrust_running"],
+        "arm_running":           STATE["arm_running"],
+        "onboard_stab":          STATE["onboard_stab"],
+        "onboard_mosfet":        STATE["onboard_mosfet"],
+        "onboard_arm":           STATE["onboard_arm"],
+        "onboard_cam":           STATE["onboard_cam"],
+        "onboard_mavproxy":      STATE["onboard_mavproxy"],
+        "ssh_connected":         STATE["ssh_connected"],
+        "ssh_error":             STATE["ssh_error"],
+        "mode":                  STATE["mode"],
+        "mosfet_on":             STATE["mosfet_on"],
+        "mosfet_enabled":        _mosfet_enabled(),
+        "telemetry_listener_ok": STATE["telemetry_listener_ok"],
+        "onboard_starting":      STATE["onboard_starting"],
+        "onboard_progress":      progress,
+        "telemetry_recording":   STATE["telemetry_recording"],
+        "telemetry_record_file": STATE.get("telemetry_record_file", ""),
+        "video_recording":       STATE["video_recording"],
+        "video_record_session":  STATE.get("video_record_session", ""),
+        "video_record_mode":     STATE.get("video_record_mode", ""),
+        "video_record_files":    list(STATE.get("video_record_files", [])),
+        "link_health":           link,
+        "arm_last_pwm":          STATE.get("arm_last_pwm"),
+        "preset_running":        STATE.get("preset_running", False),
+        "preset_active_name":    STATE.get("preset_active_name", ""),
+        "manual_pwm_enabled":    STATE.get("manual_pwm_enabled", False),
+        "manual_aux_pwm":        STATE.get("manual_aux_pwm", list(_manual_aux_defaults())),
+        "manual_thr_pwm":        STATE.get("manual_thr_pwm", list(_manual_thr_defaults())),
+        "claw_hold":             STATE.get("claw_hold", False),
+        "arm_claw_stop_us":      int(config.get("arm_claw_stop_us", 1515)),
+        "arm_motion_enabled":    _robot_armed(),
+        "arm_pi_enabled":        STATE.get("telemetry", {}).get("arm_enabled"),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────

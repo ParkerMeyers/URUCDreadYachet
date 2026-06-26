@@ -1,0 +1,506 @@
+def normalize_camera_config():
+    """Keep forward/arm URLs and Pi USB wiring consistent for this ROV."""
+    global config
+    c1 = str(config.get("camera1_url", "")).strip()
+    c2 = str(config.get("camera2_url", "")).strip()
+    if c1 and not str(config.get("arm_camera_url", "")).strip():
+        config["arm_camera_url"] = c1
+    if c2 and not str(config.get("forward_camera_url", "")).strip():
+        config["forward_camera_url"] = c2
+    if not str(config.get("forward_camera_url", "")).strip():
+        config["forward_camera_url"] = DEFAULT_CONFIG["forward_camera_url"]
+    if not str(config.get("arm_camera_url", "")).strip():
+        config["arm_camera_url"] = DEFAULT_CONFIG["arm_camera_url"]
+    # Only apply defaults if not explicitly set in rov_config.json.
+    if not str(config.get("camera0_device", "")).strip():
+        config["camera0_device"] = DEFAULT_CONFIG["camera0_device"]
+    if not str(config.get("camera1_device", "")).strip():
+        config["camera1_device"] = DEFAULT_CONFIG["camera1_device"]
+
+
+def normalize_onboard_config():
+    """Force onboard MAVProxy TCP outputs (one tcpin client per port)."""
+    global config
+    normalize_camera_config()
+    normalize_arm_presets()
+    try:
+        config["arm_control_port"] = int(config.get("arm_control_port", config.get("arm_udp_port", 5006)))
+    except (TypeError, ValueError):
+        config["arm_control_port"] = int(config.get("arm_udp_port", 5006))
+    try:
+        config["arm_udp_port"] = int(config.get("arm_udp_port", 5006))
+    except (TypeError, ValueError):
+        config["arm_udp_port"] = 5006
+    # JSON arm commands belong on 5009; CSV arm_sender stays on arm_udp_port (5006).
+    if config["arm_control_port"] == config["arm_udp_port"]:
+        config["arm_control_port"] = 5009
+    try:
+        config["mosfet_control_port"] = int(config.get("mosfet_control_port", 5007))
+    except (TypeError, ValueError):
+        config["mosfet_control_port"] = 5007
+    out2 = str(config.get("mavproxy_out2", "")).strip()
+    if "tcpin" not in out2.lower() or str(MAVPROXY_TCP_PORT) not in out2:
+        config["mavproxy_out2"] = MAVPROXY_ONBOARD_OUT
+    out3 = str(config.get("mavproxy_out3", "")).strip()
+    if "tcpin" not in out3.lower() or str(MAVPROXY_ARM_TCP_PORT) not in out3:
+        config["mavproxy_out3"] = MAVPROXY_ARM_ONBOARD_OUT
+
+
+def _slug_preset_name(name: str) -> str:
+    slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(name).strip().lower())
+    slug = slug.strip("_")
+    return slug or "preset"
+
+
+def _clamp_arm_pwm(value) -> int:
+    return int(max(ARM_PWM_MIN, min(ARM_PWM_MAX, int(round(float(value))))))
+
+
+_preset_lock = threading.Lock()
+
+
+def _pwm_to_csv(pwms: list, j6_angle: float) -> str:
+    vals = [_clamp_arm_pwm(v) for v in pwms[:7]]
+    while len(vals) < 7:
+        vals.append(1500)
+    return ",".join(str(x) for x in vals) + f",{float(j6_angle):.2f}"
+
+
+def _preset_to_csv(preset: dict) -> str:
+    pwms = [_clamp_arm_pwm(v) for v in preset["pwm"][:7]]
+    while len(pwms) < 7:
+        pwms.append(1500)
+    angle = float(preset.get("j6_angle", 0.0))
+    return _pwm_to_csv(pwms, angle)
+
+
+def _current_arm_pose() -> tuple[list[int], float]:
+    """Last known J1..Claw PWM + J6 target angle from arm_sender telemetry."""
+    raw = STATE.get("arm_last_pwm")
+    if isinstance(raw, dict) and isinstance(raw.get("pwm"), list) and len(raw["pwm"]) >= 7:
+        pwms = [_clamp_arm_pwm(x) for x in raw["pwm"][:7]]
+        angle = float(raw.get("j6_angle", 0.0))
+        return pwms, angle
+    return list(ARM_DEFAULT_PWM), 0.0
+
+
+def _joint_move_delay_sec(from_us: int, to_us: int) -> float:
+    """Wait time proportional to PWM travel (full span ≈ max delay)."""
+    delta = abs(_clamp_arm_pwm(to_us) - _clamp_arm_pwm(from_us))
+    if delta < 12:
+        return 0.0
+    span = float(ARM_PWM_MAX - ARM_PWM_MIN)
+    travel = delta / span
+    delay = ARM_PRESET_DELAY_MIN_SEC + travel * (
+        ARM_PRESET_DELAY_MAX_SEC - ARM_PRESET_DELAY_MIN_SEC
+    )
+    return round(min(ARM_PRESET_DELAY_MAX_SEC, max(ARM_PRESET_DELAY_MIN_SEC, delay)), 3)
+
+
+def _emit_preset_progress(payload: dict) -> None:
+    socketio.emit("preset_progress", payload)
+    emit_status()
+
+
+def _run_preset_sequence(preset_name: str, preset: dict) -> None:
+    """Move joints one at a time J6→J1→Claw with distance-based pauses."""
+    label = str(preset.get("label") or preset_name)
+    target_pwms = [_clamp_arm_pwm(v) for v in preset["pwm"][:7]]
+    while len(target_pwms) < 7:
+        target_pwms.append(1500)
+    target_angle = float(preset.get("j6_angle", 0.0))
+
+    try:
+        _send_pi_arm_control({"cmd": "preset_motion", "enabled": True})
+        current_pwms, current_angle = _current_arm_pose()
+        working = list(current_pwms)
+        angle = current_angle
+        total = len(ARM_PRESET_JOINT_ORDER)
+
+        for step_i, joint_idx in enumerate(ARM_PRESET_JOINT_ORDER, start=1):
+            if not _robot_armed():
+                _emit_preset_progress({
+                    "status": "error",
+                    "preset": preset_name,
+                    "label": label,
+                    "msg": "Preset aborted — ROV disarmed",
+                })
+                return
+
+            joint_name = ARM_JOINT_NAMES[joint_idx]
+            from_us = working[joint_idx]
+            to_us = target_pwms[joint_idx]
+            working[joint_idx] = to_us
+            if joint_idx == 5:
+                angle = target_angle
+
+            delay = _joint_move_delay_sec(from_us, to_us)
+            _send_pi_arm_control({
+                "cmd": "preset_step",
+                "pwm": list(working),
+                "j6_angle": angle,
+            })
+
+            with _state_lock:
+                STATE["arm_last_pwm"] = {"pwm": list(working), "j6_angle": angle}
+
+            _emit_preset_progress({
+                "status": "running",
+                "preset": preset_name,
+                "label": label,
+                "joint": joint_name,
+                "step": step_i,
+                "total": total,
+                "delay_sec": delay,
+                "from_us": from_us,
+                "to_us": to_us,
+            })
+
+            if delay > 0:
+                time.sleep(delay)
+
+        _emit_preset_progress({
+            "status": "done",
+            "preset": preset_name,
+            "label": label,
+            "msg": f"Preset '{label}' complete",
+        })
+    except Exception as e:
+        _emit_preset_progress({
+            "status": "error",
+            "preset": preset_name,
+            "label": label,
+            "msg": str(e),
+        })
+    finally:
+        _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
+        with _state_lock:
+            STATE["preset_running"] = False
+            STATE["preset_active_name"] = ""
+        emit_status()
+
+
+def _start_preset_sequence(preset_name: str, preset: dict) -> tuple[bool, str]:
+    with _preset_lock:
+        if STATE.get("preset_running"):
+            return False, "Another preset sequence is already running"
+        STATE["preset_running"] = True
+        STATE["preset_active_name"] = preset_name
+    threading.Thread(
+        target=_run_preset_sequence,
+        args=(preset_name, preset),
+        daemon=True,
+        name=f"preset-{preset_name}",
+    ).start()
+    return True, f"Moving to preset '{preset_name}' (J6→J1→Claw)"
+
+
+def _normalize_preset_entry(raw) -> dict | None:
+    if isinstance(raw, str):
+        parts = raw.replace("PWM:", "").split(",")
+        if len(parts) < 7:
+            return None
+        try:
+            pwms = [_clamp_arm_pwm(x) for x in parts[:7]]
+            angle = float(parts[7]) if len(parts) >= 8 else 0.0
+            return {"label": "Preset", "pwm": pwms, "j6_angle": angle}
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    pwm_in = raw.get("pwm", [])
+    if not isinstance(pwm_in, (list, tuple)) or len(pwm_in) < 7:
+        return None
+    try:
+        pwms = [_clamp_arm_pwm(x) for x in pwm_in[:7]]
+        angle = float(raw.get("j6_angle", 0.0))
+    except (TypeError, ValueError):
+        return None
+    label = str(raw.get("label") or raw.get("name") or "Preset").strip() or "Preset"
+    return {"label": label, "pwm": pwms, "j6_angle": angle}
+
+
+def normalize_arm_presets():
+    """Ensure arm_presets in config is a valid name → preset dict map."""
+    global config
+    raw = config.get("arm_presets")
+    cleaned = {}
+    if isinstance(raw, dict):
+        for name, entry in raw.items():
+            slug = _slug_preset_name(name)
+            norm = _normalize_preset_entry(entry)
+            if norm:
+                if not norm["label"] or norm["label"] == "Preset":
+                    norm["label"] = slug.replace("_", " ").title()
+                cleaned[slug] = norm
+    if not cleaned:
+        cleaned = {
+            k: {
+                "label": v["label"],
+                "pwm": list(v["pwm"]),
+                "j6_angle": float(v["j6_angle"]),
+            }
+            for k, v in DEFAULT_ARM_PRESETS.items()
+        }
+    config["arm_presets"] = cleaned
+
+
+def _parse_arm_sent_line(line: str) -> dict | None:
+    text = line.strip()
+    if not text or text.startswith("BAD "):
+        return None
+    if "SENT:" in text:
+        text = text.split("SENT:", 1)[1].strip()
+    elif text.startswith("RAW:"):
+        return None
+    if text.startswith("PWM:"):
+        text = text[4:]
+    parts = text.split(",")
+    if len(parts) < 7:
+        return None
+    try:
+        pwms = [_clamp_arm_pwm(x) for x in parts[:7]]
+        angle = float(parts[7]) if len(parts) >= 8 else 0.0
+        return {"pwm": pwms, "j6_angle": angle}
+    except (TypeError, ValueError):
+        return None
+
+
+def _robot_armed() -> bool:
+    return STATE.get("mode", "disarmed") in ("armed", "stabilize")
+
+
+def _sync_arm_enable():
+    """Tell new_ar.py whether arm motion is allowed (disabled when DISARMED)."""
+    if _robot_armed():
+        _sync_arm_unlock()
+    else:
+        _send_pi_arm_control({"cmd": "arm_enable", "enabled": False})
+
+
+def _mosfet_enabled() -> bool:
+    load_config_file()
+    val = config.get("mosfet_enabled", True)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(val)
+
+
+def _send_mosfet_command(state: bool) -> tuple[bool, str]:
+    """UDP to Pi mosfet_service.py — same JSON as test/mosfet_test_topside.py."""
+    if not _mosfet_enabled():
+        return False, "MOSFET disabled in config"
+    load_config_file()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            payload = json.dumps({"cmd": "mosfet", "state": bool(state)}).encode("utf-8")
+            port = int(config["mosfet_control_port"])
+            sock.sendto(payload, (config["pi_ip"], port))
+        finally:
+            sock.close()
+        return True, f"sent → {config['pi_ip']}:{port}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _arm_control_ports() -> list[int]:
+    """UDP ports for JSON arm control (primary = arm CSV port, legacy 5009 optional)."""
+    load_config_file()
+    primary = int(config.get("arm_udp_port", 5006))
+    try:
+        legacy = int(config.get("arm_control_port", primary))
+    except (TypeError, ValueError):
+        legacy = primary
+    ports = [primary]
+    if legacy != primary:
+        ports.append(legacy)
+    if 5009 not in ports and primary != 5009:
+        ports.append(5009)
+    return ports
+
+
+def _send_pi_arm_control(payload: dict) -> tuple[bool, str]:
+    """Send JSON control command to new_ar.py on the arm UDP port(s)."""
+    load_config_file()
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sent_ports = []
+            for port in _arm_control_ports():
+                sock.sendto(body, (config["pi_ip"], port))
+                sent_ports.append(str(port))
+        finally:
+            sock.close()
+        return True, f"sent → {config['pi_ip']}:{','.join(sent_ports)}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _send_pi_stab_control(payload: dict) -> tuple[bool, str]:
+    """Send JSON control command to stabilization.py on the thrust UDP port."""
+    load_config_file()
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        port = int(config["thrust_udp_port"])
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.sendto(body, (config["pi_ip"], port))
+        finally:
+            sock.close()
+        return True, f"sent → {config['pi_ip']}:{port}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _sync_arm_power():
+    """Push current MOSFET state to mosfet_service.py on the Pi."""
+    if not _mosfet_enabled():
+        return
+    # Servo rail needs power for any arm motion — auto-enable when armed.
+    if _robot_armed() and not STATE.get("mosfet_on"):
+        STATE["mosfet_on"] = True
+    _send_mosfet_command(bool(STATE.get("mosfet_on", False)))
+
+
+def _apply_disarmed_arm_lockout():
+    """Stop arm motion and overrides when the ROV is disarmed (MOSFET unchanged)."""
+    if _robot_armed():
+        _sync_arm_unlock()
+        return
+    STATE["manual_pwm_enabled"] = False
+    STATE["preset_running"] = False
+    STATE["preset_active_name"] = ""
+    _send_pi_arm_control({"cmd": "arm_enable", "enabled": False})
+    _send_pi_arm_control({"cmd": "manual_pwm", "enabled": False})
+    _send_pi_stab_control({"cmd": "manual_pwm", "enabled": False})
+    _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
+
+
+def _sync_arm_unlock():
+    """Allow arm motion on the Pi (clears stale preset lock)."""
+    _send_pi_arm_control({"cmd": "arm_enable", "enabled": True})
+    if not STATE.get("preset_running"):
+        _send_pi_arm_control({"cmd": "preset_motion", "enabled": False})
+
+
+def _send_arm_csv(csv_line: str):
+    if not _robot_armed():
+        return
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(
+            csv_line.encode("utf-8"),
+            (config["pi_ip"], int(config["arm_udp_port"])),
+        )
+    finally:
+        sock.close()
+
+
+def _parse_manual_pwm_line(line: str) -> tuple[str, int, int, str] | None:
+    """Parse manual PWM line → (kind, index, pwm, label). kind is 'aux' or 'motor'."""
+    line = (line or "").strip()
+    if not line:
+        return None
+    parts = line.split()
+    if len(parts) != 2:
+        return None
+
+    token = parts[0].strip().lower()
+    try:
+        pwm_raw = parts[1]
+    except IndexError:
+        return None
+
+    # Thruster: M1–M8 or motor name alias
+    if token.startswith("m") and len(token) > 1 and token[1:].isdigit():
+        motor_i = int(token[1:])
+        if not (1 <= motor_i <= 8):
+            return None
+        try:
+            pwm = _clamp_thr_pwm(pwm_raw)
+        except (TypeError, ValueError):
+            return None
+        label = f"M{motor_i} ({MANUAL_THR_LABELS[motor_i - 1]})"
+        return "motor", motor_i, pwm, label
+
+    if token in MOTOR_NAME_ALIASES:
+        motor_i = MOTOR_NAME_ALIASES[token]
+        try:
+            pwm = _clamp_thr_pwm(pwm_raw)
+        except (TypeError, ValueError):
+            return None
+        label = f"M{motor_i} ({MANUAL_THR_LABELS[motor_i - 1]})"
+        return "motor", motor_i, pwm, label
+
+    # Arm AUX / joint
+    try:
+        pwm = _clamp_arm_pwm(pwm_raw)
+    except (TypeError, ValueError):
+        return None
+
+    if token in ("claw",):
+        return "aux", 7, pwm, "Claw"
+    if token in ("j6", "wrist"):
+        return "aux", JOINT_TO_AUX[6], pwm, "J6"
+    if token.startswith("j") and token[1:].isdigit():
+        joint_i = int(token[1:])
+        if joint_i not in JOINT_TO_AUX:
+            return None
+        aux = JOINT_TO_AUX[joint_i]
+        label = f"J{joint_i}" if joint_i < 7 else "Claw"
+        return "aux", aux, pwm, label
+    try:
+        aux = int(parts[0])
+    except (TypeError, ValueError):
+        return None
+    if not (1 <= aux <= 7):
+        return None
+    label = f"AUX{aux} ({MANUAL_AUX_LABELS[aux - 1]})"
+    return "aux", aux, pwm, label
+
+
+config = DEFAULT_CONFIG.copy()
+normalize_onboard_config()
+
+CONFIG_PATH = ROV_ROOT / "rov_config.json"
+
+TELEMETRY_CSV_FIELDS = [
+    "time", "state", "depth_m", "hold_depth_m", "yaw_deg", "roll_deg", "pitch_deg",
+    "pressure_hpa", "pressure_temperature_c", "stabilize",
+    "depth_hold_active", "yaw_hold_active", "gain_percent",
+    "control_timeout", "mavlink_link_dead",
+]
+
+
+def load_config_file():
+    """Load persisted config from disk if present."""
+    global config
+    if not CONFIG_PATH.is_file():
+        return
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        for k, v in data.items():
+            if k in config:
+                config[k] = v
+        normalize_onboard_config()
+    except Exception as e:
+        print(f"[WARN] Could not load {CONFIG_PATH}: {e}")
+
+
+def save_config_file():
+    """Persist current config to disk."""
+    try:
+        CONFIG_PATH.write_text(
+            json.dumps(config, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"[WARN] Could not save {CONFIG_PATH}: {e}")
+
+
+load_config_file()
+
+
+# ─────────────────────────────────────────────────────────────────────────────

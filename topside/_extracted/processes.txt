@@ -1,0 +1,90 @@
+# LOCAL PROCESS MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+_procs: dict[str, subprocess.Popen] = {}
+_procs_lock = threading.Lock()
+
+
+def _topside_dir():
+    return ROV_ROOT / "topside"
+
+
+def start_local_process(name: str, cmd: list[str], cwd=None, env_extra=None):
+    with _procs_lock:
+        proc = _procs.get(name)
+        if proc and proc.poll() is None:
+            return True, "already running"
+
+        env = os.environ.copy()
+        env.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
+        if env_extra:
+            env.update(env_extra)
+
+        try:
+            kwargs = dict(
+                cwd=str(cwd or ROV_ROOT),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            if IS_WINDOWS:
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            proc = subprocess.Popen(cmd, **kwargs)
+            _procs[name] = proc
+        except Exception as e:
+            return False, str(e)
+
+    threading.Thread(
+        target=_drain_process_output, args=(name, proc), daemon=True
+    ).start()
+    return True, "started"
+
+
+def stop_local_process(name: str):
+    with _procs_lock:
+        proc = _procs.pop(name, None)
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def is_local_running(name: str) -> bool:
+    with _procs_lock:
+        proc = _procs.get(name)
+        return proc is not None and proc.poll() is None
+
+
+def _drain_process_output(name: str, proc: subprocess.Popen):
+    """Read stdout from a local process and emit logs."""
+    for raw_line in proc.stdout:
+        line = raw_line.rstrip()
+        if not line:
+            continue
+
+        with _state_lock:
+            log_list = STATE["logs"].get(name, [])
+            log_list.append(line)
+            if len(log_list) > MAX_LOG_LINES:
+                del log_list[:-MAX_LOG_LINES]
+            if name == "arm":
+                parsed = _parse_arm_sent_line(line)
+                if parsed:
+                    STATE["arm_last_pwm"] = parsed
+
+        socketio.emit("process_log", {"name": name, "line": line})
+
+    with _state_lock:
+        if name == "thrust":
+            STATE["thrust_running"] = False
+        elif name == "arm":
+            STATE["arm_running"] = False
+
+    emit_status()
+
+
+# ─────────────────────────────────────────────────────────────────────────────

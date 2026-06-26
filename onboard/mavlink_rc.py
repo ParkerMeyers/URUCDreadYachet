@@ -15,10 +15,11 @@ RC_IGNORE = 65535
 
 # MAVProxy tcpin accepts ONE TCP client per port — use separate ports:
 #   stabilization.py → 5762   new_ar.py → 5763
-# MAVProxy must expose both:
-#   --out=tcpin:127.0.0.1:5762 --out=tcpin:127.0.0.1:5763
-MAVLINK_ONBOARD = "tcp:127.0.0.1:5762"
-MAVLINK_ONBOARD_ARM = "tcp:127.0.0.1:5763"
+# See onboard/ports.py for the full port map.
+from onboard.ports import MAVPROXY_ONBOARD_ARM, MAVPROXY_ONBOARD_STAB
+
+MAVLINK_ONBOARD = MAVPROXY_ONBOARD_STAB.replace("tcpin:", "tcp:")
+MAVLINK_ONBOARD_ARM = MAVPROXY_ONBOARD_ARM.replace("tcpin:", "tcp:")
 
 _ENCODER = mav_v20.MAVLink(None, srcSystem=255, srcComponent=190)
 

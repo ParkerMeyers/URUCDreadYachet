@@ -1,0 +1,463 @@
+# TELEMETRY RECEIVER — parses JSON directly from stabilization.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _forward_ctrl_to_pi(packet: dict):
+    """Send a control JSON packet to stabilization.py on the Pi."""
+    ip = config["pi_ip"]
+    port = int(config["thrust_udp_port"])
+    try:
+        _pi_ctrl_sock.sendto(json.dumps(packet).encode("utf-8"), (ip, port))
+    except Exception as e:
+        print(f"[WARN] Control UDP send failed: {e}")
+
+
+def _get_active_ctrl_packet() -> dict:
+    """Pick the best control packet to send: live browser input or neutral keepalive."""
+    global _ctrl_keepalive_seq
+    with _ctrl_lock:
+        recent = (time.time() - _last_browser_ctrl_time) < 1.0
+        if recent and _last_browser_ctrl:
+            return dict(_last_browser_ctrl)
+
+    with _ctrl_lock:
+        _ctrl_keepalive_seq += 1
+        seq = _ctrl_keepalive_seq
+
+    mode = STATE.get("mode", "disarmed")
+    armed = mode in ("armed", "stabilize")
+    return {
+        "seq": seq,
+        "time": time.time(),
+        "forward": 0.0,
+        "lateral": 0.0,
+        "yaw": 0.0,
+        "vertical": 0.0,
+        "stabilize": STATE.get("ctrl_stabilize", False) if armed else False,
+        "depth_hold": STATE.get("ctrl_depth_hold", False) if armed else False,
+        "yaw_hold": STATE.get("ctrl_yaw_hold", False) if armed else False,
+        "gain_percent": STATE["telemetry"].get("gain_percent", 100),
+        "telemetry_port": int(config["telemetry_port"]),
+    }
+
+
+def _make_keepalive_packet() -> dict:
+    """Backward-compatible alias."""
+    return _get_active_ctrl_packet()
+
+
+def _start_control_sender():
+    """Send control UDP at a fixed 50 Hz — browser only updates the cached packet."""
+    interval = 1.0 / CTRL_SEND_HZ
+
+    def _loop():
+        next_t = time.time()
+        while True:
+            _forward_ctrl_to_pi(_get_active_ctrl_packet())
+            next_t += interval
+            delay = next_t - time.time()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_t = time.time()
+
+    threading.Thread(target=_loop, daemon=True, name="ctrl-sender").start()
+
+
+def _emit_onboard_progress(step: str, status: str, msg: str = ""):
+    """Record onboard start progress and push to all connected browsers."""
+    entry = {"step": step, "status": status, "msg": msg, "time": time.time()}
+    with _state_lock:
+        STATE["onboard_progress"].append(entry)
+        if len(STATE["onboard_progress"]) > 50:
+            STATE["onboard_progress"] = STATE["onboard_progress"][-50:]
+        if step == "complete":
+            STATE["onboard_starting"] = False
+
+    socketio.emit("onboard_progress", entry)
+
+
+def _wait_onboard_running(check_fn, label: str, timeout_sec: float = 12.0) -> tuple[bool, str]:
+    """Poll until an onboard process is running or timeout.
+    Polls every 2 s so we don't flood the SSH connection while
+    the monitor loop is also making SSH calls every second.
+    While SSH is disconnected the countdown is paused — disconnected time
+    does not count against the budget, since the process may be running fine
+    (it's nohup'd) and we just can't reach the Pi temporarily."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if not ssh.is_connected():
+            time.sleep(2.0)
+            deadline += 2.0  # don't count time we can't even poll against timeout
+            continue
+        if check_fn():
+            return True, f"{label} running"
+        time.sleep(2.0)
+    return False, f"{label} did not start within {int(timeout_sec)}s — check onboard logs"
+
+
+def _arm_telemetry_age_sec() -> float | None:
+    last = STATE.get("last_arm_telemetry_time", 0.0)
+    if last <= 0:
+        return None
+    return round(time.time() - last, 2)
+
+
+def _reset_onboard_telemetry_state() -> None:
+    """Clear stale telemetry after onboard stop/restart so UI waits for fresh data."""
+    tel = STATE["telemetry"]
+    tel["rx_state"] = "NO_TELEMETRY"
+    tel["attitude_stale"] = False
+    tel["depth_stale"] = False
+    tel["mavlink_link_dead"] = False
+    tel["control_timeout"] = False
+    tel["arm_imu_ok"] = False
+    tel["arm_bno_ready"] = False
+    tel["arm_imu_stale"] = False
+    tel["arm_imu_angle_deg"] = None
+    tel["arm_j6_target_deg"] = None
+    tel["arm_j6_pwm_out"] = None
+    tel["arm_claw_hold_active"] = False
+    tel["arm_hold_neutral"] = None
+    tel["arm_rx_count"] = None
+    tel["arm_enabled"] = None
+    tel["arm_mavlink_ok"] = None
+    tel["arm_joint_us"] = None
+    tel["arm_manual_mode"] = None
+    tel["arm_preset_motion"] = None
+    STATE["last_telemetry_time"] = 0.0
+    STATE["last_arm_telemetry_time"] = 0.0
+    STATE["telemetry_packets"] = 0
+    STATE["telemetry_rate_hz"] = 0.0
+
+
+def _on_onboard_stack_ready() -> None:
+    """Re-subscribe topside listeners after Pi processes restart."""
+    _reset_onboard_telemetry_state()
+    _subscribe_arm_telemetry()
+    _sync_arm_claw_hold()
+    _sync_arm_imu_cal()
+    _sync_arm_claw_stop()
+    _apply_disarmed_arm_lockout()
+    if STATE.get("onboard_mosfet"):
+        _sync_arm_power()
+    socketio.emit("telemetry", _telemetry_emit_payload())
+    emit_status()
+
+    def _resync_arm_after_restart():
+        for delay in (0.75, 2.0, 5.0):
+            time.sleep(delay)
+            if STATE.get("onboard_mosfet"):
+                _sync_arm_power()
+            if not STATE.get("onboard_arm"):
+                continue
+            _subscribe_arm_telemetry()
+            _sync_arm_claw_hold()
+            _sync_arm_imu_cal()
+            _sync_arm_claw_stop()
+            _sync_arm_enable()
+            if STATE.get("onboard_mosfet"):
+                _sync_arm_power()
+
+    socketio.start_background_task(_resync_arm_after_restart)
+
+
+def _telemetry_emit_payload() -> dict:
+    payload = dict(STATE["telemetry"])
+    payload["link_health"] = _compute_link_health()
+    payload["arm_telemetry_age_sec"] = _arm_telemetry_age_sec()
+    return payload
+
+
+def _update_telemetry_from_json(pkt: dict):
+    """Map stabilization.py JSON telemetry → UI state and emit to browser."""
+    if pkt.get("type") == "arm":
+        _update_arm_telemetry_from_json(pkt)
+        return
+
+    tel = STATE["telemetry"]
+    tel["rx_state"]                = pkt.get("state", "OK")
+    tel["gain_percent"]            = pkt.get("gain_percent", tel["gain_percent"])
+    tel["stabilize"]               = bool(pkt.get("stabilize", False))
+    tel["depth_hold_request"]      = bool(pkt.get("depth_hold_request", False))
+    tel["depth_hold_active"]       = bool(pkt.get("depth_hold_active", False))
+    tel["yaw_hold_request"]        = bool(pkt.get("yaw_hold_request", False))
+    tel["yaw_hold_active"]         = bool(pkt.get("yaw_hold_active", False))
+    tel["depth_m"]                 = pkt.get("depth_m")
+    tel["hold_depth_m"]            = pkt.get("hold_depth_m")
+    tel["yaw_deg"]                 = pkt.get("yaw_deg")
+    tel["hold_yaw_deg"]            = pkt.get("hold_yaw_deg")
+    tel["roll_deg"]                = pkt.get("roll_deg")
+    tel["pitch_deg"]               = pkt.get("pitch_deg")
+    tel["h_group"]                 = float(pkt.get("horizontal_group", 0.0))
+    tel["v_group"]                 = float(pkt.get("vertical_group", 0.0))
+    tel["pressure_hpa"]            = pkt.get("pressure_hpa")
+    tel["temperature_c"]           = pkt.get("pressure_temperature_c")
+    tel["control_timeout"]         = bool(pkt.get("control_timeout", False))
+    tel["attitude_stale"]          = bool(pkt.get("attitude_stale", False))
+    tel["depth_stale"]             = bool(pkt.get("depth_stale", False))
+    tel["mavlink_link_dead"]       = bool(pkt.get("mavlink_link_dead", False))
+    tel["mavlink_last_rx_age_sec"] = pkt.get("mavlink_last_rx_age_sec")
+    tel["attitude_age_sec"]        = pkt.get("attitude_age_sec")
+    tel["depth_recapture_pending"] = bool(pkt.get("depth_recapture_pending", False))
+    tel["yaw_recapture_pending"]   = bool(pkt.get("yaw_recapture_pending", False))
+
+    now = time.time()
+    STATE["last_telemetry_time"] = now
+    STATE["telemetry_packets"]   = STATE.get("telemetry_packets", 0) + 1
+
+    _telemetry_rate_counter["count"] += 1
+    elapsed = now - _telemetry_rate_counter["window_start"]
+    if elapsed >= 1.0:
+        STATE["telemetry_rate_hz"] = round(_telemetry_rate_counter["count"] / elapsed, 1)
+        _telemetry_rate_counter["count"] = 0
+        _telemetry_rate_counter["window_start"] = now
+
+    _append_telemetry_record(pkt)
+    socketio.emit("telemetry", _telemetry_emit_payload())
+
+
+def _update_arm_telemetry_from_json(pkt: dict):
+    """Merge arm BNO055 gripper telemetry into UI state."""
+    tel = STATE["telemetry"]
+    tel["arm_bno_ready"]     = bool(pkt.get("arm_bno_ready", pkt.get("arm_imu_ok")))
+    tel["arm_imu_ok"]        = bool(pkt.get("arm_imu_ok"))
+    tel["arm_imu_stale"]     = bool(pkt.get("arm_imu_stale"))
+    tel["arm_imu_angle_deg"] = pkt.get("arm_imu_angle_deg")
+    tel["arm_j6_target_deg"] = pkt.get("arm_j6_target_deg")
+    tel["arm_j6_pwm_out"]    = pkt.get("arm_j6_pwm_out")
+    tel["arm_claw_hold_request"] = bool(pkt.get("arm_claw_hold_request", tel.get("arm_claw_hold_request", False)))
+    tel["arm_claw_hold_active"]  = bool(pkt.get("arm_claw_hold_active", False))
+    tel["arm_j6_manual"]         = bool(pkt.get("arm_j6_manual", True))
+    if pkt.get("arm_enabled") is not None:
+        tel["arm_enabled"] = bool(pkt.get("arm_enabled"))
+    if pkt.get("arm_rx_count") is not None:
+        tel["arm_rx_count"] = int(pkt.get("arm_rx_count"))
+    if pkt.get("arm_hold_neutral") is not None:
+        tel["arm_hold_neutral"] = bool(pkt.get("arm_hold_neutral"))
+    if pkt.get("arm_mavlink_ok") is not None:
+        tel["arm_mavlink_ok"] = bool(pkt.get("arm_mavlink_ok"))
+    if isinstance(pkt.get("arm_joint_us"), list):
+        tel["arm_joint_us"] = pkt["arm_joint_us"]
+    if pkt.get("arm_manual_mode") is not None:
+        tel["arm_manual_mode"] = bool(pkt.get("arm_manual_mode"))
+    if pkt.get("arm_preset_motion") is not None:
+        tel["arm_preset_motion"] = bool(pkt.get("arm_preset_motion"))
+    if pkt.get("arm_imu_zero_offset") is not None:
+        tel["arm_imu_zero_offset"] = float(pkt["arm_imu_zero_offset"])
+    if pkt.get("arm_imu_sign") is not None:
+        tel["arm_imu_sign"] = float(pkt["arm_imu_sign"])
+    if pkt.get("arm_claw_stop_us") is not None:
+        tel["arm_claw_stop_us"] = int(pkt["arm_claw_stop_us"])
+    if pkt.get("arm_mosfet_on") is not None:
+        tel["arm_mosfet_on"] = bool(pkt.get("arm_mosfet_on"))
+    if pkt.get("arm_mosfet_gpio_ok") is not None:
+        tel["arm_mosfet_gpio_ok"] = bool(pkt.get("arm_mosfet_gpio_ok"))
+    if pkt.get("arm_imu_read_age_sec") is not None:
+        tel["arm_imu_read_age_sec"] = float(pkt["arm_imu_read_age_sec"])
+    STATE["last_arm_telemetry_time"] = time.time()
+    socketio.emit("telemetry", _telemetry_emit_payload())
+
+
+def _sync_arm_claw_hold():
+    """Push claw-hold flag to new_ar.py (J6 IMU auto-level)."""
+    _send_pi_arm_control({
+        "cmd": "claw_hold",
+        "enabled": bool(STATE.get("claw_hold", False)),
+    })
+
+
+def _sync_arm_claw_stop():
+    """Push persisted claw stop PWM to new_ar.py."""
+    _send_pi_arm_control({
+        "cmd": "arm_claw_stop",
+        "stop_us": int(config.get("arm_claw_stop_us", 1515)),
+    })
+
+
+def _sync_arm_imu_cal():
+    """Push persisted arm IMU sign/zero to new_ar.py."""
+    _send_pi_arm_control({
+        "cmd": "arm_imu_cal",
+        "sign": float(config.get("arm_imu_sign", -1.0)),
+        "zero_offset_deg": float(config.get("arm_imu_zero_offset", -154.0)),
+    })
+
+
+def _subscribe_arm_telemetry():
+    """Ask new_ar.py on the Pi to push arm IMU data to our UDP listener."""
+    try:
+        payload = json.dumps({
+            "cmd": "arm_telemetry",
+            "subscribe": True,
+            "port": int(config.get("arm_telemetry_port", 5008)),
+        }).encode("utf-8")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            body = payload
+            for port in _arm_control_ports():
+                s.sendto(body, (config["pi_ip"], port))
+        finally:
+            s.close()
+    except Exception as e:
+        print(f"[WARN] Arm telemetry subscribe failed: {e}")
+
+
+def _start_arm_telemetry_subscribe_loop():
+    """Re-subscribe periodically so new_ar picks us up after restarts."""
+    def _loop():
+        while True:
+            _subscribe_arm_telemetry()
+            _sync_arm_claw_hold()
+            _sync_arm_imu_cal()
+            _sync_arm_claw_stop()
+            _sync_arm_enable()
+            _sync_arm_power()
+            time.sleep(5.0)
+
+    threading.Thread(target=_loop, daemon=True, name="arm-tel-sub").start()
+
+
+def _start_arm_telemetry_listener():
+    """Listen for JSON arm IMU telemetry from new_ar.py on arm_telemetry_port."""
+    def _listen():
+        port = int(config.get("arm_telemetry_port", 5008))
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", port))
+            s.settimeout(1.0)
+        except Exception as e:
+            print(
+                f"[ERROR] Arm telemetry listener bind failed on port {port}: {e}"
+            )
+            return
+
+        print(f"[INFO] Arm telemetry listener active on UDP port {port}")
+        _subscribe_arm_telemetry()
+        _sync_arm_claw_hold()
+        _sync_arm_imu_cal()
+        _sync_arm_claw_stop()
+        _sync_arm_enable()
+        _sync_arm_power()
+        while True:
+            try:
+                data, _ = s.recvfrom(4096)
+                try:
+                    pkt = json.loads(data.decode("utf-8"))
+                    if pkt.get("type") == "arm":
+                        _update_arm_telemetry_from_json(pkt)
+                except Exception:
+                    pass
+            except socket.timeout:
+                pass
+            except Exception:
+                pass
+
+    threading.Thread(target=_listen, daemon=True, name="arm-tel-listen").start()
+
+
+def _append_telemetry_record(pkt: dict):
+    """Append one telemetry row to the active CSV black-box file."""
+    if not STATE.get("telemetry_recording"):
+        return
+    path = STATE.get("telemetry_record_file")
+    if not path:
+        return
+    record = dict(pkt)
+    record.setdefault("gain_percent", STATE["telemetry"].get("gain_percent"))
+    row = []
+    for key in TELEMETRY_CSV_FIELDS:
+        val = record.get(key)
+        if val is None and key == "pressure_temperature_c":
+            val = record.get("pressure_temperature_c")
+        if val is None:
+            row.append("")
+        elif isinstance(val, bool):
+            row.append("1" if val else "0")
+        else:
+            row.append(str(val))
+    line = ",".join(row) + "\n"
+    try:
+        with _telemetry_record_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception as e:
+        print(f"[WARN] Telemetry record write failed: {e}")
+
+
+def _compute_link_health() -> dict:
+    """Composite link health from telemetry + control path."""
+    tel = STATE["telemetry"]
+    tel_age = time.time() - STATE["last_telemetry_time"]
+    ctrl_age = time.time() - STATE.get("last_ctrl_time", 0.0)
+
+    level = "ok"
+    detail_parts = []
+
+    if tel_age > 2.0 or tel.get("rx_state") == "NO_TELEMETRY":
+        level = "err"
+        detail_parts.append(f"telem {tel_age:.1f}s")
+    elif tel.get("control_timeout") or tel.get("rx_state") not in ("OK", None):
+        level = "warn" if level == "ok" else level
+        detail_parts.append(tel.get("rx_state", "fault"))
+
+    if tel.get("mavlink_link_dead"):
+        level = "err"
+        detail_parts.append("mavlink dead")
+    elif tel.get("attitude_stale") or tel.get("depth_stale"):
+        level = "warn" if level == "ok" else level
+        if tel.get("attitude_stale"):
+            detail_parts.append("IMU stale")
+        if tel.get("depth_stale"):
+            detail_parts.append("depth stale")
+
+    if ctrl_age > 1.5:
+        level = "warn" if level == "ok" else level
+        detail_parts.append(f"ctrl {ctrl_age:.1f}s")
+
+    return {
+        "level": level,
+        "detail": " · ".join(detail_parts) if detail_parts else "OK",
+        "telemetry_age_sec": round(tel_age, 2),
+        "ctrl_age_sec": round(ctrl_age, 2),
+        "telemetry_rate_hz": STATE.get("telemetry_rate_hz", 0.0),
+    }
+
+
+def _start_telemetry_listener():
+    """Listen for JSON telemetry from stabilization.py on telemetry_port (UDP)."""
+    def _listen():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", int(config["telemetry_port"])))
+            s.settimeout(1.0)
+            STATE["telemetry_listener_ok"] = True
+            emit_status()
+        except Exception as e:
+            STATE["telemetry_listener_ok"] = False
+            emit_status()
+            print(
+                f"[ERROR] Telemetry listener bind failed on port {config['telemetry_port']}: {e}\n"
+                f"        Stop thrust_sender.py or any other program using UDP {config['telemetry_port']}."
+            )
+            return
+
+        print(f"[INFO] Telemetry listener active on UDP port {config['telemetry_port']}")
+        while True:
+            try:
+                data, _ = s.recvfrom(8192)
+                try:
+                    pkt = json.loads(data.decode("utf-8"))
+                    _update_telemetry_from_json(pkt)
+                except Exception:
+                    pass
+            except socket.timeout:
+                pass
+            except Exception:
+                pass
+
+    threading.Thread(target=_listen, daemon=True).start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────

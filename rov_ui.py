@@ -5,31 +5,27 @@ from __future__ import annotations
 ROV Web Control UI — DreadYachet ROV Main Control System
 =========================================================
 
-A fully web-based dashboard for the DreadYachet ROV.
-Gamepad control is handled directly in the browser (replaces thrust_sender.py pygame UI).
+Modular topside dashboard. Shared code lives in ``topside/``; this file
+holds Flask routes and segment wiring.
 
-Architecture:
-  Browser Gamepad API → WebSocket → Flask → UDP 5005 → Pi stabilization.py
-  Pi stabilization.py → UDP 5006 → Flask → WebSocket → Browser telemetry
+Robot segments (each debuggable independently):
+  THRUST   — browser gamepad → UDP 5005 → onboard/stabilization.py
+  ARM      — arm_sender.py → UDP 5006 → onboard/new_ar.py
+  MOSFET   — UDP 5007 → onboard/mosfet_service.py
+  CAMERA   — HTTP MJPEG ← onboard/camera_stream.py (:8160/:8161)
+  SSH      — Pi process supervisor (onboard/supervisor.py)
 
-Features:
-  - Full Gamepad API control (same keybinds/axes/logic as thrust_sender.py)
-  - Keybinds/Controls reference screen
-  - SSH to Pi → launch/monitor stabilization.py + new_ar.py
-  - Local process launch for arm_sender.py
-  - Live MJPEG camera feed proxying from Pi
-  - Real-time telemetry via WebSocket (JSON from stabilization.py directly)
-  - Direction HUD overlay on camera feeds
-  - MOSFET / servo power toggle (via UDP to Pi)
-  - Drive mode selection (Disarmed / Armed / Stabilize)
-  - COLMAP and Crabs sequence SSH commands
-
-Dependencies:
-    pip install flask flask-socketio paramiko requests
+Package layout:
+  topside/config.py      — rov_config.json load/save
+  topside/state.py       — runtime STATE dict
+  topside/constants.py   — PWM limits, joint maps, ports
+  topside/ssh_manager.py — SSH + MAVProxy + onboard start
+  topside/segments/mosfet.py — MOSFET UDP commands
+  onboard/ports.py       — shared UDP/TCP port map
 
 Usage:
     python rov_ui.py
-    Then open http://localhost:8080
+    Open http://localhost:8080
 """
 
 import os
@@ -49,7 +45,6 @@ from pathlib import Path
 
 IS_WINDOWS = platform.system() == "Windows"
 PYTHON = sys.executable
-ROV_ROOT = Path(__file__).parent
 
 log = logging.getLogger("werkzeug")
 log.setLevel(logging.ERROR)
@@ -99,189 +94,45 @@ _ctrl_keepalive_seq = 0
 CTRL_SEND_HZ = 50
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DEFAULT CONFIGURATION
+# SHARED MODULES (config, state, constants, SSH, MOSFET segment)
 # ─────────────────────────────────────────────────────────────────────────────
 
-ARM_JOINT_NAMES = ["J1", "J2", "J3", "J4", "J5", "J6", "Claw"]
-ARM_PWM_MIN = 500
-ARM_PWM_MAX = 2500
-ARM_DEFAULT_PWM = [1500, 1500, 1500, 1500, 1500, 1500, 1515]  # J1..J6, Claw
+from topside.config import (
+    CONFIG_PATH,
+    ROV_ROOT,
+    config,
+    load_config_file,
+    normalize_arm_presets,
+    normalize_onboard_config,
+    save_config_file,
+    slug_preset_name,
+)
+from topside.constants import *  # noqa: F403
+from topside.state import (
+    LOGS_DIR,
+    STATE,
+    VIDEO_DIR,
+    _state_lock,
+    _telemetry_rate_counter,
+    _telemetry_record_lock,
+    manual_aux_defaults,
+    manual_thr_defaults,
+)
+from topside.util import clamp_arm_pwm, clamp_thr_pwm
+from topside.ssh_manager import ssh
+from topside.segments import mosfet
 
-# Preset motion order: J6 → J5 → … → J1 → Claw (indices into pwm[7])
-ARM_PRESET_JOINT_ORDER = (5, 4, 3, 2, 1, 0, 6)
-ARM_PRESET_DELAY_MIN_SEC = 0.45
-ARM_PRESET_DELAY_MAX_SEC = 4.0
+_manual_aux_defaults = manual_aux_defaults
+_manual_thr_defaults = manual_thr_defaults
+_clamp_arm_pwm = clamp_arm_pwm
+_clamp_thr_pwm = clamp_thr_pwm
+_slug_preset_name = slug_preset_name
+_mosfet_enabled = mosfet.is_enabled
+_send_mosfet_command = mosfet.send_command
 
-# Pix6 AUX1–7 joint labels (matches onboard/new_ar.py AUX_LABELS)
-MANUAL_AUX_LABELS = ["J5", "J2", "J6", "J1", "J3", "J4", "Claw"]
-# AUX7 (Claw) stop PWM comes from arm_claw_stop_us in config — see _manual_aux_defaults()
-MANUAL_AUX_DEFAULTS = [1500, 1500, 1500, 1500, 1500, 1500, 1515]  # legacy fallback
-# Joint index 1–7 (J1..J6, Claw) → AUX port on Pix6
-JOINT_TO_AUX = {1: 4, 2: 2, 3: 5, 4: 6, 5: 1, 6: 3, 7: 7}
-AUX_TO_JOINT = {v: k for k, v in JOINT_TO_AUX.items()}
-
-# Pix6 RC1–8 thruster labels (matches onboard/stabilization.py MOTOR_CH_TO_NAME)
-MANUAL_THR_LABELS = [
-    "FL_H", "BL_H", "FL_V", "FR_V", "FR_H", "BR_H", "BR_V", "BL_V",
-]
-MANUAL_THR_NAMES = {
-    1: "front_left_h",
-    2: "back_left_h",
-    3: "front_left_v",
-    4: "front_right_v",
-    5: "front_right_h",
-    6: "back_right_h",
-    7: "back_right_v",
-    8: "back_left_v",
-}
-MOTOR_NAME_ALIASES = {
-    "m1": 1, "motor1": 1, "flh": 1, "front_left_h": 1,
-    "m2": 2, "motor2": 2, "blh": 2, "back_left_h": 2,
-    "m3": 3, "motor3": 3, "flv": 3, "front_left_v": 3,
-    "m4": 4, "motor4": 4, "frv": 4, "front_right_v": 4,
-    "m5": 5, "motor5": 5, "frh": 5, "front_right_h": 5,
-    "m6": 6, "motor6": 6, "brh": 6, "back_right_h": 6,
-    "m7": 7, "motor7": 7, "brv": 7, "back_right_v": 7,
-    "m8": 8, "motor8": 8, "blv": 8, "back_left_v": 8,
-}
-THR_PWM_MIN = 1100
-THR_PWM_MAX = 1900
-NEUTRAL_THR_PWM = 1500
-
-
-def _manual_aux_defaults() -> list[int]:
-    """Default manual AUX PWM with configured claw stop."""
-    claw_stop = int(config.get("arm_claw_stop_us", 1515))
-    return [1500, 1500, 1500, 1500, 1500, 1500, claw_stop]
-
-
-def _manual_thr_defaults() -> list[int]:
-    """Default manual thruster PWM (all neutral)."""
-    return [NEUTRAL_THR_PWM] * 8
-
-
-def _clamp_thr_pwm(value) -> int:
-    return int(max(THR_PWM_MIN, min(THR_PWM_MAX, int(round(float(value))))))
-
-DEFAULT_ARM_PRESETS = {
-    "stow": {
-        "label": "Stow",
-        "pwm": [1500, 1500, 1500, 1500, 1500, 1500, 1500],
-        "j6_angle": 0.0,
-    },
-    "sample": {
-        "label": "Sample",
-        "pwm": [1600, 1400, 1550, 1500, 1450, 1500, 1500],
-        "j6_angle": 15.0,
-    },
-    "deploy_claw": {
-        "label": "Claw",
-        "pwm": [1500, 1500, 1500, 1500, 1500, 1500, 2000],
-        "j6_angle": 0.0,
-    },
-}
-
-DEFAULT_CONFIG = {
-    "pi_ip":               "192.168.69.100",
-    "pi_user":             "uruc",
-    "pi_password":         "yahboom",
-    "pi_ssh_port":         22,
-    "pi_rov_path":         "/home/uruc/URUCDreadYachet",
-    "serial_port":         "auto" if IS_WINDOWS else "/dev/ttyACM0",
-    "forward_camera_url":  "http://192.168.69.100:8161",
-    "arm_camera_url":      "http://192.168.69.100:8160",
-    "camera0_device":      "/dev/video0",   # Pi cam0 → port 8160 (arm USB)
-    "camera1_device":      "/dev/video2",   # Pi cam1 → port 8161 (forward USB)
-    "thrust_udp_port":     5005,
-    "telemetry_port":      5006,
-    "arm_udp_port":        5006,
-    "mosfet_control_port": 5007,
-    "arm_control_port":    5009,
-    "mosfet_enabled":      True,
-    "arm_telemetry_port":  5008,
-    "arm_imu_sign":        -1.0,
-    "arm_imu_zero_offset": -154.0,
-    "arm_claw_stop_us":    1515,
-    "claw_hold":           False,
-    "colmap_command":      "python3 colmap_run.py",
-    "crabs_command":       "python3 crabs.py",
-    "mavproxy_bin":        "/home/uruc/mav_env/bin/mavproxy.py",
-    "mavproxy_serial":     "/dev/ttyACM0",
-    "mavproxy_baud":       "115200",
-    "mavproxy_out1":       "udp:192.168.69.2:14550",
-    "mavproxy_out2":       "tcpin:127.0.0.1:5762",  # onboard: stabilization.py
-    "mavproxy_out3":       "tcpin:127.0.0.1:5763",  # onboard: new_ar.py (arm)
-    "arm_presets": {
-        k: {
-            "label": v["label"],
-            "pwm": list(v["pwm"]),
-            "j6_angle": float(v["j6_angle"]),
-        }
-        for k, v in DEFAULT_ARM_PRESETS.items()
-    },
-}
-
-# Must match onboard/mavlink_rc.py TCP ports (one MAVProxy tcpin client per port).
-MAVPROXY_TCP_PORT = 5762
-MAVPROXY_ARM_TCP_PORT = 5763
-MAVPROXY_ONBOARD_OUT = f"tcpin:127.0.0.1:{MAVPROXY_TCP_PORT}"
-MAVPROXY_ARM_ONBOARD_OUT = f"tcpin:127.0.0.1:{MAVPROXY_ARM_TCP_PORT}"
-
-
-def normalize_camera_config():
-    """Keep forward/arm URLs and Pi USB wiring consistent for this ROV."""
-    global config
-    c1 = str(config.get("camera1_url", "")).strip()
-    c2 = str(config.get("camera2_url", "")).strip()
-    if c1 and not str(config.get("arm_camera_url", "")).strip():
-        config["arm_camera_url"] = c1
-    if c2 and not str(config.get("forward_camera_url", "")).strip():
-        config["forward_camera_url"] = c2
-    if not str(config.get("forward_camera_url", "")).strip():
-        config["forward_camera_url"] = DEFAULT_CONFIG["forward_camera_url"]
-    if not str(config.get("arm_camera_url", "")).strip():
-        config["arm_camera_url"] = DEFAULT_CONFIG["arm_camera_url"]
-    # Fixed wiring — onboard restart must not swap streams on the Pi ports.
-    config["camera0_device"] = DEFAULT_CONFIG["camera0_device"]
-    config["camera1_device"] = DEFAULT_CONFIG["camera1_device"]
-
-
-def normalize_onboard_config():
-    """Force onboard MAVProxy TCP outputs (one tcpin client per port)."""
-    global config
-    normalize_camera_config()
-    normalize_arm_presets()
-    try:
-        config["arm_control_port"] = int(config.get("arm_control_port", config.get("arm_udp_port", 5006)))
-    except (TypeError, ValueError):
-        config["arm_control_port"] = int(config.get("arm_udp_port", 5006))
-    try:
-        config["arm_udp_port"] = int(config.get("arm_udp_port", 5006))
-    except (TypeError, ValueError):
-        config["arm_udp_port"] = 5006
-    # JSON arm commands belong on 5009; CSV arm_sender stays on arm_udp_port (5006).
-    if config["arm_control_port"] == config["arm_udp_port"]:
-        config["arm_control_port"] = 5009
-    try:
-        config["mosfet_control_port"] = int(config.get("mosfet_control_port", 5007))
-    except (TypeError, ValueError):
-        config["mosfet_control_port"] = 5007
-    out2 = str(config.get("mavproxy_out2", "")).strip()
-    if "tcpin" not in out2.lower() or str(MAVPROXY_TCP_PORT) not in out2:
-        config["mavproxy_out2"] = MAVPROXY_ONBOARD_OUT
-    out3 = str(config.get("mavproxy_out3", "")).strip()
-    if "tcpin" not in out3.lower() or str(MAVPROXY_ARM_TCP_PORT) not in out3:
-        config["mavproxy_out3"] = MAVPROXY_ARM_ONBOARD_OUT
-
-
-def _slug_preset_name(name: str) -> str:
-    slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(name).strip().lower())
-    slug = slug.strip("_")
-    return slug or "preset"
-
-
-def _clamp_arm_pwm(value) -> int:
-    return int(max(ARM_PWM_MIN, min(ARM_PWM_MAX, int(round(float(value))))))
+# ─────────────────────────────────────────────────────────────────────────────
+# ARM SEGMENT — presets, UDP control, manual PWM parsing
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 _preset_lock = threading.Lock()
@@ -423,54 +274,32 @@ def _start_preset_sequence(preset_name: str, preset: dict) -> tuple[bool, str]:
     return True, f"Moving to preset '{preset_name}' (J6→J1→Claw)"
 
 
-def _normalize_preset_entry(raw) -> dict | None:
-    if isinstance(raw, str):
-        parts = raw.replace("PWM:", "").split(",")
-        if len(parts) < 7:
-            return None
-        try:
-            pwms = [_clamp_arm_pwm(x) for x in parts[:7]]
-            angle = float(parts[7]) if len(parts) >= 8 else 0.0
-            return {"label": "Preset", "pwm": pwms, "j6_angle": angle}
-        except (TypeError, ValueError):
-            return None
-    if not isinstance(raw, dict):
-        return None
-    pwm_in = raw.get("pwm", [])
-    if not isinstance(pwm_in, (list, tuple)) or len(pwm_in) < 7:
-        return None
+def _robot_armed() -> bool:
+    return STATE.get("mode", "disarmed") in ("armed", "stabilize")
+
+
+def _sync_arm_enable():
+    """Tell new_ar.py whether arm motion is allowed (disabled when DISARMED)."""
+    if _robot_armed():
+        _sync_arm_unlock()
+    else:
+        _send_pi_arm_control({"cmd": "arm_enable", "enabled": False})
+
+
+def _arm_control_ports() -> list[int]:
+    """UDP ports for JSON arm control (primary = arm CSV port, legacy 5009 optional)."""
+    load_config_file()
+    primary = int(config.get("arm_udp_port", 5006))
     try:
-        pwms = [_clamp_arm_pwm(x) for x in pwm_in[:7]]
-        angle = float(raw.get("j6_angle", 0.0))
+        legacy = int(config.get("arm_control_port", primary))
     except (TypeError, ValueError):
-        return None
-    label = str(raw.get("label") or raw.get("name") or "Preset").strip() or "Preset"
-    return {"label": label, "pwm": pwms, "j6_angle": angle}
-
-
-def normalize_arm_presets():
-    """Ensure arm_presets in config is a valid name → preset dict map."""
-    global config
-    raw = config.get("arm_presets")
-    cleaned = {}
-    if isinstance(raw, dict):
-        for name, entry in raw.items():
-            slug = _slug_preset_name(name)
-            norm = _normalize_preset_entry(entry)
-            if norm:
-                if not norm["label"] or norm["label"] == "Preset":
-                    norm["label"] = slug.replace("_", " ").title()
-                cleaned[slug] = norm
-    if not cleaned:
-        cleaned = {
-            k: {
-                "label": v["label"],
-                "pwm": list(v["pwm"]),
-                "j6_angle": float(v["j6_angle"]),
-            }
-            for k, v in DEFAULT_ARM_PRESETS.items()
-        }
-    config["arm_presets"] = cleaned
+        legacy = primary
+    ports = [primary]
+    if legacy != primary:
+        ports.append(legacy)
+    if 5009 not in ports and primary != 5009:
+        ports.append(5009)
+    return ports
 
 
 def _parse_arm_sent_line(line: str) -> dict | None:
@@ -492,60 +321,6 @@ def _parse_arm_sent_line(line: str) -> dict | None:
         return {"pwm": pwms, "j6_angle": angle}
     except (TypeError, ValueError):
         return None
-
-
-def _robot_armed() -> bool:
-    return STATE.get("mode", "disarmed") in ("armed", "stabilize")
-
-
-def _sync_arm_enable():
-    """Tell new_ar.py whether arm motion is allowed (disabled when DISARMED)."""
-    if _robot_armed():
-        _sync_arm_unlock()
-    else:
-        _send_pi_arm_control({"cmd": "arm_enable", "enabled": False})
-
-
-def _mosfet_enabled() -> bool:
-    load_config_file()
-    val = config.get("mosfet_enabled", True)
-    if isinstance(val, str):
-        return val.strip().lower() in ("1", "true", "yes", "on")
-    return bool(val)
-
-
-def _send_mosfet_command(state: bool) -> tuple[bool, str]:
-    """UDP to Pi mosfet_service.py — same JSON as test/mosfet_test_topside.py."""
-    if not _mosfet_enabled():
-        return False, "MOSFET disabled in config"
-    load_config_file()
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            payload = json.dumps({"cmd": "mosfet", "state": bool(state)}).encode("utf-8")
-            port = int(config["mosfet_control_port"])
-            sock.sendto(payload, (config["pi_ip"], port))
-        finally:
-            sock.close()
-        return True, f"sent → {config['pi_ip']}:{port}"
-    except Exception as e:
-        return False, str(e)
-
-
-def _arm_control_ports() -> list[int]:
-    """UDP ports for JSON arm control (primary = arm CSV port, legacy 5009 optional)."""
-    load_config_file()
-    primary = int(config.get("arm_udp_port", 5006))
-    try:
-        legacy = int(config.get("arm_control_port", primary))
-    except (TypeError, ValueError):
-        legacy = primary
-    ports = [primary]
-    if legacy != primary:
-        ports.append(legacy)
-    if 5009 not in ports and primary != 5009:
-        ports.append(5009)
-    return ports
 
 
 def _send_pi_arm_control(payload: dict) -> tuple[bool, str]:
@@ -689,678 +464,6 @@ def _parse_manual_pwm_line(line: str) -> tuple[str, int, int, str] | None:
     return "aux", aux, pwm, label
 
 
-config = DEFAULT_CONFIG.copy()
-normalize_onboard_config()
-
-CONFIG_PATH = ROV_ROOT / "rov_config.json"
-
-TELEMETRY_CSV_FIELDS = [
-    "time", "state", "depth_m", "hold_depth_m", "yaw_deg", "roll_deg", "pitch_deg",
-    "pressure_hpa", "pressure_temperature_c", "stabilize",
-    "depth_hold_active", "yaw_hold_active", "gain_percent",
-    "control_timeout", "mavlink_link_dead",
-]
-
-
-def load_config_file():
-    """Load persisted config from disk if present."""
-    global config
-    if not CONFIG_PATH.is_file():
-        return
-    try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        for k, v in data.items():
-            if k in config:
-                config[k] = v
-        normalize_onboard_config()
-    except Exception as e:
-        print(f"[WARN] Could not load {CONFIG_PATH}: {e}")
-
-
-def save_config_file():
-    """Persist current config to disk."""
-    try:
-        CONFIG_PATH.write_text(
-            json.dumps(config, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        print(f"[WARN] Could not save {CONFIG_PATH}: {e}")
-
-
-load_config_file()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GLOBAL STATE
-# ─────────────────────────────────────────────────────────────────────────────
-
-STATE = {
-    "thrust_running":      False,
-    "arm_running":         False,
-    "onboard_stab":        False,
-    "onboard_arm":         False,
-    "onboard_cam":         False,
-    "onboard_mavproxy":    False,
-    "onboard_mosfet":     False,
-    "ssh_connected":       False,
-    "ssh_error":           "",
-    "mode":                "disarmed",
-    "mosfet_on":           False,
-    "last_telemetry_time": 0.0,
-    "last_arm_telemetry_time": 0.0,
-    "telemetry_packets":   0,
-    "telemetry_rate_hz":   0.0,
-    "last_ctrl_time":      0.0,
-    "ctrl_stabilize":      False,
-    "ctrl_depth_hold":     False,
-    "ctrl_yaw_hold":       False,
-    "telemetry_listener_ok": False,
-    "telemetry_recording":   False,
-    "telemetry_record_file": "",
-    "video_recording":       False,
-    "video_record_session":  "",
-    "video_record_mode":     "",
-    "video_record_files":    [],
-    "onboard_starting":      False,
-    "onboard_progress":      [],
-    "arm_last_pwm":          None,
-    "preset_running":        False,
-    "preset_active_name":    "",
-    "manual_pwm_enabled":    False,
-    "manual_aux_pwm":        list(_manual_aux_defaults()),
-    "manual_thr_pwm":        list(_manual_thr_defaults()),
-    "claw_hold":             bool(config.get("claw_hold", False)),
-    "telemetry": {
-        "rx_state":                "NO_TELEMETRY",
-        "gain_percent":            100,
-        "cmd_forward":             0.0,
-        "cmd_lateral":             0.0,
-        "cmd_yaw":                 0.0,
-        "cmd_vertical":            0.0,
-        "stabilize":               False,
-        "depth_hold_request":      False,
-        "depth_hold_active":       False,
-        "yaw_hold_request":        False,
-        "yaw_hold_active":         False,
-        "depth_m":                 None,
-        "hold_depth_m":            None,
-        "yaw_deg":                 None,
-        "hold_yaw_deg":            None,
-        "roll_deg":                None,
-        "pitch_deg":               None,
-        "h_group":                 0.0,
-        "v_group":                 0.0,
-        "pressure_hpa":            None,
-        "temperature_c":           None,
-        "control_timeout":         False,
-        "attitude_stale":          False,
-        "depth_stale":             False,
-        "mavlink_link_dead":       False,
-        "mavlink_last_rx_age_sec": None,
-        "attitude_age_sec":        None,
-        "depth_recapture_pending": False,
-        "yaw_recapture_pending":   False,
-        "arm_imu_ok":              False,
-        "arm_bno_ready":           False,
-        "arm_imu_stale":           False,
-        "arm_imu_angle_deg":       None,
-        "arm_j6_target_deg":       None,
-        "arm_j6_pwm_out":          None,
-        "arm_claw_hold_request":   False,
-        "arm_claw_hold_active":    False,
-        "arm_j6_manual":           True,
-    },
-    "logs": {
-        "thrust":       [],
-        "arm":          [],
-        "onboard_stab": [],
-        "onboard_arm":  [],
-        "onboard_cam":  [],
-        "colmap":       [],
-        "crabs":        [],
-    },
-}
-
-_state_lock = threading.Lock()
-_telemetry_record_lock = threading.Lock()
-_telemetry_rate_counter = {"count": 0, "window_start": time.time()}
-MAX_LOG_LINES = 200
-LOGS_DIR = ROV_ROOT / "logs"
-VIDEO_DIR = LOGS_DIR / "videos"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SSH MANAGER
-# ─────────────────────────────────────────────────────────────────────────────
-
-class SSHManager:
-    def __init__(self):
-        self._client = None
-        self._lock = threading.Lock()
-
-    def connect(self, host, user, password, port=22, connect_timeout=20):
-        if not HAVE_PARAMIKO:
-            return False, "paramiko not installed. Run: pip install paramiko"
-        try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(
-                host, port=port, username=user, password=password,
-                timeout=connect_timeout,
-                banner_timeout=max(connect_timeout, 15),
-                auth_timeout=max(connect_timeout, 15),
-            )
-            # Keepalive every 5 s — catches a dead link quickly so the
-            # monitor loop notices before exec() blocks on a stale channel.
-            t = client.get_transport()
-            if t:
-                t.set_keepalive(5)
-            with self._lock:
-                if self._client:
-                    try: self._client.close()
-                    except: pass
-                self._client = client
-            return True, "Connected"
-        except (TimeoutError, socket.timeout):
-            return False, (
-                f"Timed out connecting to {host}:{port} — "
-                "is the Pi on and reachable? Check the IP address."
-            )
-        except paramiko.AuthenticationException:
-            return False, f"Authentication failed for {user}@{host} — check username/password."
-        except paramiko.SSHException as e:
-            return False, f"SSH error: {e}"
-        except OSError as e:
-            # Covers ConnectionRefusedError, NetworkUnreachable, etc.
-            return False, f"Network error reaching {host}:{port} — {e}"
-        except Exception as e:
-            return False, str(e)
-
-    def disconnect(self):
-        with self._lock:
-            if self._client:
-                try: self._client.close()
-                except: pass
-                self._client = None
-
-    def is_connected(self):
-        with self._lock:
-            if self._client is None:
-                return False
-            try:
-                t = self._client.get_transport()
-                return t is not None and t.is_active()
-            except:
-                return False
-
-    def _invalidate_client(self):
-        if self._client:
-            try:
-                self._client.close()
-            except Exception:
-                pass
-            self._client = None
-
-    def exec(self, cmd, timeout=20):
-        # Phase 1: acquire lock only long enough to open the exec channel.
-        # Releasing the lock before stdout.read() lets is_connected() and
-        # other threads proceed while we wait for the command output —
-        # a dead connection won't freeze the entire SSH lock.
-        with self._lock:
-            if self._client is None:
-                return "", "", "Not connected"
-            try:
-                transport = self._client.get_transport()
-                if transport is None or not transport.is_active():
-                    self._invalidate_client()
-                    return "", "", "SSH session not active"
-                _, stdout, stderr = self._client.exec_command(cmd, timeout=timeout)
-            except Exception as e:
-                self._invalidate_client()
-                return "", "", str(e)
-        # Phase 2: read output outside the lock (may block up to `timeout` s).
-        try:
-            out = stdout.read().decode("utf-8", errors="replace")
-            err = stderr.read().decode("utf-8", errors="replace")
-            return out.strip(), err.strip(), None
-        except Exception as e:
-            with self._lock:
-                self._invalidate_client()
-            return "", "", str(e)
-
-    def _supervisor_cmd(self, *args, timeout=90):
-        """Run onboard/supervisor.py on the Pi; return (parsed_json, error_msg)."""
-        rov_path = shlex.quote(config["pi_rov_path"])
-        cmd = (
-            f"cd {rov_path} && python3 onboard/supervisor.py "
-            + " ".join(shlex.quote(str(a)) for a in args)
-        )
-        out, err, error = self.exec(cmd, timeout=timeout)
-        if error:
-            return None, error
-        blob = (out or "") + "\n" + (err or "")
-        for line in reversed(blob.splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    return json.loads(line), None
-                except json.JSONDecodeError:
-                    continue
-        return None, (err or out or "supervisor returned no JSON").strip()[:240]
-
-    def supervisor_start_and_wait(
-        self, name: str, timeout_sec: float = 50.0, extra_args: str = ""
-    ) -> tuple[bool, str]:
-        """Start one onboard service and block until log-ready or timeout."""
-        start_args = ["start", name]
-        if extra_args.strip():
-            start_args.extend(["--extra-args", extra_args.strip()])
-        data, err = self._supervisor_cmd(*start_args, timeout=30)
-        if err:
-            return False, f"start failed: {err}"
-
-        pid = (data or {}).get("pid", "?")
-        data, err = self._supervisor_cmd(
-            "wait", name, "--timeout", str(int(timeout_sec)),
-            timeout=timeout_sec + 25,
-        )
-        if err:
-            return False, f"wait failed: {err}"
-        if data and data.get("ok"):
-            return True, f"PID {data.get('pid', pid)} ready"
-
-        tail = (data or {}).get("log_tail", "")
-        detail = (data or {}).get("error", "not ready")
-        if tail:
-            last = tail.strip().splitlines()[-1][:120]
-            return False, f"{detail} | Log: {last}"
-        return False, detail
-
-    def supervisor_stop_all(self):
-        self._supervisor_cmd("stop", "all", timeout=20)
-
-    def supervisor_status(self) -> dict:
-        data, err = self._supervisor_cmd("status", timeout=15)
-        if err or not data:
-            return {}
-        return data
-
-    def is_onboard_running(self, script_name: str) -> bool:
-        key = {
-            "stabilization.py": "stab",
-            "new_ar.py": "arm",
-            "camera_stream.py": "cam",
-        }.get(script_name, "")
-        if not key:
-            return False
-        st = self.supervisor_status().get(key, {})
-        return bool(st.get("alive"))
-
-    def stop_onboard_process(self, script_name):
-        key = {
-            "stabilization.py": "stab",
-            "new_ar.py": "arm",
-            "camera_stream.py": "cam",
-        }.get(script_name)
-        if key:
-            self._supervisor_cmd("stop", key, timeout=15)
-
-    def start_onboard_process(self, script_rel, log_name, extra_args=""):
-        """Legacy wrapper — prefer supervisor_start_and_wait()."""
-        ok, msg = self.supervisor_start_and_wait(log_name, 50.0, extra_args)
-        return ok, msg
-
-    def get_onboard_log(self, log_name, lines=20):
-        log_file = f"/tmp/rov_{log_name}.log"
-        out, _, _ = self.exec(f"tail -n {lines} {log_file} 2>/dev/null || echo ''")
-        return out
-
-    def send_mosfet(self, state: bool):
-        return _send_mosfet_command(bool(state))
-
-    def _release_serial_port(self, ser: str) -> None:
-        """Free the Pix6 USB serial device before MAVProxy opens it."""
-        if not ser:
-            return
-        q = shlex.quote(ser)
-        self.exec(
-            f"fuser -k {q} 2>/dev/null; "
-            "pkill -f mavproxy 2>/dev/null; pkill -f MAVProxy 2>/dev/null; "
-            "sleep 0.5"
-        )
-
-    def _start_mavproxy_fresh(self):
-        """Kill any existing MAVProxy and launch a fresh bridge."""
-        normalize_onboard_config()
-        bin_  = config["mavproxy_bin"]
-        ser   = config["mavproxy_serial"]
-        baud  = int(config.get("mavproxy_baud", 115200))
-        out1  = config["mavproxy_out1"]
-        out2  = config["mavproxy_out2"]
-        out3  = config.get("mavproxy_out3", MAVPROXY_ARM_ONBOARD_OUT)
-
-        self._release_serial_port(ser)
-        self.exec("truncate -s 0 /tmp/rov_mavproxy.log 2>/dev/null || true")
-
-        # --no-state: skip .tlog files (log_writer thread). Critical on Pi SD
-        # cards that are full or read-only — otherwise MAVProxy dies with
-        # "Exception in thread log_writer" and never links to the FC.
-        cmd = (
-            f"setsid nohup {shlex.quote(bin_)} "
-            f"--master={shlex.quote(ser)} "
-            f"--baudrate {baud} "
-            f"--non-interactive "
-            f"--no-state "
-            f"--out={out1} "
-            f"--out={out2} "
-            f"--out={out3} "
-            f"< /dev/null >> /tmp/rov_mavproxy.log 2>&1 & echo $!"
-        )
-        out, _, error = self.exec(cmd, timeout=10)
-        if error:
-            return False, error
-        pid = out.strip()
-        if not pid.isdigit():
-            tail = self.get_mavproxy_log(lines=8)
-            hint = tail.strip().splitlines()[-1][:120] if tail.strip() else "no log output"
-            return False, f"MAVProxy failed to start — {hint}"
-        return True, f"MAVProxy started (PID {pid})"
-
-    def ensure_mavproxy(self):
-        """Start MAVProxy only if not already healthy — avoids killing a working bridge."""
-        normalize_onboard_config()
-        if (
-            self.is_mavproxy_running()
-            and self.is_mavproxy_fc_connected()
-            and self.is_mavproxy_tcp_ready()
-        ):
-            return True, "MAVProxy already running — Pix6 online"
-        return self._start_mavproxy_fresh()
-
-    def start_mavproxy(self):
-        """Legacy name — always forces a fresh MAVProxy."""
-        return self._start_mavproxy_fresh()
-
-    def is_mavproxy_tcp_port_ready(self, port: int) -> bool:
-        out, _, _ = self.exec(
-            f"(ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -q ':{port} ' "
-            f"&& echo ok"
-        )
-        return "ok" in out
-
-    def is_mavproxy_tcp_ready(self):
-        """True when MAVProxy is listening for onboard script TCP connections."""
-        return (
-            self.is_mavproxy_tcp_port_ready(MAVPROXY_TCP_PORT)
-            and self.is_mavproxy_tcp_port_ready(MAVPROXY_ARM_TCP_PORT)
-        )
-
-    def wait_mavproxy_tcp_ready(self, timeout_sec: float = 20.0) -> bool:
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline:
-            if self.is_mavproxy_tcp_ready():
-                return True
-            time.sleep(1.0)
-        return False
-
-    # Log substrings that mean the FC link is actively passing MAVLink traffic.
-    _MAVPROXY_ALIVE_MARKERS = (
-        "detected vehicle", "online system", "got command_ack",
-        "vcc ", "ap:", "flight battery", "heartbeat", "fence present",
-        "manual>", "received ", "saved ", "parameters",
-    )
-
-    def is_mavproxy_fc_connected(self):
-        """True when MAVProxy log shows live FC traffic (not just one-time startup lines)."""
-        if not self.is_mavproxy_running():
-            return False
-        if self.mavproxy_recent_no_link():
-            return False
-
-        out, _, _ = self.exec(
-            "tail -n 30 /tmp/rov_mavproxy.log 2>/dev/null || true"
-        )
-        lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
-        if not lines:
-            return False
-
-        recent = lines[-15:]
-        recent_text = "\n".join(recent).lower()
-        if "unloading module" in recent_text:
-            return False
-
-        trailing_no_link = 0
-        for ln in reversed(recent):
-            lower = ln.lower()
-            if "no link" in lower or "link down" in lower:
-                trailing_no_link += 1
-            else:
-                break
-        if trailing_no_link >= 3:
-            return False
-
-        # Startup strings scroll out once stabilization requests message rates;
-        # any recent FC traffic (COMMAND_ACK, Vcc, AP:, etc.) means link is up.
-        return any(m in recent_text for m in self._MAVPROXY_ALIVE_MARKERS)
-
-    def _device_exists(self, path: str) -> bool:
-        out, _, _ = self.exec(f"test -e {shlex.quote(path)} && echo exists")
-        return "exists" in out
-
-    def mavproxy_serial_candidates(self):
-        """Ordered serial ports to try: configured first, then other ttyACM/ttyUSB."""
-        preferred = config.get("mavproxy_serial", "/dev/ttyACM0")
-        alts = sorted(self.list_serial_candidates())
-        ordered = []
-        if self._device_exists(preferred):
-            ordered.append(preferred)
-        for dev in alts:
-            if dev not in ordered:
-                ordered.append(dev)
-        return ordered
-
-    def serial_port_exists(self):
-        """True when the configured Pix6 serial device node is present."""
-        ser = config.get("mavproxy_serial", "/dev/ttyACM0")
-        return self._device_exists(ser)
-
-    def any_serial_port_exists(self):
-        return bool(self.mavproxy_serial_candidates())
-
-    def list_serial_candidates(self):
-        """Return ttyACM/ttyUSB device paths visible on the Pi."""
-        out, _, _ = self.exec(
-            "ls -1 /dev/ttyACM* /dev/ttyUSB* 2>/dev/null || true"
-        )
-        return [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
-
-    def wait_for_mavproxy_fc(self, on_wait=None) -> tuple[bool, str]:
-        """Wait until MAVProxy reports the FC online, or fail fast on no link."""
-        time.sleep(2.0)
-        fc_deadline = time.time() + 45.0
-        fc_wait_i = 0
-        miss_running = 0
-        ser = config.get("mavproxy_serial", "/dev/ttyACM0")
-
-        while time.time() < fc_deadline:
-            if self.is_mavproxy_running():
-                miss_running = 0
-            else:
-                miss_running += 1
-                if miss_running >= 3:
-                    return False, "MAVProxy exited — check /tmp/rov_mavproxy.log on Pi"
-
-            if self.is_mavproxy_fc_connected():
-                return True, f"MAVProxy running — Pix6 online on {ser}"
-
-            fc_wait_i += 1
-            diag = self.mavproxy_diagnosis() if fc_wait_i >= 2 else ""
-            wait_msg = f"Waiting for Pix6 on {ser}... ({fc_wait_i})"
-            if diag:
-                wait_msg += f" — {diag}"
-
-            if fc_wait_i >= 4 and not self._device_exists(ser):
-                return False, f"USB port {ser} disappeared — {self.mavproxy_diagnosis()}"
-            if fc_wait_i >= 6 and self.mavproxy_recent_no_link():
-                return False, f"No FC on {ser} — {self.mavproxy_diagnosis()}"
-
-            if on_wait:
-                on_wait(wait_msg)
-            time.sleep(2.0)
-
-        return False, (
-            "MAVProxy running but Pix6 not detected — "
-            + self.mavproxy_diagnosis()
-        )
-
-    def mavproxy_recent_no_link(self):
-        """True when the last few MAVProxy log lines are all 'no link'."""
-        out, _, _ = self.exec(
-            "tail -n 5 /tmp/rov_mavproxy.log 2>/dev/null || true"
-        )
-        lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
-        if len(lines) < 3:
-            return False
-        return all(
-            "no link" in ln.lower() or "link down" in ln.lower()
-            for ln in lines[-3:]
-        )
-
-    def mavproxy_diagnosis(self):
-        """Human-readable summary when MAVProxy has no FC link."""
-        ser = config.get("mavproxy_serial", "/dev/ttyACM0")
-        parts = []
-        if not self.serial_port_exists():
-            parts.append(f"{ser} not found")
-            alts = self.list_serial_candidates()
-            if alts:
-                parts.append(f"available: {', '.join(alts)}")
-            else:
-                parts.append("no /dev/ttyACM* or /dev/ttyUSB* devices")
-        else:
-            parts.append(f"{ser} exists but MAVProxy reports no link")
-
-        log_tail = self.get_mavproxy_log(lines=20)
-        if log_tail:
-            lower = log_tail.lower()
-            if "not enough free disk space" in lower or "flight logs full" in lower:
-                parts.append("Pi disk full — MAVProxy could not open tlog files")
-            if "log_writer" in lower:
-                parts.append(
-                    "log_writer thread crashed (disk full or permissions) — "
-                    "restart onboard after updating rov_ui.py"
-                )
-            if "permission denied" in lower:
-                parts.append(f"permission denied on {ser} — run: sudo usermod -aG dialout uruc")
-            if "multiple access" in lower or "returned no data" in lower:
-                parts.append("serial port busy — another process may hold the USB port")
-
-            for ln in reversed(log_tail.strip().splitlines()):
-                ln = ln.strip()
-                if not ln:
-                    continue
-                low = ln.lower()
-                if low in ("no link", "link 1 down", "link down"):
-                    continue
-                parts.append(f"log: {ln[:100]}")
-                break
-
-        df_out, _, _ = self.exec("df -h / 2>/dev/null | tail -1")
-        if df_out.strip():
-            df_line = df_out.strip()
-            if any(p in df_line for p in ("100%", "99%", "98%")):
-                parts.append(f"disk nearly full: {df_line[:70]}")
-
-        return " — ".join(parts)
-
-    def stop_mavproxy(self):
-        ser = config.get("mavproxy_serial", "/dev/ttyACM0")
-        self._release_serial_port(ser)
-
-    def is_mavproxy_running(self):
-        # pgrep -a shows full command line; -f matches against it.
-        # Returns True if any mavproxy process is alive.
-        out, _, error = self.exec("pgrep -f 'mavproxy'")
-        if error:
-            return False
-        return bool(out.strip())
-
-    def get_onboard_status(self):
-        """Check onboard processes via the Pi-side supervisor."""
-        st = self.supervisor_status()
-        if not st:
-            return {"mavproxy": False, "mosfet": False, "stab": False, "arm": False, "cam": False}
-        return {
-            "mavproxy": self.is_mavproxy_running() and self.is_mavproxy_fc_connected(),
-            "mosfet":   bool(st.get("mosfet", {}).get("alive")),
-            "stab":     bool(st.get("stab", {}).get("alive")),
-            "arm":      bool(st.get("arm", {}).get("alive")),
-            "cam":      bool(st.get("cam", {}).get("alive")),
-        }
-
-    def get_mavproxy_log(self, lines=10):
-        out, _, _ = self.exec(f"tail -n {lines} /tmp/rov_mavproxy.log 2>/dev/null || echo ''")
-        return out
-
-    def run_colmap(self):
-        rov_path = config["pi_rov_path"]
-        cmd = config["colmap_command"]
-        full_cmd = f"cd {rov_path} && nohup {cmd} > /tmp/rov_colmap.log 2>&1 &"
-        _, _, error = self.exec(full_cmd)
-        return error is None, error or "started"
-
-    def run_crabs(self):
-        rov_path = config["pi_rov_path"]
-        cmd = config["crabs_command"]
-        full_cmd = f"cd {rov_path} && nohup {cmd} > /tmp/rov_crabs.log 2>&1 &"
-        _, _, error = self.exec(full_cmd)
-        return error is None, error or "started"
-
-    def sync_onboard_files(self):
-        """Upload all onboard/*.py files from the local project to the Pi via SFTP.
-
-        Opens a dedicated SFTP channel on the existing SSH transport without
-        holding the exec lock, so normal SSH commands can continue concurrently.
-        """
-        with self._lock:
-            if self._client is None:
-                return False, "Not connected"
-            try:
-                sftp = self._client.open_sftp()
-            except Exception as e:
-                return False, f"SFTP channel failed: {e}"
-
-        remote_onboard = f"{config['pi_rov_path']}/onboard"
-        local_onboard  = ROV_ROOT / "onboard"
-
-        uploaded, errors = [], []
-        try:
-            try:
-                sftp.stat(remote_onboard)
-            except FileNotFoundError:
-                sftp.mkdir(remote_onboard)
-
-            for local_file in sorted(local_onboard.glob("*.py")):
-                remote_path = f"{remote_onboard}/{local_file.name}"
-                try:
-                    sftp.put(str(local_file), remote_path)
-                    uploaded.append(local_file.name)
-                except Exception as e:
-                    errors.append(f"{local_file.name}: {e}")
-        except Exception as e:
-            errors.append(f"Sync error: {e}")
-        finally:
-            try:
-                sftp.close()
-            except Exception:
-                pass
-
-        if errors:
-            return False, "Upload errors — " + "; ".join(errors)
-        return True, f"Synced {len(uploaded)} file(s): {', '.join(uploaded)}"
-
-
-ssh = SSHManager()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOCAL PROCESS MANAGEMENT

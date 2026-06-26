@@ -288,7 +288,7 @@ def _init_optional_hardware() -> None:
 def _start_imu_poll_thread() -> None:
     """Dedicated BNO055 reader — avoids stale reads when the main loop is busy."""
     def _loop():
-        global _imu_consecutive_failures
+        global _imu_consecutive_failures, _imu_snap_angle, _imu_snap_stale
         while True:
             if HAVE_BNO:
                 _poll_imu_cache(force=True)

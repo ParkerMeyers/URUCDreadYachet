@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -157,16 +158,16 @@ def _start_service(svc: dict, extra_args: str = "") -> int:
     log_path = Path(svc["log"])
     log_path.write_text("", encoding="utf-8")
 
-    cmd = ["python3", svc["script"]]
+    cmd = [svc["script"]]
     if extra_args.strip():
-        cmd.extend(extra_args.split())
+        cmd.extend(shlex.split(extra_args))
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
     with open(log_path, "ab", buffering=0) as logf:
         proc = subprocess.Popen(
-            ["python3", "-u", *cmd[1:]],
+            ["python3", "-u", *cmd],
             cwd=str(ROOT),
             stdin=subprocess.DEVNULL,
             stdout=logf,
