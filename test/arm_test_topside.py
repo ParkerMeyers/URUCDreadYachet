@@ -8,29 +8,6 @@ commands.  Sends UDP packets to arm_test_onboard.py running on the Pi.
 Usage:
     python test/arm_test_topside.py
     python test/arm_test_topside.py --ip 192.168.69.100
-
-Commands at the prompt:
-    1 1600      set J1 to 1600 µs  (M13)
-    1 1400      set J1 back to neutral pose
-    2 1600      set J2 to neutral pose (M9)
-    3 1500      set J3 to stop (M11, continuous)
-    4 1325      open claw (M15)   |  4 1525 close claw
-    center      all joints → neutral/stop PWM  (also: c)
-    status      print current PWM state  (also: s)
-    q           center all then exit
-
-Joint map (type joint number 1-4 — matches rov_ui / new_ar.py):
-    1  J1 / M13         AUX5 → RC ch 13   500–2350 µs, neutral 1400
-    2  J2 / M9          AUX1 → RC ch  9   950–2200 µs, neutral 1600
-    3  J3 / M11 (cont) AUX3 → RC ch 11   1300–1700 µs, stop 1500
-    4  Claw / M15 (cont) AUX7 → RC ch 15  open 1325, close 1525, stop 1425
-
-Mission Planner parameters required (set once, write params):
-    SERVO9_FUNCTION  = 59   (RCPassThru9  → J2 / AUX1 / M9)
-    SERVO11_FUNCTION = 61   (RCPassThru11 → J3 / AUX3 / M11)
-    SERVO13_FUNCTION = 63   (RCPassThru13 → J1 / AUX5 / M13)
-    SERVO15_FUNCTION = 65   (RCPassThru15 → Claw / AUX7 / M15)
-    BRD_SAFETYENABLE = 0
 """
 from __future__ import annotations
 
@@ -38,43 +15,28 @@ import argparse
 import json
 import socket
 import sys
+from pathlib import Path
 
-# ── Config ────────────────────────────────────────────────────────────────────
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "onboard"))
+from arm_joints import (
+    JOINT_CONTINUOUS,
+    JOINT_NAMES,
+    JOINT_TO_AUX,
+    JOINT_TO_MOTOR,
+    NUM_JOINTS,
+    clamp_joint_pwm,
+    default_joint_pwm,
+    joint_center_us,
+    joint_pwm_range,
+    joint_to_rc_ch,
+)
+
 DEFAULT_PI_IP = "192.168.69.100"
-TEST_PORT     = 5011          # Must match arm_test_onboard.py
-NUM_JOINTS    = 4
-# ─────────────────────────────────────────────────────────────────────────────
-
-JOINT_NAMES = {
-    1: "J1",
-    2: "J2",
-    3: "J3",
-    4: "Claw",
-}
-
-JOINT_TO_AUX = {1: 5, 2: 1, 3: 3, 4: 7}
-JOINT_TO_MOTOR = {1: 13, 2: 9, 3: 11, 4: 15}
-JOINT_CONTINUOUS = {3, 4}
-
-JOINT_LIMITS = {
-    1: (500, 2350, 1400),   # M13 — positional, neutral 1400
-    2: (950, 2200, 1600),   # M9  — positional, neutral 1600
-    3: (1300, 1700, 1500),  # M11 — continuous, stop 1500
-    4: (1325, 1525, 1425),  # M15 — continuous, open 1325 / close 1525 / stop 1425
-}
+TEST_PORT = 5011
 
 
 def joint_center_label(joint: int) -> str:
     return "stop" if joint in JOINT_CONTINUOUS else "neutral"
-
-
-def joint_center_us(joint: int) -> int:
-    return JOINT_LIMITS[joint][2]
-
-
-def joint_pwm_range(joint: int) -> tuple[int, int]:
-    lo, hi, _ = JOINT_LIMITS[joint]
-    return lo, hi
 
 
 def clamp(x, lo, hi):
@@ -95,13 +57,11 @@ def print_state(current):
 
 def main():
     parser = argparse.ArgumentParser(description="ROV arm joint PWM test — topside")
-    parser.add_argument("--ip",   default=DEFAULT_PI_IP,
-                        help=f"Pi IP address (default {DEFAULT_PI_IP})")
-    parser.add_argument("--port", type=int, default=TEST_PORT,
-                        help=f"UDP port (default {TEST_PORT})")
+    parser.add_argument("--ip", default=DEFAULT_PI_IP, help=f"Pi IP (default {DEFAULT_PI_IP})")
+    parser.add_argument("--port", type=int, default=TEST_PORT, help=f"UDP port (default {TEST_PORT})")
     args = parser.parse_args()
 
-    pi   = (args.ip, args.port)
+    pi = (args.ip, args.port)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     print(f"Arm joint test — sending to {args.ip}:{args.port}")
@@ -110,7 +70,7 @@ def main():
     for joint, name in JOINT_NAMES.items():
         aux = JOINT_TO_AUX[joint]
         motor = JOINT_TO_MOTOR[joint]
-        rc_ch = aux + 8
+        rc_ch = joint_to_rc_ch(joint)
         lo, hi = joint_pwm_range(joint)
         ctr = joint_center_us(joint)
         cont = " continuous" if joint in JOINT_CONTINUOUS else ""
@@ -122,7 +82,7 @@ def main():
         )
     print("\nCommands:  <joint 1-4> <pwm>  |  center (c)  |  status (s)  |  q\n")
 
-    current = {j: joint_center_us(j) for j in range(1, NUM_JOINTS + 1)}
+    current = default_joint_pwm()
 
     try:
         while True:
@@ -133,50 +93,46 @@ def main():
 
             if not line:
                 continue
-
             if line in ("q", "quit", "exit"):
                 break
-
             if line in ("c", "center"):
-                for joint in current:
-                    current[joint] = joint_center_us(joint)
+                current = default_joint_pwm()
                 send(sock, pi, {"center_all": True})
                 print("  → All joints centered")
                 print_state(current)
                 continue
-
             if line in ("s", "status"):
                 print_state(current)
                 continue
 
             parts = line.split()
-            if len(parts) == 2:
-                try:
-                    joint = int(parts[0])
-                    us    = int(parts[1])
-                except ValueError:
-                    print(f"  Bad input — expected: <joint 1-{NUM_JOINTS}> <pwm>")
-                    continue
-
-                if not (1 <= joint <= NUM_JOINTS):
-                    print(f"  Joint must be 1-{NUM_JOINTS}")
-                    continue
-
-                lo, hi = joint_pwm_range(joint)
-                clamped = clamp(us, lo, hi)
-                if clamped != us:
-                    print(f"  (PWM clamped to {clamped})")
-                us = clamped
-
-                current[joint] = us
-                send(sock, pi, {"joint": joint, "pwm": us})
-                name  = JOINT_NAMES[joint]
-                aux   = JOINT_TO_AUX[joint]
-                rc_ch = aux + 8
-                print(f"  → {name} (AUX{aux}) = {us} µs  [RC ch {rc_ch}]")
-                print_state(current)
-            else:
+            if len(parts) != 2:
                 print(f"  Usage:  <joint 1-{NUM_JOINTS}> <pwm>   e.g.  1 1600")
+                continue
+
+            try:
+                joint = int(parts[0])
+                us = int(parts[1])
+            except ValueError:
+                print(f"  Bad input — expected: <joint 1-{NUM_JOINTS}> <pwm>")
+                continue
+
+            if not (1 <= joint <= NUM_JOINTS):
+                print(f"  Joint must be 1-{NUM_JOINTS}")
+                continue
+
+            lo, hi = joint_pwm_range(joint)
+            us = clamp_joint_pwm(joint, us)
+            if us != int(parts[1]):
+                print(f"  (PWM clamped to {us})")
+
+            current[joint] = us
+            send(sock, pi, {"joint": joint, "pwm": us})
+            name = JOINT_NAMES[joint]
+            aux = JOINT_TO_AUX[joint]
+            rc_ch = joint_to_rc_ch(joint)
+            print(f"  → {name} (AUX{aux}) = {us} µs  [RC ch {rc_ch}]")
+            print_state(current)
 
     except KeyboardInterrupt:
         pass

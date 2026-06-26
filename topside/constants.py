@@ -3,6 +3,20 @@ from __future__ import annotations
 
 import platform
 
+from onboard.arm_joints import (
+    CLAW_MAX_US as CLAW_PWM_MAX,
+    CLAW_MIN_US as CLAW_PWM_MIN,
+    CLAW_STOP_US_DEFAULT,
+    CSV_IDX_TO_JOINT,
+    JOINT_LIMITS,
+    JOINT_NAMES as _JOINT_NAME_MAP,
+    JOINT_TO_AUX,
+    JOINT_TO_CSV_IDX,
+    JOINT_TO_MOTOR,
+    default_joint_pwm,
+    joint_center_us,
+    joint_pwm_to_csv_list,
+)
 from onboard.ports import (
     MAVPROXY_ONBOARD_ARM,
     MAVPROXY_ONBOARD_STAB,
@@ -13,46 +27,37 @@ from onboard.ports import (
 IS_WINDOWS = platform.system() == "Windows"
 
 # ── Arm (Pix6 AUX) — 4 DOF: J1, J2, J3, Claw ───────────────────────────────
-# arm_sender CSV indices for active joints: 0=J1, 4=J2, 5=J3, 6=Claw
-# Arm controller + presets use motor-native PWM (µs) — no stick scaling.
-# Hardware outputs: M13=J1, M9=J2, M11=J3 (continuous), M15=Claw (continuous)
 ARM_JOINT_NAMES = ["J1", "J2", "J3", "Claw"]
 ARM_CSV_INDICES = [0, 4, 5, 6]
 ARM_CSV_TO_NAME = {0: "J1", 4: "J2", 5: "J3", 6: "Claw"}
 
-CLAW_PWM_MIN = 1325
-CLAW_PWM_MAX = 1525
-CLAW_STOP_US_DEFAULT = 1425
-
-# Per-joint limits (CSV index → spec)
 JOINT_PWM_SPECS = {
-    0: {"min": 500, "max": 2350, "neutral": 1400, "continuous": False, "motor": 13, "rc_ch": 13},
-    4: {"min": 950, "max": 2200, "neutral": 1600, "continuous": False, "motor": 9, "rc_ch": 9},
-    5: {"min": 1300, "max": 1700, "neutral": 1500, "continuous": True, "motor": 11, "rc_ch": 11},
-    6: {"min": CLAW_PWM_MIN, "max": CLAW_PWM_MAX, "neutral": CLAW_STOP_US_DEFAULT, "continuous": True, "motor": 15, "rc_ch": 15},
+    csv_idx: {
+        "min": JOINT_LIMITS[joint][0],
+        "max": JOINT_LIMITS[joint][1],
+        "neutral": JOINT_LIMITS[joint][2],
+        "continuous": joint in (3, 4),
+        "motor": JOINT_TO_MOTOR[joint],
+        "rc_ch": JOINT_TO_AUX[joint] + 8,
+    }
+    for csv_idx, joint in CSV_IDX_TO_JOINT.items()
 }
 
-# Legacy blanket limits (widest span for generic helpers)
 ARM_PWM_MIN = 500
 ARM_PWM_MAX = 2500
-
-ARM_DEFAULT_PWM = [1400, 1500, 1500, 1500, 1600, 1500, CLAW_STOP_US_DEFAULT]
-JOINT_NEUTRAL_PWM = {1: 1400, 2: 1600, 3: 1500, 4: CLAW_STOP_US_DEFAULT}
+ARM_DEFAULT_PWM = joint_pwm_to_csv_list(default_joint_pwm())
+JOINT_NEUTRAL_PWM = {j: joint_center_us(j) for j in range(1, 5)}
 
 ARM_PRESET_JOINT_ORDER = (5, 4, 0, 6)  # J3→J2→J1→Claw (CSV indices)
 ARM_PRESET_DELAY_MIN_SEC = 0.45
 ARM_PRESET_DELAY_MAX_SEC = 4.0
 
 MANUAL_AUX_LABELS = ["J2", "—", "J3", "—", "J1", "—", "Claw"]
-MANUAL_AUX_DEFAULTS = [1600, 1500, 1500, 1500, 1400, 1500, CLAW_STOP_US_DEFAULT]
-JOINT_TO_AUX = {1: 5, 2: 1, 3: 3, 4: 7}
-AUX_TO_JOINT = {v: k for k, v in JOINT_TO_AUX.items()}
-AUX_TO_CSV = {5: 0, 1: 4, 3: 5, 7: 6}
+MANUAL_AUX_DEFAULTS = joint_pwm_to_csv_list(default_joint_pwm())
+AUX_TO_CSV = {aux: JOINT_TO_CSV_IDX[joint] for joint, aux in JOINT_TO_AUX.items()}
 ARM_MANUAL_JOINTS = [
-    {"joint": 1, "name": "J1", "aux": 5},
-    {"joint": 2, "name": "J2", "aux": 1},
-    {"joint": 3, "name": "J3", "aux": 3},
-    {"joint": 4, "name": "Claw", "aux": 7},
+    {"joint": j, "name": _JOINT_NAME_MAP[j], "aux": JOINT_TO_AUX[j]}
+    for j in range(1, 5)
 ]
 
 ARM_SERVO_HINT = "SERVO9=59 SERVO11=61 SERVO13=63 SERVO15=65 (RCPassThru), BRD_SAFETYENABLE=0"

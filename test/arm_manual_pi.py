@@ -28,17 +28,18 @@ import argparse
 import json
 import socket
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "onboard"))
+from arm_joints import (
+    JOINT_LIMITS,
+    JOINT_NAMES,
+    JOINT_TO_AUX,
+    clamp_joint_pwm,
+    default_joint_pwm,
+)
 
 ARM_PORT = 5009
-
-JOINT_NAMES = {1: "J1", 2: "J2", 3: "J3", 4: "Claw"}
-JOINT_TO_AUX = {1: 5, 2: 1, 3: 3, 4: 7}
-JOINT_LIMITS = {
-    1: (500, 2350, 1400),
-    2: (950, 2200, 1600),
-    3: (1300, 1700, 1500),
-    4: (1325, 1525, 1425),
-}
 
 
 def send(port: int, pkt: dict) -> None:
@@ -60,9 +61,8 @@ def manual_enable(on: bool) -> None:
 
 def move_joint(joint: int, pwm: int) -> None:
     aux = JOINT_TO_AUX[joint]
-    lo, hi, _ = JOINT_LIMITS[joint]
-    pwm = max(lo, min(hi, pwm))
-    send(ARM_PORT, {"cmd": "manual_pwm", "enabled": True, "aux": aux, "pwm": pwm})
+    pwm = clamp_joint_pwm(joint, pwm)
+    send(ARM_PORT, {"cmd": "manual_pwm", "enabled": True, "joint": joint, "pwm": pwm})
 
 
 def center_all() -> None:

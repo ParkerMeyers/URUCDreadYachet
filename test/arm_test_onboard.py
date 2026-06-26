@@ -5,27 +5,10 @@ Arm joint test — ONBOARD  (runs on the Raspberry Pi)
 Listens for joint/PWM commands from the topside test script over UDP,
 then forwards them to the Pix6 via MAVLink RC_CHANNELS_OVERRIDE.
 
-Command numbers are joint indices 1-4 (J1, J2, J3, Claw) — same as rov_ui /
-new_ar.py, not raw AUX port numbers.
-
-DIAGNOSTIC mode: reads back SERVO_OUTPUT_RAW (servo9-servo16) from
-the FC every 2 s so you can see exactly where the pipeline is stalling.
-
-Setup in Mission Planner first:
-    SERVO9_FUNCTION  = 59   (RCPassThru9  → J2 / AUX1 / M9)
-    SERVO11_FUNCTION = 61   (RCPassThru11 → J3 / AUX3 / M11)
-    SERVO13_FUNCTION = 63   (RCPassThru13 → J1 / AUX5 / M13)
-    SERVO15_FUNCTION = 65   (RCPassThru15 → Claw / AUX7 / M15)
-    BRD_SAFETYENABLE = 0
+Uses the same arm_joints + MAVLink path as onboard/new_ar.py.
 
 Start MAVProxy first (arm test uses tcp:127.0.0.1:5763), then run:
     python3 test/arm_test_onboard.py
-
-Joint PWM limits (M9/M11/M13/M15):
-    J1 / M13         500–2350 µs, neutral 1400
-    J2 / M9          950–2200 µs, neutral 1600
-    J3 / M11 (cont)  1300–1700 µs, stop 1500
-    Claw / M15 (cont) open 1325, close 1525, stop 1425
 """
 from __future__ import annotations
 
@@ -36,62 +19,25 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "onboard"))
+from arm_joints import (
+    JOINT_NAMES,
+    JOINT_TO_AUX,
+    JOINT_TO_MOTOR,
+    NUM_JOINTS,
+    RC_IGNORE,
+    build_rc_override,
+    default_joint_pwm,
+    joint_center_us,
+    joint_to_rc_ch,
+)
 from mavlink_rc import MAVLINK_ONBOARD_ARM, connect_mavlink, send_rc_channels_override
 
 from pymavlink import mavutil
 
-# ── Config ────────────────────────────────────────────────────────────────────
-LISTEN_PORT   = 5011
-MAVLINK_URL   = MAVLINK_ONBOARD_ARM
-CENTER_US     = 1500
-CLAW_CENTER_US = 1425
-CLAW_MIN_US = 1325
-CLAW_MAX_US = 1525
-MIN_US        = 500
-MAX_US        = 2500
-OVERRIDE_HZ   = 20
-DIAG_INTERVAL = 2.0   # seconds between diagnostic prints
-SPARE_RC_CH   = 16    # AUX8 — always centered
-
-NUM_JOINTS = 4
-
-JOINT_NAMES = {
-    1: "J1",
-    2: "J2",
-    3: "J3",
-    4: "Claw",
-}
-
-JOINT_TO_AUX = {1: 5, 2: 1, 3: 3, 4: 7}
-JOINT_TO_MOTOR = {1: 13, 2: 9, 3: 11, 4: 15}
-JOINT_CONTINUOUS = {3, 4}
-
-JOINT_LIMITS = {
-    1: (500, 2350, 1400),   # M13 — positional, neutral 1400
-    2: (950, 2200, 1600),   # M9  — positional, neutral 1600
-    3: (1300, 1700, 1500),  # M11 — continuous, stop 1500
-    4: (CLAW_MIN_US, CLAW_MAX_US, CLAW_CENTER_US),  # M15 — open/close/stop
-}
-
-IGNORE = 65535
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def joint_center_us(joint: int) -> int:
-    return JOINT_LIMITS[joint][2]
-
-
-def joint_pwm_range(joint: int) -> tuple[int, int]:
-    lo, hi, _ = JOINT_LIMITS[joint]
-    return lo, hi
-
-
-def joint_to_rc_ch(joint: int) -> int:
-    return JOINT_TO_AUX[joint] + 8
-
-
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+LISTEN_PORT = 5011
+MAVLINK_URL = MAVLINK_ONBOARD_ARM
+OVERRIDE_HZ = 20
+DIAG_INTERVAL = 2.0
 
 
 def main():
@@ -107,11 +53,7 @@ def main():
         print("[arm-onboard] *** NO HEARTBEAT in 15 s ***")
         print("[arm-onboard]     Check: MAVProxy running?  Pix6 USB plugged in?")
 
-    # Request SERVO_OUTPUT_RAW at ~2 Hz so we can read AUX output values
-    for msg_id, interval_us in [
-        (36,  500_000),   # SERVO_OUTPUT_RAW  @ 2 Hz
-        (65,  500_000),   # RC_CHANNELS        @ 2 Hz
-    ]:
+    for msg_id, interval_us in ((36, 500_000), (65, 500_000)):
         try:
             master.mav.command_long_send(
                 master.target_system or 1,
@@ -127,37 +69,18 @@ def main():
     sock.setblocking(False)
 
     print(f"[arm-onboard] Listening for commands on UDP port {LISTEN_PORT}")
-    print("[arm-onboard] Joint numbers 1-4 (J1, J2, J3, Claw) — see topside map")
-    print("[arm-onboard] All joints → center PWM")
-    print("[arm-onboard] ── DIAGNOSTIC OUTPUT every 2 s ────────────────────────────")
-    print("[arm-onboard]   RC_CHANNELS ch9-16 = what FC thinks AUX RC inputs are")
-    print("[arm-onboard]   SERVO_OUTPUT ch9-16 = what FC is actually sending to AUX pins")
-    print("[arm-onboard]   If RC changes but SERVO_OUTPUT doesn't →")
-    print("[arm-onboard]     SERVOx_FUNCTION not set to 1 (RCPassThru) in Mission Planner")
-    print("[arm-onboard]     or BRD_SAFETYENABLE=1 (safety switch blocking output)")
-    print("[arm-onboard]   If RC never changes →")
-    print("[arm-onboard]     RC_CHANNELS_OVERRIDE not reaching FC — check MAVProxy")
-    print("[arm-onboard] ────────────────────────────────────────────────────────────")
+    print("[arm-onboard] Joint numbers 1-4 (J1, J2, J3, Claw)")
     print("[arm-onboard] Press Ctrl+C to stop.")
 
-    # pwm[1..7] = current target per joint (J1..Claw)
-    pwm = {j: joint_center_us(j) for j in range(1, NUM_JOINTS + 1)}
-
-    last_send      = 0.0
+    pwm = default_joint_pwm()
+    last_send = 0.0
     last_heartbeat = 0.0
-    last_diag      = 0.0
-
-    fc_rc  = {}   # rc channel → pwm from RC_CHANNELS
-    fc_srv = {}   # rc channel → pwm from SERVO_OUTPUT_RAW
+    last_diag = 0.0
+    fc_rc: dict[int, int] = {}
+    fc_srv: dict[int, int] = {}
 
     def send_override():
-        rc = [IGNORE] * 18
-        rc[SPARE_RC_CH - 1] = CENTER_US
-        for joint, us in pwm.items():
-            rc_ch = joint_to_rc_ch(joint)
-            lo, hi = joint_pwm_range(joint)
-            rc[rc_ch - 1] = int(clamp(us, lo, hi))
-        send_rc_channels_override(master, rc, ignore=IGNORE)
+        send_rc_channels_override(master, build_rc_override(pwm), ignore=RC_IGNORE)
 
     def send_heartbeat():
         master.mav.heartbeat_send(
@@ -168,23 +91,17 @@ def main():
 
     def poll_mavlink():
         while True:
-            msg = master.recv_match(
-                type=["RC_CHANNELS", "SERVO_OUTPUT_RAW"],
-                blocking=False,
-            )
+            msg = master.recv_match(type=["RC_CHANNELS", "SERVO_OUTPUT_RAW"], blocking=False)
             if msg is None:
                 break
-            t = msg.get_type()
-            if t == "RC_CHANNELS":
+            if msg.get_type() == "RC_CHANNELS":
                 for joint in range(1, NUM_JOINTS + 1):
                     rc_ch = joint_to_rc_ch(joint)
-                    v = getattr(msg, f"chan{rc_ch}_raw", 0)
-                    fc_rc[rc_ch] = v
-            elif t == "SERVO_OUTPUT_RAW":
+                    fc_rc[rc_ch] = getattr(msg, f"chan{rc_ch}_raw", 0)
+            else:
                 for joint in range(1, NUM_JOINTS + 1):
                     rc_ch = joint_to_rc_ch(joint)
-                    v = getattr(msg, f"servo{rc_ch}_raw", 0)
-                    fc_srv[rc_ch] = v
+                    fc_srv[rc_ch] = getattr(msg, f"servo{rc_ch}_raw", 0)
 
     def print_diag():
         print()
@@ -213,33 +130,6 @@ def main():
             for j in sorted(pwm)
         )
         print(f"[DIAG] We are sending:                {sending}")
-
-        non_center = [
-            j for j, us in pwm.items()
-            if us != joint_center_us(j)
-        ]
-        if non_center and fc_rc:
-            rc_ch_list = [joint_to_rc_ch(j) for j in non_center]
-            rc_matches = all(
-                abs(fc_rc.get(rc_ch, joint_center_us(j)) - pwm[j]) < 20
-                for j, rc_ch in zip(non_center, rc_ch_list)
-            )
-            srv_matches = all(
-                abs(fc_srv.get(rc_ch, joint_center_us(j)) - pwm[j]) < 20
-                for j, rc_ch in zip(non_center, rc_ch_list)
-            ) if fc_srv else False
-
-            if not rc_matches:
-                print("[DIAG] *** RC_CHANNELS not matching sent values —")
-                print("[DIAG]     RC_CHANNELS_OVERRIDE not reaching FC. Is MAVProxy running?")
-            elif rc_matches and not srv_matches:
-                print("[DIAG] *** RC input changed but SERVO output did NOT —")
-                print("[DIAG]     Most likely fixes:")
-                print("[DIAG]       1. Set SERVO9/11/13/15_FUNCTION = 59/61/63/65 in Mission Planner")
-                print("[DIAG]       2. Set BRD_SAFETYENABLE = 0 in Mission Planner")
-            elif rc_matches and srv_matches:
-                print("[DIAG] RC input AND servo output both match — FC side is OK.")
-                print("[DIAG]     If servo still doesn't move: check wiring to AUX pins.")
         print()
 
     send_override()
@@ -247,7 +137,6 @@ def main():
     try:
         while True:
             now = time.time()
-
             poll_mavlink()
 
             try:
@@ -259,19 +148,18 @@ def main():
                         continue
 
                     if cmd.get("center_all"):
-                        for joint in pwm:
-                            pwm[joint] = joint_center_us(joint)
+                        pwm = default_joint_pwm()
                         print("[arm-onboard] ALL CENTER")
                         continue
 
                     joint = int(cmd.get("joint", 0))
-                    us    = int(cmd.get("pwm", CENTER_US))
+                    us = int(cmd.get("pwm", 1500))
                     if 1 <= joint <= NUM_JOINTS:
                         pwm[joint] = us
-                        name  = JOINT_NAMES.get(joint, "?")
-                        aux   = JOINT_TO_AUX[joint]
-                        rc_ch = joint_to_rc_ch(joint)
+                        name = JOINT_NAMES[joint]
                         motor = JOINT_TO_MOTOR[joint]
+                        aux = JOINT_TO_AUX[joint]
+                        rc_ch = joint_to_rc_ch(joint)
                         print(f"[arm-onboard] {name}/M{motor} (AUX{aux}) → ch{rc_ch}  {us} µs")
                     else:
                         print(f"[arm-onboard] Ignored joint {joint} — valid range 1-{NUM_JOINTS}")
@@ -295,8 +183,7 @@ def main():
 
     except KeyboardInterrupt:
         print("\n[arm-onboard] Stopping — centering all joints.")
-        for joint in pwm:
-            pwm[joint] = joint_center_us(joint)
+        pwm = default_joint_pwm()
         send_override()
         time.sleep(0.2)
         sock.close()
