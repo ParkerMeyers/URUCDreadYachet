@@ -1430,6 +1430,9 @@ _crab = {"sess": None, "input": None, "cd": None, "count": 0}
 # Crab overlay camera: UI slot 1 = forward (:8161), slot 2 = arm (:8160). See crab_camera_num.
 _CRAB_CAMERA_NUM = 1
 _CRAB_DISPLAY_FPS = 15
+_CRAB_CONF_DEFAULT = 0.6
+_CRAB_CONF_MIN = 0.35
+_CRAB_CONF_MAX = 0.95
 
 
 def _crab_camera_num() -> int:
@@ -1443,6 +1446,21 @@ def _crab_camera_num() -> int:
 def _crab_camera_url() -> str:
     key = _CAMERA_UI_URL_KEY.get(_crab_camera_num(), "arm_camera_url")
     return str(config.get(key, "")).strip()
+
+
+def _crab_confidence() -> float:
+    try:
+        v = float(config.get("crab_confidence", _CRAB_CONF_DEFAULT))
+    except (TypeError, ValueError):
+        v = _CRAB_CONF_DEFAULT
+    return max(_CRAB_CONF_MIN, min(_CRAB_CONF_MAX, v))
+
+
+def _set_crab_confidence(value: float) -> float:
+    v = max(_CRAB_CONF_MIN, min(_CRAB_CONF_MAX, round(float(value), 2)))
+    config["crab_confidence"] = v
+    save_config_file()
+    return v
 
 
 def _crab_deps_issues() -> list[str]:
@@ -1561,7 +1579,7 @@ class _CrabPipeline:
             h, w = frame.shape[:2]
             try:
                 outputs = sess.run(None, {input_name: cd.preprocess(frame)})
-                dets = cd.postprocess(outputs, w, h)
+                dets = cd.postprocess(outputs, w, h, conf_threshold=_crab_confidence())
             except Exception:
                 continue
             with self._lock:
@@ -1691,7 +1709,26 @@ def api_crab_config():
     return jsonify({
         "camera": n,
         "url_key": _CAMERA_UI_URL_KEY.get(n, ""),
+        "confidence": _crab_confidence(),
+        "confidence_min": _CRAB_CONF_MIN,
+        "confidence_max": _CRAB_CONF_MAX,
     })
+
+
+@app.route("/api/crab/confidence", methods=["GET", "POST"])
+def api_crab_confidence():
+    if request.method == "GET":
+        return jsonify({
+            "confidence": _crab_confidence(),
+            "min": _CRAB_CONF_MIN,
+            "max": _CRAB_CONF_MAX,
+        })
+    data = request.get_json(silent=True) or {}
+    try:
+        v = _set_crab_confidence(data.get("confidence", _crab_confidence()))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "invalid confidence"}), 400
+    return jsonify({"ok": True, "confidence": v})
 
 
 @app.route("/api/crab/status")
@@ -1711,7 +1748,7 @@ def api_crab_count():
         return jsonify({"count": int(_crab.get("count", 0))})
 
 
-# --- COLMAP frame recorder (arm camera, 10 fps, <=720p, aspect preserved) -----
+# --- COLMAP frame recorder (forward camera, 10 fps, <=720p, aspect preserved) -----
 COLMAP_DIR = os.path.join(_HERE, "colmap_captures")
 COLMAP_STAGE = os.path.join(COLMAP_DIR, "_staging")
 COLMAP_FPS = 10
@@ -1768,10 +1805,10 @@ def api_colmap_toggle():
         return jsonify({"ok": False, "msg": "opencv not installed topside"}), 503
     if not HAVE_REQUESTS:
         return jsonify({"ok": False, "msg": "requests not installed"}), 503
-    arm_url = str(config.get("arm_camera_url", "")).strip()
-    if not arm_url:
-        return jsonify({"ok": False, "msg": "arm camera URL not set"}), 400
-    snap_url = request.host_url.rstrip("/") + "/camera/2/snapshot"
+    forward_url = str(config.get("forward_camera_url", "")).strip()
+    if not forward_url:
+        return jsonify({"ok": False, "msg": "forward camera URL not set"}), 400
+    snap_url = request.host_url.rstrip("/") + "/camera/1/snapshot"
     with _colmap_lock:
         if _colmap["running"]:
             _colmap["running"] = False

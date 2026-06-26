@@ -419,6 +419,21 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 }
 .action-btn:hover { background:var(--accent2); color:#fff; }
 
+.crab-conf-wrap {
+  display:flex; align-items:center; gap:6px;
+  padding:2px 8px; border-radius:6px;
+  border:1px solid var(--border); background:var(--bg3);
+  flex-shrink:0;
+}
+.crab-conf-slider {
+  width:72px; height:4px; accent-color:var(--green);
+  cursor:pointer;
+}
+.crab-conf-val {
+  font-size:0.72rem; font-weight:600; color:var(--green);
+  min-width:2.4rem; font-variant-numeric:tabular-nums;
+}
+
 /* ── telemetry bar ── */
 .telembar {
   display:flex; align-items:center; gap:0;

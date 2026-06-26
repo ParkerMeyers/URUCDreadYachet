@@ -295,11 +295,18 @@
       </div>
     </div>
     <button class="action-btn" id="btn-colmap" onclick="toggleColmap()"
-            title="Record arm cam frames @10fps for COLMAP">⏺ COLMAP</button>
+            title="Record forward cam frames @10fps for COLMAP">⏺ COLMAP</button>
     <button class="action-btn" id="btn-colmap-save" onclick="saveColmap()"
             title="Save all recorded frames into one folder">💾 SAVE FRAMES</button>
     <button class="action-btn" id="btn-crabs" onclick="toggleCrabs()"
             title="Overlay green-crab detections on the forward camera">🦀 CRABS</button>
+    <label class="crab-conf-wrap" id="crab-conf-wrap" title="Minimum confidence to count a crab">
+      <span class="control-label">Conf</span>
+      <input type="range" id="crab-conf-slider" class="crab-conf-slider"
+             min="35" max="95" step="1" value="60"
+             oninput="onCrabConfSlider(this)"/>
+      <span class="crab-conf-val" id="crab-conf-val">0.60</span>
+    </label>
 
     <div class="ctrl-sep"></div>
 

@@ -61,16 +61,17 @@ def preprocess(frame: np.ndarray) -> np.ndarray:
     return np.expand_dims(img, axis=0)          # -> (1, 3, 512, 512)
 
 
-def postprocess(output, frame_w: int, frame_h: int):
+def postprocess(output, frame_w: int, frame_h: int, conf_threshold: float | None = None):
     """Decode YOLO11 ONNX output into european-green-crab boxes in frame pixels.
 
     Output shape: (1, 7, N). Each column is [cx, cy, w, h, c0, c1, c2] where
     cx/cy/w/h are in the 512x512 input space. We keep only boxes whose top class
-    is european-green-crab with confidence >= CONF_THRESHOLD, then run NMS so each
+    is european-green-crab with confidence >= conf_threshold, then run NMS so each
     physical crab yields exactly one box (the raw model emits many overlaps).
 
     Returns a list of (x1, y1, x2, y2, confidence) in original-frame pixels.
     """
+    thresh = CONF_THRESHOLD if conf_threshold is None else float(conf_threshold)
     preds = output[0][0].T            # (N, 7)
 
     # Scale factors from the 512x512 input back to the original frame.
@@ -86,7 +87,7 @@ def postprocess(output, frame_w: int, frame_h: int):
         confidence = float(class_scores[class_id])
 
         # Only european-green-crab above threshold; everything else is ignored.
-        if class_id != GREEN_CRAB_ID or confidence < CONF_THRESHOLD:
+        if class_id != GREEN_CRAB_ID or confidence < thresh:
             continue
 
         cx, cy, w, h = pred[0], pred[1], pred[2], pred[3]
@@ -101,7 +102,7 @@ def postprocess(output, frame_w: int, frame_h: int):
     if not boxes:
         return []
 
-    keep = cv2.dnn.NMSBoxes(boxes, scores, CONF_THRESHOLD, NMS_THRESHOLD)
+    keep = cv2.dnn.NMSBoxes(boxes, scores, thresh, NMS_THRESHOLD)
     if len(keep) == 0:
         return []
 

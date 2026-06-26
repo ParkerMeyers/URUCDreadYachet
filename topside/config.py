@@ -34,6 +34,8 @@ DEFAULT_CONFIG = {
     "arm_telemetry_port": 5006,
     "arm_claw_stop_us": 1425,
     "colmap_command": "python3 colmap_run.py",
+    "crab_camera_num": 1,
+    "crab_confidence": 0.6,
     "crabs_command": "python3 crabs.py",
     "mavproxy_bin": "/home/uruc/mav_env/bin/mavproxy.py",
     "mavproxy_serial": "/dev/ttyACM0",

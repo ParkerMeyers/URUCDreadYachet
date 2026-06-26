@@ -233,10 +233,10 @@ DIR = {
 # - pitch stabilization
 # - roll stabilization
 VERTICAL_BIAS = {
-    "front_right_v": 1.20,
-    "front_left_v":  1.25,
-    "back_right_v":  0.825,
-    "back_left_v":   0.825,
+    "front_right_v": 1.15,
+    "front_left_v":  1.00,
+    "back_right_v":  1.00,
+    "back_left_v":   0.85,
 }
 
 HORIZONTAL_MOTORS = [

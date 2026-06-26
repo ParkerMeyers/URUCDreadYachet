@@ -673,6 +673,8 @@ function updateModeUI(mode) {
 let CRAB_CAM = 1;
 window._crabActive = false;
 let _crabCountTimer = null;
+let _crabConfidence = 0.6;
+let _crabConfDebounce = null;
 
 function crabCamMeta() {
   return _CAM_RECORD_META[CRAB_CAM] || _CAM_RECORD_META[1];
@@ -701,6 +703,44 @@ async function loadCrabConfig() {
     if (!r.ok) return;
     const d = await r.json();
     if (d.camera === 1 || d.camera === 2) CRAB_CAM = d.camera;
+    if (typeof d.confidence === 'number') applyCrabConfUI(d.confidence, d.confidence_min, d.confidence_max);
+  } catch (_) {}
+}
+
+function applyCrabConfUI(conf, minConf, maxConf) {
+  _crabConfidence = conf;
+  const slider = document.getElementById('crab-conf-slider');
+  const val = document.getElementById('crab-conf-val');
+  const minPct = Math.round((minConf ?? 0.35) * 100);
+  const maxPct = Math.round((maxConf ?? 0.95) * 100);
+  if (slider) {
+    slider.min = String(minPct);
+    slider.max = String(maxPct);
+    slider.value = String(Math.round(conf * 100));
+  }
+  if (val) val.textContent = conf.toFixed(2);
+}
+
+function onCrabConfSlider(el) {
+  const conf = Number(el.value) / 100;
+  const val = document.getElementById('crab-conf-val');
+  if (val) val.textContent = conf.toFixed(2);
+  if (_crabConfDebounce) clearTimeout(_crabConfDebounce);
+  _crabConfDebounce = setTimeout(() => setCrabConfidence(conf), 120);
+}
+
+async function setCrabConfidence(conf) {
+  try {
+    const r = await fetch('/api/crab/confidence', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confidence: conf }),
+    });
+    const d = await r.json();
+    if (d.ok && typeof d.confidence === 'number') {
+      _crabConfidence = d.confidence;
+      applyCrabConfUI(d.confidence);
+    }
   } catch (_) {}
 }
 
@@ -786,7 +826,7 @@ function applyCrabToggle(on) {
   toast(on ? `🦀 Crab detection ON (${label})` : 'Crab detection OFF', 'ok');
 }
 
-// COLMAP frame recorder (topside): toggle records arm cam at 10fps; save seals
+// COLMAP frame recorder (topside): toggle records forward cam at 10fps; save seals
 // every staged frame into a single folder.
 async function toggleColmap() {
   const r = await fetch('/api/colmap/toggle', { method: 'POST' });
