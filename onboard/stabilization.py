@@ -45,13 +45,13 @@ TELEMETRY_HZ = 10
 # ── Pix6 RC output ──────────────────────────────────────────────────────────
 # Pix6 PWM outputs must be set to RCPassThru in QGroundControl (Advanced Params):
 #   SERVO1_FUNCTION = 51   → front_right_h  (MOTORS index 0, M1)
-#   SERVO2_FUNCTION = 52   → back_right_v   (MOTORS index 1, M2)
+#   SERVO2_FUNCTION = 52   → front_right_v  (MOTORS index 1, M2)
 #   SERVO3_FUNCTION = 53   → back_right_h   (MOTORS index 2, M3)
 #   SERVO4_FUNCTION = 54   → back_left_v    (MOTORS index 3, M4)
-#   SERVO5_FUNCTION = 55   → front_right_v  (MOTORS index 4, M5)
+#   SERVO5_FUNCTION = 55   → front_left_v   (MOTORS index 4, M5)
 #   SERVO6_FUNCTION = 56   → front_left_h   (MOTORS index 5, M6)
-#   SERVO7_FUNCTION = 57   → front_left_v   (MOTORS index 6, M7)
-#   SERVO8_FUNCTION = 58   → back_left_h    (MOTORS index 7, M8)
+#   SERVO7_FUNCTION = 57   → back_left_h    (MOTORS index 6, M7)
+#   SERVO8_FUNCTION = 58   → back_right_v   (MOTORS index 7, M8)
 # Also set RC_OVERRIDE_TIME to e.g. 3 (seconds) so overrides persist briefly
 # if the loop hiccups, but fail-safe to neutral on actual loss of comms.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,13 +207,13 @@ MAX_VERTICAL_CMD = 1.00
 
 MOTORS = {
     "front_right_h": 0,
-    "back_right_v":  1,
+    "front_right_v": 1,
     "back_right_h":  2,
     "back_left_v":   3,
-    "front_right_v": 4,
+    "front_left_v":  4,
     "front_left_h":  5,
-    "front_left_v":  6,
-    "back_left_h":   7,
+    "back_left_h":   6,
+    "back_right_v":  7,
 }
 
 DIR = {
@@ -256,13 +256,13 @@ VERTICAL_MOTORS = [
 # RC channel 1–8 → motor name (matches motor_test_onboard.py)
 MOTOR_CH_TO_NAME = {
     1: "front_right_h",
-    2: "back_right_v",
+    2: "front_right_v",
     3: "back_right_h",
     4: "back_left_v",
-    5: "front_right_v",
+    5: "front_left_v",
     6: "front_left_h",
-    7: "front_left_v",
-    8: "back_left_h",
+    7: "back_left_h",
+    8: "back_right_v",
 }
 
 # Manual thruster PWM (web UI JSON on UDP_LISTEN_PORT with cmd=manual_pwm)

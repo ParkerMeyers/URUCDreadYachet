@@ -669,18 +669,121 @@ function updateModeUI(mode) {
   updateArmControlsUI();
 }
 
-// Crab detection runs topside: toggle swaps the arm cam to the annotated stream.
-const CRAB_CAM = 2;            // arm camera (/camera/2)
+// Crab detection camera: 1 = forward, 2 = arm (from rov_config.json crab_camera_num).
+let CRAB_CAM = 1;
 window._crabActive = false;
+let _crabCountTimer = null;
+
+function crabCamMeta() {
+  return _CAM_RECORD_META[CRAB_CAM] || _CAM_RECORD_META[1];
+}
+
+function ensureCrabOverlay() {
+  const meta = crabCamMeta();
+  const wrap = document.getElementById(meta.wrapId);
+  if (!wrap) return null;
+  let el = document.getElementById('crab-count-overlay');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'crab-count-overlay';
+    el.className = 'crab-count-overlay hidden';
+    el.textContent = '🦀 0';
+    wrap.appendChild(el);
+  } else if (el.parentElement !== wrap) {
+    wrap.appendChild(el);
+  }
+  return el;
+}
+
+async function loadCrabConfig() {
+  try {
+    const r = await fetch('/api/crab/config');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.camera === 1 || d.camera === 2) CRAB_CAM = d.camera;
+  } catch (_) {}
+}
+
+function reconnectCamera(camNum, forceReconnect = true) {
+  const st = _cameraState[camNum];
+  if (st && st._loadStream) {
+    st._loadStream(forceReconnect);
+    return true;
+  }
+  return false;
+}
+
+function updateCrabCountUI(count) {
+  const crbEl = document.getElementById('mission-crabs');
+  if (crbEl && window._crabActive) {
+    crbEl.textContent = `CRABS: ${count}`;
+    crbEl.className = 'mission-item running';
+  }
+  const overlay = ensureCrabOverlay();
+  if (overlay) {
+    overlay.textContent = `🦀 ${count}`;
+    overlay.classList.toggle('hidden', !window._crabActive);
+  }
+}
+
+async function refreshCrabCount() {
+  if (!window._crabActive) return;
+  try {
+    const r = await fetch('/api/crab/count');
+    if (!r.ok) return;
+    const d = await r.json();
+    updateCrabCountUI(d.count ?? 0);
+  } catch (_) {}
+}
+
+function startCrabCountPoll() {
+  stopCrabCountPoll();
+  refreshCrabCount();
+  _crabCountTimer = setInterval(refreshCrabCount, 500);
+}
+
+function stopCrabCountPoll() {
+  if (_crabCountTimer) { clearInterval(_crabCountTimer); _crabCountTimer = null; }
+  const overlay = ensureCrabOverlay();
+  if (overlay) overlay.classList.add('hidden');
+}
 
 function toggleCrabs() {
-  window._crabActive = !window._crabActive;
+  const enabling = !window._crabActive;
+  if (enabling) {
+    fetch('/api/crab/status')
+      .then(r => r.json())
+      .then(d => {
+        if (!d.ok) {
+          const fix = d.install || 'pip install opencv-python numpy onnxruntime';
+          toast(`Crab detection unavailable (${(d.issues || []).join(', ')}). ${fix}`, 'err');
+          return;
+        }
+        applyCrabToggle(true);
+      })
+      .catch(() => toast('Could not check crab detection status', 'err'));
+    return;
+  }
+  applyCrabToggle(false);
+}
+
+function applyCrabToggle(on) {
+  window._crabActive = on;
   const btn = document.getElementById('btn-crabs');
-  if (btn) btn.classList.toggle('active', window._crabActive);
-  // Reconnect the arm camera so loadStream picks the /crab sub-stream (or plain).
-  setupCamera('cam2', 'no-sig-2', CRAB_CAM);
-  toast(window._crabActive ? '🦀 Crab detection ON (arm cam)' : 'Crab detection OFF',
-        'ok');
+  if (btn) btn.classList.toggle('active', on);
+  const meta = crabCamMeta();
+  if (!reconnectCamera(CRAB_CAM)) {
+    setupCamera(meta.imgId, 'no-sig-' + CRAB_CAM, CRAB_CAM);
+  }
+  if (on) {
+    startCrabCountPoll();
+    updateCrabCountUI(0);
+  } else {
+    stopCrabCountPoll();
+    refreshMissionStatus();
+  }
+  const label = (crabCamMeta().label || 'camera').replace('CAM ', '');
+  toast(on ? `🦀 Crab detection ON (${label})` : 'Crab detection OFF', 'ok');
 }
 
 // COLMAP frame recorder (topside): toggle records arm cam at 10fps; save seals
@@ -966,7 +1069,7 @@ const ARM_MANUAL_JOINTS = [
 ];
 const MANUAL_AUX_LABELS = ['J2', '—', 'J3', '—', 'J1', '—', 'Claw'];
 const MANUAL_AUX_NEUTRALS = [1600, 1500, 1500, 1500, 1400, 1500, 1425];
-const MANUAL_THR_LABELS = ['FR_H', 'BR_V', 'BR_H', 'BL_V', 'FR_V', 'FL_H', 'FL_V', 'BL_H'];
+const MANUAL_THR_LABELS = ['FR_H', 'FR_V', 'BR_H', 'BL_V', 'FL_V', 'FL_H', 'BL_H', 'BR_V'];
 let _configClawStopUs = 1425;
 
 function manualAuxDefaults() {
@@ -1772,10 +1875,14 @@ async function refreshMissionStatus() {
       colEl.title = d.colmap.last_line || '';
     }
     if (crbEl && d.crabs) {
-      const st = d.crabs.running ? 'RUNNING' : 'idle';
-      crbEl.textContent = `CRABS: ${st}`;
-      crbEl.className = 'mission-item ' + (d.crabs.running ? 'running' : 'stopped');
-      crbEl.title = d.crabs.last_line || '';
+      if (window._crabActive) {
+        refreshCrabCount();
+      } else {
+        const st = d.crabs.running ? 'RUNNING' : 'idle';
+        crbEl.textContent = `CRABS: ${st}`;
+        crbEl.className = 'mission-item ' + (d.crabs.running ? 'running' : 'stopped');
+        crbEl.title = d.crabs.last_line || '';
+      }
     }
   } catch (_) {}
 }
@@ -1852,6 +1959,60 @@ function updateFlagUI() {
   if (yawBtn) {
     yawBtn.textContent = `YAW: ${_ctrlState.yaw_hold ? 'ON' : 'OFF'}`;
     yawBtn.className   = 'ctrl-flag' + (_ctrlState.yaw_hold ? ' active-yaw' : '');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ARM GRIP STATUS (GRIP_ONOFF from arm controller)
+// ─────────────────────────────────────────────────────────────
+let _armGripOn = false;
+
+function isArmGripping(t) {
+  t = t || _tel || {};
+  const v = t.arm_grip_on;
+  if (v === true || v === 1) return true;
+  if (v === false || v === 0 || v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === '1' || s === 'on' || s === 'true' || s === 'yes';
+}
+
+function ensureGripBanner() {
+  const wrap = document.getElementById('cam-wrap-2');
+  if (!wrap) return null;
+  let el = document.getElementById('grip-status-banner');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'grip-status-banner';
+    el.className = 'grip-status-banner hidden';
+    el.textContent = 'Gripping';
+    wrap.appendChild(el);
+  }
+  return el;
+}
+
+function updateGripStatusUI(t) {
+  _armGripOn = isArmGripping(t);
+  const gripBanner = ensureGripBanner();
+  if (gripBanner) {
+    gripBanner.classList.toggle('hidden', !_armGripOn);
+  }
+  const gripTel = document.getElementById('tel-arm-grip');
+  if (gripTel) {
+    const v = (t || _tel || {}).arm_grip_on;
+    if (v === true || v === 1) {
+      gripTel.textContent = 'ON';
+      gripTel.className = 'tc-val good';
+    } else if (v === false || v === 0) {
+      gripTel.textContent = 'OFF';
+      gripTel.className = 'tc-val';
+    } else if (v != null && String(v).trim()) {
+      gripTel.textContent = String(v).toUpperCase();
+      gripTel.className = 'tc-val ' + (_armGripOn ? 'good' : '');
+    } else {
+      gripTel.textContent = '--';
+      gripTel.className = 'tc-val';
+    }
+    gripTel.title = 'GRIP_ONOFF from arm controller (9th CSV field)';
   }
 }
 
@@ -1933,11 +2094,7 @@ function updateArmPipelineTelemetry(t) {
     updateMosfetUI();
   }
 
-  const gripBanner = document.getElementById('grip-status-banner');
-  if (gripBanner) {
-    const gripping = t.arm_grip_on === true || t.arm_grip_on === 1;
-    gripBanner.classList.toggle('hidden', !gripping);
-  }
+  updateGripStatusUI(t);
 }
 
 function updateStatus() {
@@ -2854,7 +3011,55 @@ function drawArmHUD(canvasId) {
   canvas.width  = wrap.clientWidth;
   canvas.height = wrap.clientHeight;
   const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const W = canvas.width;
+  const H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (!_armGripOn || W < 40 || H < 40) return;
+
+  const pulse = 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(Date.now() / 425));
+  const fontSize = Math.max(18, Math.min(W * 0.12, H * 0.1, 42));
+  const label = 'Gripping';
+  ctx.font = `800 ${fontSize}px system-ui, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  const cx = W * 0.5;
+  const cy = H * 0.5;
+  const metrics = ctx.measureText(label);
+  const padX = fontSize * 0.7;
+  const padY = fontSize * 0.45;
+  const boxW = metrics.width + padX * 2;
+  const boxH = fontSize + padY * 2;
+
+  ctx.save();
+  ctx.globalAlpha = 0.88;
+  ctx.fillStyle = 'rgba(0, 32, 20, 0.92)';
+  ctx.strokeStyle = `rgba(0, 224, 138, ${pulse})`;
+  ctx.lineWidth = 3;
+  ctx.shadowColor = `rgba(0, 224, 138, ${0.35 + pulse * 0.55})`;
+  ctx.shadowBlur = 18 + pulse * 22;
+  const rx = 12;
+  const x = cx - boxW / 2;
+  const y = cy - boxH / 2;
+  ctx.beginPath();
+  ctx.moveTo(x + rx, y);
+  ctx.lineTo(x + boxW - rx, y);
+  ctx.quadraticCurveTo(x + boxW, y, x + boxW, y + rx);
+  ctx.lineTo(x + boxW, y + boxH - rx);
+  ctx.quadraticCurveTo(x + boxW, y + boxH, x + boxW - rx, y + boxH);
+  ctx.lineTo(x + rx, y + boxH);
+  ctx.quadraticCurveTo(x, y + boxH, x, y + boxH - rx);
+  ctx.lineTo(x, y + rx);
+  ctx.quadraticCurveTo(x, y, x + rx, y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.shadowBlur = 10 + pulse * 16;
+  ctx.fillStyle = `rgba(0, 224, 138, ${0.65 + pulse * 0.35})`;
+  ctx.fillText(label, cx, cy);
+  ctx.restore();
 }
 
 function drawArrow(ctx, x1, y1, x2, y2, color, opacity) {
@@ -3077,6 +3282,16 @@ function setupCamera(imgId, noSigId, camNum) {
   function onFail() {
     if (!st.active) return;
     st.failCount++;
+    if (window._crabActive && camNum === CRAB_CAM && st.failCount >= 2) {
+      window._crabActive = false;
+      const btn = document.getElementById('btn-crabs');
+      if (btn) btn.classList.remove('active');
+      stopCrabCountPoll();
+      refreshMissionStatus();
+      toast('Crab detection unavailable — falling back to plain camera feed', 'err');
+      loadStream(true);
+      return;
+    }
     // Transient MJPEG/proxy glitch — retry without flashing "No Signal".
     if (hasFrame() && st.lastFrameAt && Date.now() - st.lastFrameAt < 5000) {
       scheduleRetry();
@@ -3087,6 +3302,8 @@ function setupCamera(imgId, noSigId, camNum) {
   }
 
   function prefetchSnapshot() {
+    // Extra Pi snapshot pulls while crab owns the arm upstream can kill the other USB cam.
+    if (window._crabActive && camNum === CRAB_CAM) return;
     fetch(`/camera/${camNum}/snapshot?t=${Date.now()}`)
       .then(r => (r.ok ? r.blob() : null))
       .then(blob => {
@@ -3129,7 +3346,7 @@ function setupCamera(imgId, noSigId, camNum) {
       img.onload = onSuccess;
       img.onerror = onFail;
       startFramePoll();
-      const sub = (window._crabActive && camNum === 2) ? '/crab' : '';
+      const sub = (window._crabActive && camNum === CRAB_CAM) ? '/crab' : '';
       img.src = `/camera/${camNum}${sub}?t=${Date.now()}`;
       armWatchdog();
     };
@@ -3144,6 +3361,7 @@ function setupCamera(imgId, noSigId, camNum) {
     }
   }
 
+  st._loadStream = loadStream;
   loadStream(false);
 }
 
@@ -3253,6 +3471,7 @@ async function _doOpenControl() {
   _updateGamepadPill();
   loadArmPresets();
   startMissionPoll();
+  if (window._crabActive) startCrabCountPoll();
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       startAllCameras();
@@ -3267,6 +3486,7 @@ function showLaunch() {
   closeVideoRecordDropdown();
   stopAllCameras();
   stopMissionPoll();
+  stopCrabCountPoll();
   document.getElementById('control').classList.remove('active');
   document.getElementById('launch').classList.add('active');
   unbindCameraResize();
@@ -3420,6 +3640,7 @@ function toast(msg, type='') {
 window.addEventListener('load', async () => {
   _initTtsVoices();
   await loadConfig();
+  await loadCrabConfig();
   buildArmPwmGrid();
   loadArmPresets();
 

@@ -65,20 +65,20 @@ ARM_MANUAL_JOINTS = [
 ARM_SERVO_HINT = "SERVO9=59 SERVO11=61 SERVO13=63 SERVO15=65 (RCPassThru), BRD_SAFETYENABLE=0"
 
 # ── Thrusters (Pix6 RC1–8) ───────────────────────────────────────────────────
-MANUAL_THR_LABELS = ["FR_H", "BR_V", "BR_H", "BL_V", "FR_V", "FL_H", "FL_V", "BL_H"]
+MANUAL_THR_LABELS = ["FR_H", "FR_V", "BR_H", "BL_V", "FL_V", "FL_H", "BL_H", "BR_V"]
 MANUAL_THR_NAMES = {
-    1: "front_right_h", 2: "back_right_v", 3: "back_right_h", 4: "back_left_v",
-    5: "front_right_v", 6: "front_left_h", 7: "front_left_v", 8: "back_left_h",
+    1: "front_right_h", 2: "front_right_v", 3: "back_right_h", 4: "back_left_v",
+    5: "front_left_v", 6: "front_left_h", 7: "back_left_h", 8: "back_right_v",
 }
 MOTOR_NAME_ALIASES = {
     "m1": 1, "motor1": 1, "frh": 1, "front_right_h": 1,
-    "m2": 2, "motor2": 2, "brv": 2, "back_right_v": 2,
+    "m2": 2, "motor2": 2, "frv": 2, "front_right_v": 2,
     "m3": 3, "motor3": 3, "brh": 3, "back_right_h": 3,
     "m4": 4, "motor4": 4, "blv": 4, "back_left_v": 4,
-    "m5": 5, "motor5": 5, "frv": 5, "front_right_v": 5,
+    "m5": 5, "motor5": 5, "flv": 5, "front_left_v": 5,
     "m6": 6, "motor6": 6, "flh": 6, "front_left_h": 6,
-    "m7": 7, "motor7": 7, "flv": 7, "front_left_v": 7,
-    "m8": 8, "motor8": 8, "blh": 8, "back_left_h": 8,
+    "m7": 7, "motor7": 7, "blh": 7, "back_left_h": 7,
+    "m8": 8, "motor8": 8, "brv": 8, "back_right_v": 8,
 }
 THR_PWM_MIN = 1100
 THR_PWM_MAX = 1900

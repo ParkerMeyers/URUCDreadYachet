@@ -66,6 +66,21 @@ except ImportError:
     HAVE_REQUESTS = False
 
 try:
+    import cv2 as _cv2
+    import numpy as np
+    HAVE_CV2 = True
+except ImportError:
+    HAVE_CV2 = False
+    _cv2 = None  # type: ignore
+    np = None  # type: ignore
+
+try:
+    import onnxruntime as _ort  # noqa: F401 — checked via HAVE_ONNX
+    HAVE_ONNX = True
+except ImportError:
+    HAVE_ONNX = False
+
+try:
     import serial as _serial  # pyserial — required by topside/arm_sender.py
     HAVE_PYSERIAL = True
 except ImportError:
@@ -315,7 +330,7 @@ def _merge_arm_sensors_into_telemetry(parsed: dict) -> None:
         "grip_on": "arm_grip_on",
     }
     for src, dst in mapping.items():
-        if parsed.get(src) is not None:
+        if src in parsed:
             tel[dst] = parsed[src]
 
 
@@ -326,7 +341,7 @@ def _parse_arm_sent_line(line: str) -> dict | None:
     if "SENT:" in text:
         text = text.split("SENT:", 1)[1].strip()
     elif text.startswith("RAW:"):
-        return None
+        text = text.split("RAW:", 1)[1].strip()
     if text.startswith("PWM:"):
         text = text[4:]
     parsed = parse_arm_controller_csv(text.split(","))
@@ -892,7 +907,7 @@ def _update_arm_telemetry_from_json(pkt: dict):
         ("arm_imu_angle_deg", "arm_imu_angle_deg"),
         ("arm_grip_on", "arm_grip_on"),
     ):
-        if pkt.get(src) is not None:
+        if src in pkt:
             tel[dst] = pkt[src]
     STATE["last_arm_telemetry_time"] = time.time()
     if not STATE.get("_arm_telemetry_rx_logged"):
@@ -1371,6 +1386,17 @@ def camera_snapshot(cam_num):
     if not HAVE_REQUESTS:
         return jsonify({"ok": False, "msg": "requests not installed"}), 503
 
+    # While crab detection owns the arm upstream, serve from its buffer — avoids
+    # a second HTTP client on the Pi that can knock out the other USB camera.
+    if (
+        HAVE_CV2
+        and cam_num == _crab_camera_num()
+        and _crab_pipeline.is_active()
+    ):
+        jpeg = _crab_pipeline.snapshot_jpeg(annotated=False)
+        if jpeg:
+            return Response(jpeg, mimetype="image/jpeg")
+
     url_key = _CAMERA_UI_URL_KEY.get(cam_num, f"camera{cam_num}_url")
     base = str(config.get(url_key, "")).rstrip("/")
     if not base:
@@ -1395,18 +1421,214 @@ def camera_snapshot(cam_num):
 
 import shutil
 
-try:
-    import cv2 as _cv2
-    import numpy as np
-    HAVE_CV2 = True
-except ImportError:
-    HAVE_CV2 = False
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _EXTRA_DIR = os.path.join(_HERE, "extra")
 
 _crab_lock = threading.Lock()
-_crab = {"sess": None, "input": None, "cd": None}
+_crab = {"sess": None, "input": None, "cd": None, "count": 0}
+
+# Crab overlay camera: UI slot 1 = forward (:8161), slot 2 = arm (:8160). See crab_camera_num.
+_CRAB_CAMERA_NUM = 1
+_CRAB_DISPLAY_FPS = 15
+
+
+def _crab_camera_num() -> int:
+    try:
+        n = int(config.get("crab_camera_num", _CRAB_CAMERA_NUM))
+    except (TypeError, ValueError):
+        n = _CRAB_CAMERA_NUM
+    return n if n in (1, 2) else _CRAB_CAMERA_NUM
+
+
+def _crab_camera_url() -> str:
+    key = _CAMERA_UI_URL_KEY.get(_crab_camera_num(), "arm_camera_url")
+    return str(config.get(key, "")).strip()
+
+
+def _crab_deps_issues() -> list[str]:
+    issues: list[str] = []
+    if not HAVE_CV2:
+        issues.append("opencv-python")
+    if not HAVE_ONNX:
+        issues.append("onnxruntime")
+    model = os.path.join(_EXTRA_DIR, "crab_model.onnx")
+    if not os.path.isfile(model):
+        issues.append("extra/crab_model.onnx missing")
+    return issues
+
+
+class _CrabPipeline:
+    """One Pi upstream + reader/infer threads; stream at camera fps with live boxes."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._clients = 0
+        self._stop = threading.Event()
+        self._reader_thread = None
+        self._infer_thread = None
+        self._cam_url = ""
+        self._latest_frame = None
+        self._latest_dets = []
+        self._frame_seq = 0
+        self._infer_seq = 0
+        self._frame_event = threading.Event()
+
+    def is_active(self) -> bool:
+        with self._lock:
+            return self._clients > 0
+
+    def acquire(self, cam_url: str) -> None:
+        with self._lock:
+            self._clients += 1
+            self._cam_url = cam_url
+            if self._clients == 1:
+                self._stop.clear()
+                self._latest_frame = None
+                self._latest_dets = []
+                self._frame_seq = 0
+                self._infer_seq = 0
+                self._frame_event.clear()
+                self._reader_thread = threading.Thread(
+                    target=self._reader_loop, daemon=True, name="crab-reader"
+                )
+                self._infer_thread = threading.Thread(
+                    target=self._infer_loop, daemon=True, name="crab-infer"
+                )
+                self._reader_thread.start()
+                self._infer_thread.start()
+
+    def release(self) -> None:
+        with self._lock:
+            self._clients = max(0, self._clients - 1)
+            if self._clients == 0:
+                self._stop.set()
+                self._frame_event.set()
+
+    def wait_first_frame(self, timeout: float = 12.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline and not self._stop.is_set():
+            with self._lock:
+                if self._latest_frame is not None:
+                    return True
+            time.sleep(0.03)
+        return False
+
+    def snapshot_jpeg(self, annotated: bool = False):
+        with self._lock:
+            frame = self._latest_frame
+            dets = list(self._latest_dets)
+        if frame is None:
+            return None
+        out = frame.copy()
+        if annotated:
+            _, _, cd = _crab_engine()
+            cd.draw_overlay(out, dets)
+        ok, enc = _cv2.imencode(".jpg", out, [_cv2.IMWRITE_JPEG_QUALITY, 80])
+        return enc.tobytes() if ok else None
+
+    def _reader_loop(self) -> None:
+        while not self._stop.is_set():
+            url = self._cam_url
+            try:
+                for jpeg in _iter_upstream_jpegs(url):
+                    if self._stop.is_set():
+                        break
+                    frame = _cv2.imdecode(
+                        np.frombuffer(jpeg, dtype=np.uint8), _cv2.IMREAD_COLOR
+                    )
+                    if frame is None:
+                        continue
+                    with self._lock:
+                        self._latest_frame = frame
+                        self._frame_seq += 1
+                    self._frame_event.set()
+            except Exception:
+                if not self._stop.is_set():
+                    time.sleep(0.4)
+
+    def _infer_loop(self) -> None:
+        sess, input_name, cd = _crab_engine()
+        last_seq = 0
+        while not self._stop.is_set():
+            if not self._frame_event.wait(timeout=0.4):
+                continue
+            self._frame_event.clear()
+            with self._lock:
+                if self._frame_seq == last_seq or self._latest_frame is None:
+                    continue
+                frame = self._latest_frame.copy()
+                seq = self._frame_seq
+            h, w = frame.shape[:2]
+            try:
+                outputs = sess.run(None, {input_name: cd.preprocess(frame)})
+                dets = cd.postprocess(outputs, w, h)
+            except Exception:
+                continue
+            with self._lock:
+                if seq >= self._infer_seq:
+                    self._latest_dets = dets
+                    self._infer_seq = seq
+                    _crab["count"] = len(dets)
+            last_seq = seq
+
+    def iter_stream(self):
+        _, _, cd = _crab_engine()
+        period = 1.0 / _CRAB_DISPLAY_FPS
+        while not self._stop.is_set():
+            t0 = time.time()
+            with self._lock:
+                frame = self._latest_frame
+                dets = list(self._latest_dets)
+            if frame is not None:
+                out = frame.copy()
+                cd.draw_overlay(out, dets)
+                ok, enc = _cv2.imencode(
+                    ".jpg", out, [_cv2.IMWRITE_JPEG_QUALITY, 75]
+                )
+                if ok:
+                    yield _crab_mjpeg_part(enc.tobytes())
+            elapsed = time.time() - t0
+            delay = period - elapsed
+            if delay > 0:
+                time.sleep(delay)
+
+
+_crab_pipeline = _CrabPipeline()
+
+
+def _iter_upstream_jpegs(cam_url: str):
+    """Yield raw JPEG bytes from Pi MJPEG upstream via requests (not cv2.VideoCapture)."""
+    upstream = _open_camera_upstream(cam_url)
+    try:
+        buf = b""
+        for chunk in upstream.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            buf += chunk
+            while True:
+                start = buf.find(b"\xff\xd8")
+                if start < 0:
+                    if len(buf) > 2:
+                        buf = buf[-2:]
+                    break
+                end = buf.find(b"\xff\xd9", start + 2)
+                if end < 0:
+                    if start > 0:
+                        buf = buf[start:]
+                    break
+                yield buf[start:end + 2]
+                buf = buf[end + 2:]
+    finally:
+        try:
+            upstream.close()
+        except Exception:
+            pass
+
+
+def _crab_mjpeg_part(jpeg_bytes):
+    return (b"--frame\r\nContent-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(jpeg_bytes)).encode() + b"\r\n\r\n"
+            + jpeg_bytes + b"\r\n")
 
 
 def _crab_engine():
@@ -1425,61 +1647,68 @@ def _crab_engine():
         return _crab["sess"], _crab["input"], _crab["cd"]
 
 
-def _crab_mjpeg(cam_url):
-    """Yield annotated JPEG bytes — green-crab boxes + count burned into frame.
-
-    ponytail: CPU inference of YOLO11m runs ~2-4 fps; switch the onnxruntime
-    provider to CUDA/DirectML if a faster overlay is needed.
-    """
-    sess, input_name, cd = _crab_engine()
-    cap = None
-    try:
-        while True:
-            if cap is None or not cap.isOpened():
-                if cap is not None:
-                    cap.release()
-                cap = _cv2.VideoCapture(cam_url)
-                cap.set(_cv2.CAP_PROP_BUFFERSIZE, 1)
-                if not cap.isOpened():
-                    time.sleep(1.0)
-                    continue
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                cap.release()
-                cap = None
-                time.sleep(0.3)
-                continue
-            h, w = frame.shape[:2]
-            outputs = sess.run(None, {input_name: cd.preprocess(frame)})
-            dets = cd.postprocess(outputs, w, h)
-            cd.draw_overlay(frame, dets)
-            ok, jpeg = _cv2.imencode(".jpg", frame, [_cv2.IMWRITE_JPEG_QUALITY, 75])
-            if ok:
-                yield jpeg.tobytes()
-    finally:
-        if cap is not None:
-            cap.release()
-
-
 @app.route("/camera/<int:cam_num>/crab")
 def camera_crab(cam_num):
-    if cam_num not in (1, 2) or not HAVE_CV2:
+    if cam_num != _crab_camera_num():
         return "", 404
-    cam_url = config.get(_CAMERA_UI_URL_KEY.get(cam_num, ""), "")
+    issues = _crab_deps_issues()
+    if issues:
+        msg = "Crab detection unavailable: " + ", ".join(issues)
+        msg += f" — install with: {PYTHON} -m pip install opencv-python numpy onnxruntime"
+        return Response(msg, status=503)
+    cam_url = _crab_camera_url()
     if not cam_url:
-        return "", 404
+        return Response("crab camera URL not configured", status=503)
 
-    def _gen():
+    try:
+        _crab_engine()
+    except Exception as exc:
+        return Response(str(exc), status=503)
+
+    _crab_pipeline.acquire(cam_url)
+    if not _crab_pipeline.wait_first_frame():
+        _crab_pipeline.release()
+        return Response("no frames from crab camera", status=502)
+
+    def _stream():
         try:
-            for jpeg in _crab_mjpeg(cam_url):
-                yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
-                       b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
-                       + jpeg + b"\r\n")
+            yield from _crab_pipeline.iter_stream()
         except (GeneratorExit, Exception):
-            return
+            pass
+        finally:
+            _crab_pipeline.release()
 
-    return Response(stream_with_context(_gen()),
-                    mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(
+        stream_with_context(_stream()),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+@app.route("/api/crab/config")
+def api_crab_config():
+    n = _crab_camera_num()
+    return jsonify({
+        "camera": n,
+        "url_key": _CAMERA_UI_URL_KEY.get(n, ""),
+    })
+
+
+@app.route("/api/crab/status")
+def api_crab_status():
+    issues = _crab_deps_issues()
+    return jsonify({
+        "ok": not issues,
+        "issues": issues,
+        "python": PYTHON,
+        "install": f"{PYTHON} -m pip install opencv-python numpy onnxruntime",
+    })
+
+
+@app.route("/api/crab/count")
+def api_crab_count():
+    with _crab_lock:
+        return jsonify({"count": int(_crab.get("count", 0))})
 
 
 # --- COLMAP frame recorder (arm camera, 10 fps, <=720p, aspect preserved) -----
@@ -2581,6 +2810,12 @@ def main():
     )
     print(f"  Arm telemetry on {arm_port_note}")
     print(f"  Control packets -> Pi UDP port {config['thrust_udp_port']}")
+    crab_issues = _crab_deps_issues()
+    if crab_issues:
+        print("  [WARN] Crab detection OFF — missing:", ", ".join(crab_issues))
+        print(f"         Fix: {PYTHON} -m pip install opencv-python numpy onnxruntime")
+    else:
+        print("  Crab detection: ready (opencv + onnxruntime)")
     print(f"{'='*55}\n")
 
     socketio.run(app, host=args.host, port=args.port, debug=False, allow_unsafe_werkzeug=True)

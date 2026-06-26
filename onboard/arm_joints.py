@@ -103,6 +103,14 @@ def _parse_imu_angle(value) -> float | None:
 
 
 def _parse_grip_onoff(value) -> bool | None:
+    text = str(value).strip()
+    if not text:
+        return None
+    low = text.lower()
+    if low in ("on", "yes", "true"):
+        return True
+    if low in ("off", "no", "false"):
+        return False
     status = _parse_status_int(value)
     if status is None:
         return None

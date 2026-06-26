@@ -31,7 +31,7 @@ GREEN_CRAB_ID = 0                  # index of european-green-crab in CLASS_NAMES
 INPUT_SIZE = 512                   # model expects 512x512
 
 # --- Detection tuning ---------------------------------------------------------
-CONF_THRESHOLD = 0.5               # task: count detections above 0.5 confidence
+CONF_THRESHOLD = 0.6               # count detections at/above this confidence (was 0.5 task min)
 NMS_THRESHOLD = 0.45               # IoU threshold for de-duplicating boxes
 
 # --- Stream config ------------------------------------------------------------

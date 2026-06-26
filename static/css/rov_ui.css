@@ -311,16 +311,27 @@ html,body { height:100%; background:var(--bg); color:var(--text);
 /* Arm grip active overlay (GRIP_ON) */
 .grip-status-banner {
   position:absolute; top:50%; left:50%; transform:translate(-50%, -50%);
-  background:rgba(0, 32, 20, 0.88); color:var(--green);
+  background:rgba(0, 32, 20, 0.92); color:var(--green);
   padding:14px 36px; border-radius:12px;
   font-weight:800; font-size:1.35rem; letter-spacing:3px;
-  z-index:6; pointer-events:none;
+  z-index:15; pointer-events:none;
   border:2px solid var(--green);
   text-shadow:0 0 12px var(--green), 0 0 24px rgba(0, 224, 138, 0.6);
   box-shadow:0 0 20px rgba(0, 224, 138, 0.5), 0 4px 24px rgba(0, 0, 0, 0.6);
   animation:grip-glow-flash 0.85s ease-in-out infinite;
 }
 .grip-status-banner.hidden { display:none; }
+
+.crab-count-overlay {
+  position:absolute; top:10px; left:10px;
+  background:rgba(0, 32, 20, 0.88); color:var(--green);
+  padding:6px 14px; border-radius:8px;
+  font-weight:700; font-size:1rem; letter-spacing:1px;
+  z-index:6; pointer-events:none;
+  border:1px solid var(--green);
+}
+.crab-count-overlay.hidden { display:none; }
+
 @keyframes grip-glow-flash {
   0%, 100% {
     opacity:1;
