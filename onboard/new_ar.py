@@ -11,7 +11,7 @@ Physical arm (4 DOF):
     J3 / M11  AUX3  RC ch 11   1300–1700 µs, stop 1500 (continuous)
     Claw/M15  AUX7  RC ch 15   open 1325, close 1525, stop 1425 (continuous)
 
-UDP inputs (port 5006, also 5009 for legacy control):
+UDP (port 5006 — CSV + JSON; port 5009 — legacy JSON control):
     Test / direct:  {"joint": 1, "pwm": 1400}  |  {"center_all": true}
     arm_sender CSV: 1400,1500,1500,1500,1600,1500,1425
     Web UI JSON:    {"cmd": "manual_pwm", "joint": 2, "pwm": 1600}
@@ -29,7 +29,11 @@ import time
 from pymavlink import mavutil
 
 from arm_joints import (
+    AUX_TO_JOINT,
     CLAW_STOP_US_DEFAULT,
+    JOINT_NAMES,
+    JOINT_TO_AUX,
+    JOINT_TO_MOTOR,
     NUM_JOINTS,
     RC_IGNORE,
     build_rc_override,
@@ -37,34 +41,33 @@ from arm_joints import (
     csv_list_to_joint_pwm,
     default_joint_pwm,
     joint_pwm_to_csv_list,
+    joint_to_rc_ch,
 )
-from mavlink_rc import MAVLINK_ONBOARD_ARM, connect_mavlink, send_rc_channels_override, wait_for_heartbeat
+from mavlink_rc import MAVLINK_ONBOARD_ARM, connect_mavlink, send_rc_channels_override
 
 UDP_PORT = 5006
 ARM_CONTROL_PORT = 5009
 MAVLINK_URL = MAVLINK_ONBOARD_ARM
 OVERRIDE_HZ = 20
-PRINT_HZ = 2
+DIAG_INTERVAL = 2.0
 ARM_TELEM_HZ = 5
 ARM_TELEM_PORT = 5006
 TIMEOUT_SEC = 0.75
 PRESET_MOTION_TIMEOUT_SEC = 45.0
-SERVO_DIAG_SEC = 3.0
-NEUTRAL_DEADBAND_US = 10
 
 _lock = threading.Lock()
-_joint_pwm = default_joint_pwm()
-_claw_stop_pwm = CLAW_STOP_US_DEFAULT
+_pwm = default_joint_pwm()
+_claw_stop = CLAW_STOP_US_DEFAULT
 _last_pkt_time = 0.0
 _rx_count = 0
-_arm_enabled = True
+_arm_enabled = False
 _manual_mode = False
 _preset_motion = False
 _preset_motion_since = 0.0
-_mavlink_up = False
+_fc_rc: dict[int, int] = {}
+_fc_srv: dict[int, int] = {}
+_mavlink_ok = False
 _mav_master = None
-_mav_lock = threading.Lock()
-_mav_connecting = False
 
 _telem_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 _telem_subscribers: set[tuple[str, int]] = set()
@@ -72,51 +75,115 @@ _telem_sub_lock = threading.Lock()
 _telem_send_failures: dict[tuple[str, int], int] = {}
 
 
-def _should_hold_neutral(last_pkt_time: float) -> bool:
-    if last_pkt_time <= 0:
+def _hold_neutral(last_pkt: float) -> bool:
+    if last_pkt <= 0:
         return True
-    return time.time() - last_pkt_time > TIMEOUT_SEC
+    return time.time() - last_pkt > TIMEOUT_SEC
 
 
-def _neutral_pwm() -> dict[int, int]:
+def _snapshot() -> tuple[dict[int, int], float, int, bool, bool, bool, bool, int]:
     with _lock:
-        claw = int(_claw_stop_pwm)
-    return default_joint_pwm(claw_stop=claw)
+        return (
+            dict(_pwm),
+            _last_pkt_time,
+            _rx_count,
+            _arm_enabled,
+            _manual_mode,
+            _preset_motion,
+            _mavlink_ok,
+            int(_claw_stop),
+        )
 
 
-def _apply_joint_pwm(updates: dict[int, int]) -> None:
-    global _joint_pwm, _last_pkt_time
+def _effective_pwm() -> dict[int, int]:
+    pwm, last_pkt, _, armed, manual, preset, _, claw = _snapshot()
+    if not armed:
+        return default_joint_pwm(claw_stop=claw)
+    if manual or preset:
+        return pwm
+    if _hold_neutral(last_pkt):
+        return default_joint_pwm(claw_stop=claw)
+    return pwm
+
+
+def _apply_pwm(updates: dict[int, int], *, from_csv: bool = False) -> None:
+    global _pwm, _last_pkt_time, _rx_count
     with _lock:
         for joint, us in updates.items():
             if 1 <= joint <= NUM_JOINTS:
-                _joint_pwm[joint] = clamp_joint_pwm(joint, us, claw_stop=_claw_stop_pwm)
+                _pwm[joint] = clamp_joint_pwm(joint, us, claw_stop=_claw_stop)
+        _last_pkt_time = time.time()
+        if from_csv:
+            _rx_count += 1
+
+
+def _center_all() -> None:
+    global _pwm, _last_pkt_time
+    with _lock:
+        _pwm = default_joint_pwm(claw_stop=int(_claw_stop))
         _last_pkt_time = time.time()
 
 
-def _center_all_joints() -> None:
-    global _joint_pwm, _last_pkt_time
-    with _lock:
-        _joint_pwm = default_joint_pwm(claw_stop=int(_claw_stop_pwm))
-        _last_pkt_time = time.time()
+def _poll_mavlink(master) -> None:
+    global _fc_rc, _fc_srv
+    while True:
+        msg = master.recv_match(type=["RC_CHANNELS", "SERVO_OUTPUT_RAW"], blocking=False)
+        if msg is None:
+            break
+        if msg.get_type() == "RC_CHANNELS":
+            for joint in range(1, NUM_JOINTS + 1):
+                rc_ch = joint_to_rc_ch(joint)
+                _fc_rc[rc_ch] = getattr(msg, f"chan{rc_ch}_raw", 0)
+        else:
+            for joint in range(1, NUM_JOINTS + 1):
+                rc_ch = joint_to_rc_ch(joint)
+                _fc_srv[rc_ch] = getattr(msg, f"servo{rc_ch}_raw", 0)
 
 
-def _build_rc_array() -> list[int]:
-    with _lock:
-        if not _arm_enabled:
-            return build_rc_override(_neutral_pwm(), ignore=RC_IGNORE)
-        manual = _manual_mode
-        preset = _preset_motion
-        pwm = dict(_joint_pwm)
-        last_pkt = _last_pkt_time
-        claw = int(_claw_stop_pwm)
+def _send_override(master) -> None:
+    send_rc_channels_override(master, build_rc_override(_effective_pwm()), ignore=RC_IGNORE)
 
-    if manual or preset:
-        return build_rc_override(pwm, ignore=RC_IGNORE)
 
-    if _should_hold_neutral(last_pkt):
-        return build_rc_override(default_joint_pwm(claw_stop=claw), ignore=RC_IGNORE)
+def _send_heartbeat(master) -> None:
+    master.mav.heartbeat_send(
+        mavutil.mavlink.MAV_TYPE_GCS,
+        mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+        0, 0, 0,
+    )
 
-    return build_rc_override(pwm, ignore=RC_IGNORE)
+
+def _joint_telemetry_rows(pwm: dict[int, int]) -> list[dict]:
+    rows = []
+    for joint in range(1, NUM_JOINTS + 1):
+        rc_ch = joint_to_rc_ch(joint)
+        rows.append({
+            "joint": joint,
+            "name": JOINT_NAMES[joint],
+            "aux": JOINT_TO_AUX[joint],
+            "motor": JOINT_TO_MOTOR[joint],
+            "rc_ch": rc_ch,
+            "sending_us": int(pwm.get(joint, 0)),
+            "fc_rc_us": _fc_rc.get(rc_ch),
+            "fc_srv_us": _fc_srv.get(rc_ch),
+        })
+    return rows
+
+
+def _telemetry_payload() -> dict:
+    pwm, last_pkt, rx_count, armed, manual, preset, mav_ok, claw = _snapshot()
+    hold = False if (manual or preset or not armed) else _hold_neutral(last_pkt)
+    return {
+        "type": "arm",
+        "arm_enabled": bool(armed),
+        "arm_claw_stop_us": claw,
+        "arm_rx_count": int(rx_count),
+        "arm_hold_neutral": bool(hold),
+        "arm_mavlink_ok": bool(mav_ok),
+        "arm_manual_mode": bool(manual),
+        "arm_preset_motion": bool(preset),
+        "arm_joint_us": joint_pwm_to_csv_list(pwm),
+        "arm_joints": _joint_telemetry_rows(pwm),
+    }
 
 
 def _note_telemetry_subscriber(host: str, port: int) -> None:
@@ -125,33 +192,11 @@ def _note_telemetry_subscriber(host: str, port: int) -> None:
 
 
 def _send_arm_telemetry() -> None:
-    with _lock:
-        rx_count = _rx_count
-        last_pkt = _last_pkt_time
-        pwm = dict(_joint_pwm)
-        armed = _arm_enabled
-        manual = _manual_mode
-        preset = _preset_motion
-        claw = int(_claw_stop_pwm)
-
-    hold_neutral = False if manual or preset else _should_hold_neutral(last_pkt)
-    payload = json.dumps({
-        "type": "arm",
-        "arm_enabled": bool(armed),
-        "arm_claw_stop_us": claw,
-        "arm_rx_count": int(rx_count),
-        "arm_hold_neutral": bool(hold_neutral),
-        "arm_mavlink_ok": bool(_mavlink_up),
-        "arm_manual_mode": bool(manual),
-        "arm_preset_motion": bool(preset),
-        "arm_joint_us": joint_pwm_to_csv_list(pwm),
-    }).encode("utf-8")
-
+    payload = json.dumps(_telemetry_payload()).encode("utf-8")
     with _telem_sub_lock:
         subscribers = list(_telem_subscribers)
     if not subscribers:
         return
-
     for dest in subscribers:
         try:
             _telem_sock.sendto(payload, dest)
@@ -165,41 +210,78 @@ def _send_arm_telemetry() -> None:
                 _telem_send_failures.pop(dest, None)
 
 
-def _flush_rc_override_now() -> None:
-    master = _get_mavlink_master()
-    if master is None:
-        return
-    try:
-        send_rc_channels_override(master, _build_rc_array(), ignore=RC_IGNORE)
-    except OSError as e:
-        _drop_mavlink_master(str(e))
+def _print_diag() -> None:
+    pwm, _, _, armed, manual, preset, mav_ok, _ = _snapshot()
+    print()
+    if _fc_rc:
+        rc_str = "  ".join(
+            f"{JOINT_NAMES[j]}(AUX{JOINT_TO_AUX[j]},ch{joint_to_rc_ch(j)})="
+            f"{_fc_rc.get(joint_to_rc_ch(j), '?')}"
+            for j in range(1, NUM_JOINTS + 1)
+        )
+        print(f"[arm] RC_CHANNELS (FC RC input):     {rc_str}")
+    else:
+        print("[arm] RC_CHANNELS: no data yet")
+
+    if _fc_srv:
+        srv_str = "  ".join(
+            f"{JOINT_NAMES[j]}(AUX{JOINT_TO_AUX[j]},ch{joint_to_rc_ch(j)})="
+            f"{_fc_srv.get(joint_to_rc_ch(j), '?')}"
+            for j in range(1, NUM_JOINTS + 1)
+        )
+        print(f"[arm] SERVO_OUTPUT_RAW (FC PWM out): {srv_str}")
+    else:
+        print("[arm] SERVO_OUTPUT_RAW: no data yet")
+
+    sending = "  ".join(
+        f"{JOINT_NAMES[j]}(AUX{JOINT_TO_AUX[j]})={pwm[j]}"
+        for j in sorted(pwm)
+    )
+    tag = "MANUAL" if manual else ("PRESET" if preset else ("ARMED" if armed else "LOCKED"))
+    print(f"[arm] We are sending ({tag}, mav={'OK' if mav_ok else 'DOWN'}): {sending}")
+    print(flush=True)
 
 
-def _handle_direct_joint_cmd(cmd: dict) -> bool:
-    """Test-script format: {joint, pwm} or {center_all: true}."""
+def _handle_direct(cmd: dict) -> bool:
     if cmd.get("center_all"):
-        _center_all_joints()
+        _center_all()
         print("[arm] ALL CENTER", flush=True)
         return True
-
     if "joint" not in cmd:
         return False
-
     try:
         joint = int(cmd["joint"])
-        pwm = int(cmd.get("pwm", 1500))
+        us = int(cmd.get("pwm", 1500))
     except (TypeError, ValueError):
         return False
-
     if not (1 <= joint <= NUM_JOINTS):
         return False
-
-    _apply_joint_pwm({joint: pwm})
-    print(f"[arm] joint {joint} → {pwm} µs", flush=True)
+    _apply_pwm({joint: us})
+    name = JOINT_NAMES[joint]
+    aux = JOINT_TO_AUX[joint]
+    rc_ch = joint_to_rc_ch(joint)
+    print(f"[arm] {name}/M{JOINT_TO_MOTOR[joint]} (AUX{aux}) → ch{rc_ch}  {us} µs", flush=True)
     return True
 
 
-def _apply_arm_enable_cmd(cmd: dict) -> None:
+def _handle_csv_line(line: str) -> None:
+    if line.startswith("PWM:"):
+        line = line[4:]
+    parts = line.split(",")
+    if len(parts) < 7:
+        return
+    try:
+        vals = [float(x) for x in parts[:7]]
+    except ValueError:
+        return
+    with _lock:
+        if _manual_mode or _preset_motion:
+            return
+        claw = int(_claw_stop)
+    _apply_pwm(csv_list_to_joint_pwm(vals, claw_stop=claw), from_csv=True)
+
+
+def _apply_arm_enable(cmd: dict) -> None:
     global _arm_enabled, _manual_mode, _preset_motion, _last_pkt_time
     enabled = bool(cmd.get("enabled", False))
     with _lock:
@@ -213,16 +295,16 @@ def _apply_arm_enable_cmd(cmd: dict) -> None:
     print(f"[arm] Arm {'ENABLED' if enabled else 'DISABLED'}", flush=True)
 
 
-def _apply_arm_claw_stop_cmd(cmd: dict) -> None:
-    global _claw_stop_pwm
+def _apply_arm_claw_stop(cmd: dict) -> None:
+    global _claw_stop
     stop = clamp_joint_pwm(4, cmd.get("stop_us", CLAW_STOP_US_DEFAULT))
     with _lock:
-        _claw_stop_pwm = stop
+        _claw_stop = stop
     print(f"[arm] Claw stop PWM → {stop} µs", flush=True)
 
 
-def _apply_preset_motion_cmd(cmd: dict) -> None:
-    global _preset_motion, _manual_mode, _preset_motion_since
+def _apply_preset_motion(cmd: dict) -> None:
+    global _preset_motion, _manual_mode, _preset_motion_since, _last_pkt_time
     enabled = bool(cmd.get("enabled", False))
     with _lock:
         if not _arm_enabled and enabled:
@@ -231,118 +313,112 @@ def _apply_preset_motion_cmd(cmd: dict) -> None:
         _preset_motion_since = time.time() if enabled else 0.0
         if enabled:
             _manual_mode = False
+            _last_pkt_time = time.time()
     print(f"[arm] Preset motion {'ON' if enabled else 'OFF'}", flush=True)
 
 
-def _apply_preset_step_cmd(cmd: dict) -> None:
-    global _joint_pwm, _last_pkt_time, _preset_motion_since
+def _apply_preset_step(cmd: dict) -> None:
+    global _preset_motion_since, _last_pkt_time
     pwms = cmd.get("pwm")
     if not isinstance(pwms, list) or len(pwms) < 7:
         return
     with _lock:
         if not _arm_enabled:
             return
-        _joint_pwm = csv_list_to_joint_pwm(pwms, claw_stop=int(_claw_stop_pwm))
-        _last_pkt_time = time.time()
+        claw = int(_claw_stop)
+    _apply_pwm(csv_list_to_joint_pwm(pwms, claw_stop=claw))
+    with _lock:
         _preset_motion_since = time.time()
 
 
-def _apply_manual_pwm_cmd(cmd: dict) -> None:
-    global _manual_mode, _arm_enabled
-
-    turning_off = (
-        "enabled" in cmd
-        and not cmd.get("enabled")
-        and cmd.get("aux") is None
-        and cmd.get("joint") is None
-        and not cmd.get("center")
-    )
-    has_pwm = cmd.get("center") or cmd.get("aux") is not None or cmd.get("joint") is not None
-
-    if has_pwm or (cmd.get("enabled") and not turning_off):
-        with _lock:
-            if not _arm_enabled:
-                _arm_enabled = True
-                print("[arm] Arm auto-enabled for manual command", flush=True)
-
-    with _lock:
-        if not _arm_enabled:
-            print("[arm] Manual ignored — arm DISABLED", flush=True)
-            return
+def _apply_manual_pwm(cmd: dict) -> None:
+    global _manual_mode, _arm_enabled, _last_pkt_time
 
     if cmd.get("center"):
         with _lock:
             _manual_mode = True
-        _center_all_joints()
+        _center_all()
         print("[arm] Manual: all joints centered", flush=True)
         return
 
     if "enabled" in cmd and cmd.get("aux") is None and cmd.get("joint") is None:
         with _lock:
             _manual_mode = bool(cmd.get("enabled"))
-            manual_on = _manual_mode
-        print(f"[arm] Manual mode {'ON' if manual_on else 'OFF'}", flush=True)
+        print(f"[arm] Manual mode {'ON' if cmd.get('enabled') else 'OFF'}", flush=True)
         return
 
     joint = cmd.get("joint")
     if joint is None and cmd.get("aux") is not None:
-        from arm_joints import AUX_TO_JOINT
         try:
             joint = AUX_TO_JOINT.get(int(cmd["aux"]))
         except (TypeError, ValueError):
             joint = None
-
     pwm = cmd.get("pwm")
     if joint is None or pwm is None:
         return
-
     try:
         joint_i = int(joint)
         pwm_i = int(pwm)
     except (TypeError, ValueError):
         return
-
     if not (1 <= joint_i <= NUM_JOINTS):
         return
 
     with _lock:
+        if not _arm_enabled:
+            _arm_enabled = True
+            print("[arm] Arm auto-enabled for manual command", flush=True)
         _manual_mode = True
-    _apply_joint_pwm({joint_i: pwm_i})
-    print(f"[arm] Manual joint {joint_i} → {pwm_i} µs", flush=True)
+    _apply_pwm({joint_i: pwm_i})
+    print(f"[arm] Manual {JOINT_NAMES[joint_i]} → {pwm_i} µs", flush=True)
 
 
-def _handle_arm_control_json(cmd: dict, addr) -> None:
+def _handle_json(cmd: dict, addr: tuple[str, int] | None) -> None:
     if not isinstance(cmd, dict):
         return
 
-    if _handle_direct_joint_cmd(cmd):
-        _flush_rc_override_now()
-        _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+    if _handle_direct(cmd):
+        if addr:
+            _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
         return
 
     name = cmd.get("cmd")
     if name == "preset_motion":
-        _apply_preset_motion_cmd(cmd)
+        _apply_preset_motion(cmd)
     elif name == "preset_step":
-        _apply_preset_step_cmd(cmd)
+        _apply_preset_step(cmd)
     elif name == "manual_pwm":
-        _apply_manual_pwm_cmd(cmd)
-        _flush_rc_override_now()
+        _apply_manual_pwm(cmd)
     elif name == "arm_telemetry" and cmd.get("subscribe"):
-        _note_telemetry_subscriber(str(addr[0]).strip(), int(cmd.get("port", ARM_TELEM_PORT)))
+        host = str(cmd.get("host") or (addr[0] if addr else "")).strip()
+        port = int(cmd.get("port", ARM_TELEM_PORT))
+        if host:
+            _note_telemetry_subscriber(host, port)
         _send_arm_telemetry()
     elif name == "arm_claw_stop":
-        _apply_arm_claw_stop_cmd(cmd)
+        _apply_arm_claw_stop(cmd)
     elif name == "arm_enable":
-        _apply_arm_enable_cmd(cmd)
-        _flush_rc_override_now()
+        _apply_arm_enable(cmd)
     else:
         return
 
-    _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+    if addr:
+        _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
 
 
-def _arm_control_listener() -> None:
+def _maybe_clear_stale_preset(now: float) -> None:
+    global _preset_motion, _preset_motion_since
+    with _lock:
+        if not _preset_motion or _preset_motion_since <= 0:
+            return
+        if (now - _preset_motion_since) < PRESET_MOTION_TIMEOUT_SEC:
+            return
+        _preset_motion = False
+        _preset_motion_since = 0.0
+    print("[arm] Preset motion timeout — resuming arm_sender", flush=True)
+
+
+def _control_listener() -> None:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -356,8 +432,7 @@ def _arm_control_listener() -> None:
     while True:
         try:
             data, addr = s.recvfrom(512)
-            cmd = json.loads(data.decode())
-            _handle_arm_control_json(cmd, addr)
+            _handle_json(json.loads(data.decode()), addr)
         except socket.timeout:
             pass
         except json.JSONDecodeError as e:
@@ -366,278 +441,149 @@ def _arm_control_listener() -> None:
             print(f"[arm] Control error: {e}", flush=True)
 
 
-def _try_connect_mavlink():
-    try:
-        print(f"[arm] Connecting to MAVProxy at {MAVLINK_URL} ...", flush=True)
-        master = connect_mavlink(MAVLINK_URL, timeout=12.0)
-        print("[arm] Waiting for heartbeat from Pix6 ...", flush=True)
-        hb = wait_for_heartbeat(master, timeout=8.0)
-        if hb:
-            print(
-                f"[arm] Heartbeat OK "
-                f"(system={master.target_system} component={master.target_component})",
-                flush=True,
-            )
-        else:
-            print("[arm] *** No heartbeat in 8 s — continuing anyway ***", flush=True)
-        for msg_id, interval_us in ((36, 500_000), (65, 500_000)):
-            try:
-                master.mav.command_long_send(
-                    master.target_system or 1,
-                    master.target_component or 1,
-                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                    0, msg_id, interval_us, 0, 0, 0, 0, 0,
-                )
-            except Exception:
-                pass
-        return master
-    except Exception as e:
-        print(f"[arm] MAVLink unavailable ({e}) — will retry", flush=True)
-        return None
-
-
-def _mavlink_connect_loop() -> None:
-    global _mav_master, _mav_connecting
-    while True:
-        with _mav_lock:
-            if _mav_master is not None:
-                time.sleep(2.0)
-                continue
-        if _mav_connecting:
-            time.sleep(0.5)
-            continue
-        _mav_connecting = True
-        try:
-            master = _try_connect_mavlink()
-            if master is not None:
-                with _mav_lock:
-                    _mav_master = master
-                print("[arm] MAVLink link up", flush=True)
-            else:
-                time.sleep(5.0)
-        finally:
-            _mav_connecting = False
-
-
-def _get_mavlink_master():
-    with _mav_lock:
-        return _mav_master
-
-
-def _drop_mavlink_master(reason: str = "") -> None:
-    global _mav_master, _mavlink_up
-    with _mav_lock:
-        master = _mav_master
-        _mav_master = None
-    _mavlink_up = False
-    if master is not None:
-        try:
-            master.close()
-        except Exception:
-            pass
-    if reason:
-        print(f"[arm] MAVLink dropped ({reason}) — will retry", flush=True)
-
-
-def _drain_mavlink(master) -> tuple[dict, dict]:
-    fc_rc: dict[int, int] = {}
-    fc_srv: dict[int, int] = {}
-    for _ in range(80):
-        msg = master.recv_match(type=["RC_CHANNELS", "SERVO_OUTPUT_RAW"], blocking=False)
-        if msg is None:
-            break
-        if msg.get_type() == "RC_CHANNELS":
-            for rc_ch in range(9, 17):
-                fc_rc[rc_ch] = getattr(msg, f"chan{rc_ch}_raw", 0)
-        else:
-            for rc_ch in range(9, 17):
-                fc_srv[rc_ch] = getattr(msg, f"servo{rc_ch}_raw", 0)
-    return fc_rc, fc_srv
-
-
-def _maybe_warn_servo_mismatch(rc: list[int], fc_rc: dict, fc_srv: dict, hold_neutral: bool) -> None:
-    if hold_neutral:
-        return
-    from arm_joints import joint_center_us, joint_to_rc_ch
-
-    with _lock:
-        claw = int(_claw_stop_pwm)
-
-    targets = []
-    for joint in range(1, NUM_JOINTS + 1):
-        rc_ch = joint_to_rc_ch(joint)
-        val = rc[rc_ch - 1]
-        neutral = joint_center_us(joint, claw_stop=claw if joint == 4 else None)
-        if val == RC_IGNORE or abs(val - neutral) <= NEUTRAL_DEADBAND_US:
-            continue
-        targets.append((rc_ch, int(val)))
-
-    if not targets or not fc_rc:
-        return
-    if not all(abs(fc_rc.get(ch, 0) - us) < 25 for ch, us in targets):
-        print("[arm] *** RC override not reaching FC — check MAVProxy tcp:5763 ***", flush=True)
-        return
-    if fc_srv and not all(abs(fc_srv.get(ch, 0) - us) < 25 for ch, us in targets):
+def _connect_mavlink():
+    print(f"[arm] Connecting to MAVProxy at {MAVLINK_URL} ...", flush=True)
+    master = connect_mavlink(MAVLINK_URL, timeout=12.0)
+    print("[arm] Waiting for heartbeat from Pix6 ...", flush=True)
+    hb = master.wait_heartbeat(timeout=15)
+    if hb:
         print(
-            "[arm] *** FC RC changed but servo output did not — "
-            "SERVO9=59 SERVO11=61 SERVO13=63 SERVO15=65, BRD_SAFETYENABLE=0 ***",
+            f"[arm] Heartbeat OK "
+            f"(system={master.target_system}  component={master.target_component})",
             flush=True,
         )
+    else:
+        print("[arm] *** NO HEARTBEAT in 15 s ***", flush=True)
+        print("[arm]     Check: MAVProxy running?  Pix6 USB plugged in?", flush=True)
 
-
-def _maybe_clear_stale_preset_motion(now: float) -> None:
-    global _preset_motion, _preset_motion_since
-    with _lock:
-        if not _preset_motion or _preset_motion_since <= 0:
-            return
-        if (now - _preset_motion_since) < PRESET_MOTION_TIMEOUT_SEC:
-            return
-        _preset_motion = False
-        _preset_motion_since = 0.0
-    print("[arm] Preset motion timeout — resuming arm_sender", flush=True)
-
-
-def _handle_csv_line(line: str, now: float) -> None:
-    global _joint_pwm, _last_pkt_time, _rx_count
-    if line.startswith("PWM:"):
-        line = line[4:]
-    parts = line.split(",")
-    if len(parts) < 7:
-        return
-    try:
-        vals = [float(x) for x in parts[:7]]
-    except ValueError:
-        return
-
-    with _lock:
-        if _manual_mode or _preset_motion:
-            return
-        _joint_pwm = csv_list_to_joint_pwm(vals, claw_stop=int(_claw_stop_pwm))
-        _last_pkt_time = now
-        _rx_count += 1
+    for msg_id, interval_us in ((36, 500_000), (65, 500_000)):
+        try:
+            master.mav.command_long_send(
+                master.target_system or 1,
+                master.target_component or 1,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0, msg_id, interval_us, 0, 0, 0, 0, 0,
+            )
+        except Exception:
+            pass
+    return master
 
 
 def main() -> None:
-    global _mavlink_up, _rx_count
+    global _mav_master, _mavlink_ok
 
     print("[arm] Arm controller starting...", flush=True)
+    print("[arm] J1/M13  J2/M9  J3/M11  Claw/M15", flush=True)
+
+    try:
+        _mav_master = _connect_mavlink()
+    except Exception as e:
+        print(f"[arm] MAVLink connect failed ({e}) — will retry in loop", flush=True)
+        _mav_master = None
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(("0.0.0.0", UDP_PORT))
-    except OSError as e:
-        print(f"[arm] FATAL: cannot bind UDP {UDP_PORT}: {e}", flush=True)
-        raise
-    sock.settimeout(0.001)
+    sock.bind(("0.0.0.0", UDP_PORT))
+    sock.setblocking(False)
 
-    threading.Thread(target=_arm_control_listener, daemon=True).start()
-    threading.Thread(target=_mavlink_connect_loop, daemon=True, name="arm-mavlink").start()
+    threading.Thread(target=_control_listener, daemon=True).start()
 
     print(f"[arm] Listening on UDP {UDP_PORT} (joint CSV + JSON)", flush=True)
-    print("[arm] J1/M13  J2/M9  J3/M11  Claw/M15", flush=True)
 
     last_send = 0.0
     last_heartbeat = 0.0
-    last_print = 0.0
+    last_diag = 0.0
     last_telem = 0.0
-    last_servo_diag = 0.0
-    last_fc_rc: dict = {}
-    last_fc_srv: dict = {}
+    last_mav_retry = 0.0
+
+    if _mav_master is not None:
+        _send_override(_mav_master)
 
     try:
         while True:
             now = time.time()
-            _maybe_clear_stale_preset_motion(now)
+            _maybe_clear_stale_preset(now)
 
-            master = _get_mavlink_master()
-            _mavlink_up = master is not None
+            master = _mav_master
+            _mavlink_ok = master is not None
             if master is not None:
-                fc_rc, fc_srv = _drain_mavlink(master)
-                if fc_rc:
-                    last_fc_rc = fc_rc
-                if fc_srv:
-                    last_fc_srv = fc_srv
+                _poll_mavlink(master)
 
             try:
-                data, addr = sock.recvfrom(1024)
-                text = data.decode(errors="ignore").strip()
-                if text.startswith("{"):
-                    try:
-                        _handle_arm_control_json(json.loads(text), addr)
-                    except json.JSONDecodeError:
-                        pass
-                elif text:
-                    _handle_csv_line(text, now)
-                    _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
-            except socket.timeout:
+                while True:
+                    data, addr = sock.recvfrom(4096)
+                    text = data.decode(errors="ignore").strip()
+                    if text.startswith("{"):
+                        try:
+                            _handle_json(json.loads(text), addr)
+                        except json.JSONDecodeError:
+                            pass
+                    elif text:
+                        _handle_csv_line(text)
+                        _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
+            except BlockingIOError:
                 pass
 
-            rc = None
-            if master is not None and now - last_send >= 1.0 / OVERRIDE_HZ:
-                last_send = now
-                rc = _build_rc_array()
+            if master is None and now - last_mav_retry >= 5.0:
+                last_mav_retry = now
                 try:
-                    send_rc_channels_override(master, rc, ignore=RC_IGNORE)
-                except OSError as e:
-                    _drop_mavlink_master(str(e))
-                    master = None
+                    _mav_master = _connect_mavlink()
+                    master = _mav_master
+                    _send_override(master)
+                except Exception as e:
+                    print(f"[arm] MAVLink retry failed: {e}", flush=True)
+                    _mav_master = None
 
-            if master is not None and now - last_heartbeat >= 1.0:
-                last_heartbeat = now
-                try:
-                    master.mav.heartbeat_send(
-                        mavutil.mavlink.MAV_TYPE_GCS,
-                        mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                        0, 0, 0,
-                    )
-                except OSError as e:
-                    _drop_mavlink_master(str(e))
-                    master = None
+            if master is not None:
+                if now - last_heartbeat >= 1.0:
+                    last_heartbeat = now
+                    try:
+                        _send_heartbeat(master)
+                    except OSError as e:
+                        print(f"[arm] MAVLink heartbeat failed: {e}", flush=True)
+                        try:
+                            master.close()
+                        except Exception:
+                            pass
+                        _mav_master = None
 
-            if master is not None and rc is not None and now - last_servo_diag >= SERVO_DIAG_SEC:
-                last_servo_diag = now
-                with _lock:
-                    lpt = _last_pkt_time
-                    manual = _manual_mode
-                    preset = _preset_motion
-                hold = False if manual or preset else _should_hold_neutral(lpt)
-                _maybe_warn_servo_mismatch(rc, last_fc_rc, last_fc_srv, hold)
+                if now - last_send >= 1.0 / OVERRIDE_HZ:
+                    last_send = now
+                    try:
+                        _send_override(master)
+                    except OSError as e:
+                        print(f"[arm] MAVLink override failed: {e}", flush=True)
+                        try:
+                            master.close()
+                        except Exception:
+                            pass
+                        _mav_master = None
 
             if now - last_telem >= 1.0 / ARM_TELEM_HZ:
                 last_telem = now
                 _send_arm_telemetry()
 
-            if now - last_print >= 1.0 / PRINT_HZ:
-                last_print = now
-                with _lock:
-                    pwm = dict(_joint_pwm)
-                    rx = _rx_count
-                    lpt = _last_pkt_time
-                    manual = _manual_mode
-                    armed = _arm_enabled
-                hold = _should_hold_neutral(lpt) if not manual else False
-                tag = "MANUAL" if manual else ("HOLD" if hold else "LIVE")
-                print(
-                    f"[arm] {tag} rx={rx} armed={armed} mav={'OK' if _mavlink_up else 'DOWN'} | "
-                    f"J1={pwm[1]} J2={pwm[2]} J3={pwm[3]} Claw={pwm[4]}",
-                    flush=True,
-                )
+            if now - last_diag >= DIAG_INTERVAL:
+                last_diag = now
+                _print_diag()
 
-            time.sleep(0.002)
+            time.sleep(0.005)
 
     except KeyboardInterrupt:
         print("\n[arm] Stopping — centering all joints.", flush=True)
     finally:
-        _center_all_joints()
-        master = _get_mavlink_master()
+        _center_all()
+        master = _mav_master
         if master is not None:
             try:
-                send_rc_channels_override(master, _build_rc_array(), ignore=RC_IGNORE)
+                _send_override(master)
             except Exception:
                 pass
             time.sleep(0.2)
-        _drop_mavlink_master()
+            try:
+                master.close()
+            except Exception:
+                pass
         print("[arm] Done.", flush=True)
 
 

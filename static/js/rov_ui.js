@@ -1597,6 +1597,19 @@ function updateArmPipelineTelemetry(t) {
       armMav.className = 'tc-val';
     }
   }
+  const joints = Array.isArray(t.arm_joints) ? t.arm_joints : null;
+  if (joints && joints.length) {
+    const mismatch = joints.some(j => {
+      const send = j.sending_us;
+      const srv = j.fc_srv_us;
+      return send != null && srv != null && Math.abs(send - srv) > 30;
+    });
+    if (armMav && t.arm_mavlink_ok === true) {
+      armMav.title = mismatch
+        ? 'MAVLink OK — servo output mismatch (check RCPassThru / BRD_SAFETYENABLE)'
+        : 'MAVLink OK — FC servo output matches commands';
+    }
+  }
 }
 
 function updateStatus() {

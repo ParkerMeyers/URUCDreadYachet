@@ -4,15 +4,15 @@
   "arm_control_port": 5009,
   "arm_presets": {
     "sample": {
-      "label": "Sample",
+      "label": "Rest",
       "pwm": [
+        1400,
+        1500,
+        1500,
+        1500,
         1600,
         1500,
-        1500,
-        1500,
-        1650,
-        1500,
-        1525
+        1425
       ]
     },
     "stow": {

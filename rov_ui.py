@@ -310,12 +310,13 @@ def _parse_arm_sent_line(line: str) -> dict | None:
         return None
 
 
-def _send_pi_arm_control(payload: dict) -> tuple[bool, str]:
+def _send_pi_arm_control(payload: dict, ports: list[int] | None = None) -> tuple[bool, str]:
     """Send JSON control command to new_ar.py on the arm UDP port(s)."""
     load_config_file()
     try:
         body = json.dumps(payload).encode("utf-8")
         pi_ip = str(config.get("pi_ip", "")).strip()
+        dest_ports = ports if ports is not None else _arm_control_ports()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             local_ip = local_ip_for_peer(pi_ip)
@@ -325,7 +326,7 @@ def _send_pi_arm_control(payload: dict) -> tuple[bool, str]:
                 except OSError:
                     pass
             sent_ports = []
-            for port in _arm_control_ports():
+            for port in dest_ports:
                 sock.sendto(body, (pi_ip, port))
                 sent_ports.append(str(port))
         finally:
@@ -335,8 +336,35 @@ def _send_pi_arm_control(payload: dict) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _arm_udp_port() -> int:
+    load_config_file()
+    return int(config.get("arm_udp_port", 5006))
+
+
+def _send_pi_arm_joint(joint: int, pwm: int) -> tuple[bool, str]:
+    """Fast path — one UDP packet, test-script format (no arm_enable preamble)."""
+    return _send_pi_arm_control(
+        {"joint": int(joint), "pwm": int(pwm)},
+        ports=[_arm_udp_port()],
+    )
+
+
+def _send_pi_arm_center() -> tuple[bool, str]:
+    return _send_pi_arm_control({"center_all": True}, ports=[_arm_udp_port()])
+
+
 def _send_pi_arm_manual(payload: dict) -> tuple[bool, str]:
-    """Unlock arm motion on the Pi, then send a manual_pwm command."""
+    """Send manual command; use direct joint packets when possible."""
+    joint = payload.get("joint")
+    pwm = payload.get("pwm")
+    if joint is not None and pwm is not None and payload.get("cmd") == "manual_pwm":
+        if payload.get("center"):
+            return _send_pi_arm_center()
+        return _send_pi_arm_joint(int(joint), int(pwm))
+    if payload.get("center_all") or (
+        payload.get("cmd") == "manual_pwm" and payload.get("center")
+    ):
+        return _send_pi_arm_center()
     if _robot_armed():
         _send_pi_arm_control({"cmd": "arm_enable", "enabled": True})
     return _send_pi_arm_control(payload)
@@ -708,6 +736,7 @@ def _reset_onboard_telemetry_state() -> None:
     tel["arm_enabled"] = None
     tel["arm_mavlink_ok"] = None
     tel["arm_joint_us"] = None
+    tel["arm_joints"] = None
     tel["arm_manual_mode"] = None
     tel["arm_preset_motion"] = None
     STATE["last_telemetry_time"] = 0.0
@@ -801,6 +830,8 @@ def _update_arm_telemetry_from_json(pkt: dict):
         tel["arm_mavlink_ok"] = bool(pkt.get("arm_mavlink_ok"))
     if isinstance(pkt.get("arm_joint_us"), list):
         tel["arm_joint_us"] = pkt["arm_joint_us"]
+    if isinstance(pkt.get("arm_joints"), list):
+        tel["arm_joints"] = pkt["arm_joints"]
     if pkt.get("arm_manual_mode") is not None:
         tel["arm_manual_mode"] = bool(pkt.get("arm_manual_mode"))
     if pkt.get("arm_preset_motion") is not None:
@@ -840,11 +871,14 @@ def _subscribe_arm_telemetry() -> str | None:
         if not pi_ip:
             return None
         tel_port = _arm_telemetry_port()
+        local_ip = local_ip_for_peer(pi_ip)
         payload = {
             "cmd": "arm_telemetry",
             "subscribe": True,
             "port": tel_port,
         }
+        if local_ip:
+            payload["host"] = local_ip
         body = json.dumps(payload).encode("utf-8")
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -1208,18 +1242,24 @@ def camera_stream(cam_num):
     # body that leaves the UI stuck on "No Signal" until the client watchdog fires.
     try:
         upstream = _open_camera_upstream(cam_url)
+        preview = next(upstream.iter_content(chunk_size=8192), None)
     except Exception as exc:
         return Response(str(exc), status=502)
+
+    if not preview:
+        try:
+            upstream.close()
+        except Exception:
+            pass
+        return Response("camera stream empty", status=502)
 
     content_type = upstream.headers.get(
         "Content-Type", "multipart/x-mixed-replace; boundary=frame"
     )
 
-    def _gen(resp=upstream):
-        # If the upstream drops, end the response and let the browser reconnect
-        # with a fresh request (client watchdog/retry). Do not loop server-side:
-        # aborted browser feeds used to leak threads and starve camera_stream.py.
+    def _gen(first=preview, resp=upstream):
         try:
+            yield first
             for chunk in resp.iter_content(chunk_size=8192):
                 if chunk:
                     yield chunk
@@ -1936,6 +1976,7 @@ def api_arm_diagnostic():
         "all_ok": all(c["ok"] for c in checks),
         "hint": f"Mission Planner: {ARM_SERVO_HINT}",
         "arm_joint_us": tel.get("arm_joint_us"),
+        "arm_joints": tel.get("arm_joints"),
         "mode": STATE.get("mode"),
     })
 
@@ -1960,19 +2001,13 @@ def api_arm_jog():
     label = ARM_JOINT_NAMES[joint_i - 1]
     hold_sec = float(data.get("hold_sec", 1.0))
 
-    ok1, msg1 = _send_pi_arm_manual({
-        "cmd": "manual_pwm", "enabled": True, "aux": aux, "pwm": pwm,
-    })
+    ok1, msg1 = _send_pi_arm_joint(joint_i, pwm)
     if not ok1:
         return jsonify({"ok": False, "msg": msg1}), 500
 
     def _restore():
         time.sleep(hold_sec)
-        _send_pi_arm_manual({
-            "cmd": "manual_pwm", "enabled": True, "aux": aux, "pwm": center,
-        })
-        time.sleep(0.05)
-        _send_pi_arm_control({"cmd": "manual_pwm", "enabled": False})
+        _send_pi_arm_joint(joint_i, center)
 
     threading.Thread(target=_restore, daemon=True, name=f"arm-jog-{label}").start()
     return jsonify({
@@ -2052,11 +2087,11 @@ def api_manual_pwm():
             "enabled": False,
         }), 403
 
-    # Ensure Pi arm motion is unlocked before manual override commands.
-    _sync_arm_unlock()
-
     data = request.get_json(force=True) or {}
     action = (data.get("action") or "").strip().lower()
+
+    if action != "set":
+        _sync_arm_unlock()
 
     if action == "toggle":
         enabled = bool(data.get("enabled"))
@@ -2124,16 +2159,13 @@ def api_manual_pwm():
 
         kind, idx, pwm_i, label = parsed
         if kind == "aux":
-            payload = {
-                "cmd": "manual_pwm",
-                "enabled": True,
-                "aux": idx,
-                "pwm": pwm_i,
-            }
             joint_i = AUX_TO_JOINT.get(idx)
             if joint_i is not None:
-                payload["joint"] = joint_i
-            ok, msg = _send_pi_arm_manual(payload)
+                ok, msg = _send_pi_arm_joint(joint_i, pwm_i)
+            else:
+                ok, msg = _send_pi_arm_manual({
+                    "cmd": "manual_pwm", "enabled": True, "aux": idx, "pwm": pwm_i,
+                })
             if ok:
                 STATE["manual_pwm_enabled"] = True
                 aux_list = list(STATE.get("manual_aux_pwm", list(_manual_aux_defaults())))

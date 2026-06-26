@@ -4,6 +4,7 @@ from __future__ import annotations
 import platform
 
 from onboard.arm_joints import (
+    AUX_TO_JOINT,
     CLAW_MAX_US as CLAW_PWM_MAX,
     CLAW_MIN_US as CLAW_PWM_MIN,
     CLAW_STOP_US_DEFAULT,
