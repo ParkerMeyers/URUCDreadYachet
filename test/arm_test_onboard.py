@@ -12,10 +12,10 @@ DIAGNOSTIC mode: reads back SERVO_OUTPUT_RAW (servo9-servo16) from
 the FC every 2 s so you can see exactly where the pipeline is stalling.
 
 Setup in Mission Planner first:
-    SERVO9_FUNCTION  = 59   (RCPassThru9  → J2 / AUX1)
-    SERVO11_FUNCTION = 61   (RCPassThru11 → J3 / AUX3)
-    SERVO12_FUNCTION = 62   (RCPassThru12 → J1 / AUX4)
-    SERVO15_FUNCTION = 65   (RCPassThru15 → Claw / AUX7)
+    SERVO9_FUNCTION  = 59   (RCPassThru9  → J2 / AUX1 / M9)
+    SERVO11_FUNCTION = 61   (RCPassThru11 → J3 / AUX3 / M11)
+    SERVO13_FUNCTION = 63   (RCPassThru13 → J1 / AUX5 / M13)
+    SERVO15_FUNCTION = 65   (RCPassThru15 → Claw / AUX7 / M15)
     BRD_SAFETYENABLE = 0
 
 Start MAVProxy first, then run this script:
@@ -55,14 +55,26 @@ JOINT_NAMES = {
     4: "Claw",
 }
 
-JOINT_TO_AUX = {1: 4, 2: 1, 3: 3, 4: 7}
+JOINT_TO_AUX = {1: 5, 2: 1, 3: 3, 4: 7}
+
+JOINT_LIMITS = {
+    1: (500, 2350, 1400),
+    2: (950, 2200, 1600),
+    3: (1300, 1700, 1500),
+    4: (CLAW_MIN_US, CLAW_MAX_US, CLAW_CENTER_US),
+}
 
 IGNORE = 65535
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def joint_center_us(joint: int) -> int:
-    return CLAW_CENTER_US if joint == 4 else CENTER_US
+    return JOINT_LIMITS[joint][2]
+
+
+def joint_pwm_range(joint: int) -> tuple[int, int]:
+    lo, hi, _ = JOINT_LIMITS[joint]
+    return lo, hi
 
 
 def joint_to_rc_ch(joint: int) -> int:
@@ -134,7 +146,8 @@ def main():
         rc[SPARE_RC_CH - 1] = CENTER_US
         for joint, us in pwm.items():
             rc_ch = joint_to_rc_ch(joint)
-            rc[rc_ch - 1] = int(clamp(us, MIN_US, MAX_US))
+            lo, hi = joint_pwm_range(joint)
+            rc[rc_ch - 1] = int(clamp(us, lo, hi))
         send_rc_channels_override(master, rc, ignore=IGNORE)
 
     def send_heartbeat():

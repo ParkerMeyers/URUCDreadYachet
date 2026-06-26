@@ -334,6 +334,9 @@ async function setMode(mode) {
   if (d.ok) {
     _currentMode = mode;
     updateModeUI(mode);
+    if (Array.isArray(d.warnings)) {
+      d.warnings.forEach(msg => toast(msg, 'warn'));
+    }
 
     // Auto-configure ctrl flags based on mode
     if (mode === 'disarmed') {
@@ -442,6 +445,13 @@ async function sendArmPreset(name) {
 // ─────────────────────────────────────────────────────────────
 const ARM_JOINT_NAMES = ['J1', 'J2', 'J3', 'Claw'];
 const ARM_CSV_INDICES = [0, 4, 5, 6];
+const ARM_JOINT_LIMITS = [
+  { min: 500, max: 2350, neutral: 1400, motor: 'M13' },
+  { min: 950, max: 2200, neutral: 1600, motor: 'M9' },
+  { min: 1300, max: 1700, neutral: 1500, motor: 'M11' },
+  { min: 1325, max: 1525, neutral: 1425, motor: 'M15' },
+];
+const ARM_DEFAULT_PWM = [1400, 1500, 1500, 1500, 1600, 1500, 1425];
 let _armPresets = {};
 let _armLastPwm = null;
 let _armPresetEditing = null;
@@ -478,19 +488,24 @@ function renderArmPresetButtons() {
 function buildArmPwmGrid() {
   const grid = document.getElementById('arm-preset-pwm-grid');
   if (!grid || grid.childElementCount) return;
-  grid.innerHTML = ARM_JOINT_NAMES.map((jn, i) => `
+  grid.innerHTML = ARM_JOINT_NAMES.map((jn, i) => {
+    const lim = ARM_JOINT_LIMITS[i];
+    return `
     <div class="field">
-      <label>${jn} µs</label>
-      <input id="arm-pwm-${ARM_CSV_INDICES[i]}" type="number" min="500" max="2500" step="1" value="1500"/>
+      <label>${jn} µs (${lim.motor})</label>
+      <input id="arm-pwm-${ARM_CSV_INDICES[i]}" type="number" min="${lim.min}" max="${lim.max}" step="1" value="${lim.neutral}"/>
     </div>
-  `).join('');
+  `;
+  }).join('');
 }
 
 function getArmFormValues() {
-  const pwm = [1500, 1500, 1500, 1500, 1500, 1500, 1425];
-  for (const csvIdx of ARM_CSV_INDICES) {
+  const pwm = ARM_DEFAULT_PWM.slice();
+  for (let i = 0; i < ARM_CSV_INDICES.length; i++) {
+    const csvIdx = ARM_CSV_INDICES[i];
     const el = document.getElementById('arm-pwm-' + csvIdx);
-    pwm[csvIdx] = el ? parseInt(el.value, 10) || 1500 : 1500;
+    const neutral = ARM_JOINT_LIMITS[i].neutral;
+    pwm[csvIdx] = el ? parseInt(el.value, 10) || neutral : neutral;
   }
   const nameEl = document.getElementById('arm-preset-name');
   const labelEl = document.getElementById('arm-preset-label');
@@ -512,15 +527,17 @@ function setArmFormValues(preset, name) {
     nameEl.disabled = !!name;
   }
   if (labelEl) labelEl.value = (preset && preset.label) || '';
-  for (const csvIdx of ARM_CSV_INDICES) {
+  for (let i = 0; i < ARM_CSV_INDICES.length; i++) {
+    const csvIdx = ARM_CSV_INDICES[i];
     const el = document.getElementById('arm-pwm-' + csvIdx);
-    if (el) el.value = (preset && preset.pwm && preset.pwm[csvIdx] != null) ? preset.pwm[csvIdx] : 1500;
+    const neutral = ARM_JOINT_LIMITS[i].neutral;
+    if (el) el.value = (preset && preset.pwm && preset.pwm[csvIdx] != null) ? preset.pwm[csvIdx] : neutral;
   }
 }
 
 function resetArmPresetForm() {
   _armPresetEditing = null;
-  setArmFormValues({ pwm: [1500, 1500, 1500, 1500, 1500, 1500, 1425], label: '' }, '');
+  setArmFormValues({ pwm: ARM_DEFAULT_PWM.slice(), label: '' }, '');
   const nameEl = document.getElementById('arm-preset-name');
   if (nameEl) nameEl.disabled = false;
   const title = document.getElementById('arm-preset-form-title');
@@ -595,7 +612,7 @@ function renderArmPresetList() {
   }
   list.innerHTML = names.map(name => {
     const p = _armPresets[name];
-    const meta = ARM_JOINT_NAMES.map((jn, i) => `${jn}=${(p.pwm || [])[ARM_CSV_INDICES[i]] ?? 1500}`).join(' ');
+    const meta = ARM_JOINT_NAMES.map((jn, i) => `${jn}=${(p.pwm || [])[ARM_CSV_INDICES[i]] ?? ARM_JOINT_LIMITS[i].neutral}`).join(' ');
     const label = escapeHtml(p.label || name);
     return `<div class="arm-preset-row">
       <div class="arm-preset-row-name">${label}
@@ -632,19 +649,22 @@ function hideArmPresetsOutside(e) {
 }
 
 // ── Manual AUX PWM (direct Pix6 AUX override on Pi) ───────────
-// Active arm DOF: J1, J2, J3, Claw (maps to AUX4, AUX1, AUX3, AUX7)
+// Active arm DOF: J1, J2, J3, Claw (maps to AUX5/M13, AUX1/M9, AUX3/M11, AUX7/M15)
 const ARM_MANUAL_JOINTS = [
-  { joint: 1, name: 'J1', aux: 4, pwmIdx: 3 },
+  { joint: 1, name: 'J1', aux: 5, pwmIdx: 4 },
   { joint: 2, name: 'J2', aux: 1, pwmIdx: 0 },
   { joint: 3, name: 'J3', aux: 3, pwmIdx: 2 },
   { joint: 4, name: 'Claw', aux: 7, pwmIdx: 6 },
 ];
-const MANUAL_AUX_LABELS = ['J2', '—', 'J3', 'J1', '—', '—', 'Claw'];
+const MANUAL_AUX_LABELS = ['J2', '—', 'J3', '—', 'J1', '—', 'Claw'];
+const MANUAL_AUX_NEUTRALS = [1600, 1500, 1500, 1500, 1400, 1500, 1425];
 const MANUAL_THR_LABELS = ['FR_H', 'BR_V', 'BR_H', 'BL_V', 'FR_V', 'FL_H', 'FL_V', 'BL_H'];
 let _configClawStopUs = 1425;
 
 function manualAuxDefaults() {
-  return [1500, 1500, 1500, 1500, 1500, 1500, _configClawStopUs];
+  const d = MANUAL_AUX_NEUTRALS.slice();
+  d[6] = _configClawStopUs;
+  return d;
 }
 
 function manualThrDefaults() {
@@ -661,7 +681,7 @@ function applyManualPwmPayload(d) {
     _manualAuxPwm = d.aux_pwm.slice(0, 7).map((v, i) => {
       const n = parseInt(v, 10);
       if (!Number.isNaN(n)) return n;
-      return i === 6 ? _configClawStopUs : 1500;
+      return i === 6 ? _configClawStopUs : MANUAL_AUX_NEUTRALS[i];
     });
   }
   if (Array.isArray(d.thr_pwm) && d.thr_pwm.length >= 8) {
@@ -1658,7 +1678,7 @@ function updateStatus() {
     _manualPwmEnabled = !!s.manual_pwm_enabled;
   }
   if (Array.isArray(s.manual_aux_pwm) && s.manual_aux_pwm.length >= 7) {
-    _manualAuxPwm = s.manual_aux_pwm.slice(0, 7).map(v => parseInt(v, 10) || 1500);
+    _manualAuxPwm = s.manual_aux_pwm.slice(0, 7).map((v, i) => parseInt(v, 10) || MANUAL_AUX_NEUTRALS[i]);
   }
   if (Array.isArray(s.manual_thr_pwm) && s.manual_thr_pwm.length >= 8) {
     _manualThrPwm = s.manual_thr_pwm.slice(0, 8).map(v => parseInt(v, 10) || 1500);
@@ -1687,6 +1707,7 @@ function updatePreDiveChecklist(s) {
   const gp = _getActiveGamepad();
   const items = [
     { id: 'chk-ssh', ok: s.ssh_connected },
+    { id: 'chk-pixhawk', ok: s.ssh_connected && s.pixhawk_serial_ok },
     { id: 'chk-mavproxy', ok: s.onboard_mavproxy },
     { id: 'chk-stab', ok: s.onboard_stab },
     { id: 'chk-arm-onboard', ok: s.onboard_arm },

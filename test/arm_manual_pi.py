@@ -15,8 +15,8 @@ Usage:
     python3 test/arm_manual_pi.py --claw 1425
 
 Interactive commands (joint numbers 1–4):
-    1 1600   J1 (AUX4)     2 1600   J2 (AUX1)
-    3 1600   J3 (AUX3)     4 1525   Claw (AUX7, 1325–1525)
+    1 1600   J1 (AUX5 / M13)     2 1600   J2 (AUX1 / M9)
+    3 1500   J3 (AUX3 / M11)     4 1525   Claw (AUX7 / M15, 1325–1525)
     on       arm unlock + manual ON
     off      manual OFF + arm lock
     center   all joints neutral, claw stop
@@ -30,13 +30,15 @@ import socket
 import sys
 
 ARM_PORT = 5009
-CLAW_STOP = 1425
-CLAW_MIN = 1325
-CLAW_MAX = 1525
-JOINT_CENTER = 1500
 
 JOINT_NAMES = {1: "J1", 2: "J2", 3: "J3", 4: "Claw"}
-JOINT_TO_AUX = {1: 4, 2: 1, 3: 3, 4: 7}
+JOINT_TO_AUX = {1: 5, 2: 1, 3: 3, 4: 7}
+JOINT_LIMITS = {
+    1: (500, 2350, 1400),
+    2: (950, 2200, 1600),
+    3: (1300, 1700, 1500),
+    4: (1325, 1525, 1425),
+}
 
 
 def send(port: int, pkt: dict) -> None:
@@ -58,8 +60,8 @@ def manual_enable(on: bool) -> None:
 
 def move_joint(joint: int, pwm: int) -> None:
     aux = JOINT_TO_AUX[joint]
-    if joint == 4:
-        pwm = max(CLAW_MIN, min(CLAW_MAX, pwm))
+    lo, hi, _ = JOINT_LIMITS[joint]
+    pwm = max(lo, min(hi, pwm))
     send(ARM_PORT, {"cmd": "manual_pwm", "enabled": True, "aux": aux, "pwm": pwm})
 
 
@@ -81,7 +83,9 @@ def shutdown() -> None:
 
 def run_interactive() -> None:
     print("Manual arm — joints 1=J1 2=J2 3=J3 4=Claw | on | off | center | q")
-    print(f"Claw range {CLAW_MIN}–{CLAW_MAX} µs (stop {CLAW_STOP})")
+    for j, name in JOINT_NAMES.items():
+        lo, hi, neutral = JOINT_LIMITS[j]
+        print(f"  {j} {name}: {lo}–{hi} µs, neutral {neutral}")
     print("Log: tail -f /tmp/rov_arm.log\n")
     try:
         while True:

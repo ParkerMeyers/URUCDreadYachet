@@ -14,30 +14,47 @@ IS_WINDOWS = platform.system() == "Windows"
 
 # ── Arm (Pix6 AUX) — 4 DOF: J1, J2, J3, Claw ───────────────────────────────
 # arm_sender CSV indices for active joints: 0=J1, 4=J2, 5=J3, 6=Claw
+# Hardware outputs: M13=J1, M9=J2, M11=J3 (continuous), M15=Claw (continuous)
 ARM_JOINT_NAMES = ["J1", "J2", "J3", "Claw"]
 ARM_CSV_INDICES = [0, 4, 5, 6]
 ARM_CSV_TO_NAME = {0: "J1", 4: "J2", 5: "J3", 6: "Claw"}
-ARM_PWM_MIN = 500
-ARM_PWM_MAX = 2500
+
 CLAW_PWM_MIN = 1325
 CLAW_PWM_MAX = 1525
 CLAW_STOP_US_DEFAULT = 1425
-ARM_DEFAULT_PWM = [1500, 1500, 1500, 1500, 1500, 1500, CLAW_STOP_US_DEFAULT]
+
+# Per-joint limits (CSV index → spec)
+JOINT_PWM_SPECS = {
+    0: {"min": 500, "max": 2350, "neutral": 1400, "continuous": False, "motor": 13, "rc_ch": 13},
+    4: {"min": 950, "max": 2200, "neutral": 1600, "continuous": False, "motor": 9, "rc_ch": 9},
+    5: {"min": 1300, "max": 1700, "neutral": 1500, "continuous": True, "motor": 11, "rc_ch": 11},
+    6: {"min": CLAW_PWM_MIN, "max": CLAW_PWM_MAX, "neutral": CLAW_STOP_US_DEFAULT, "continuous": True, "motor": 15, "rc_ch": 15},
+}
+
+# Legacy blanket limits (widest span for generic helpers)
+ARM_PWM_MIN = 500
+ARM_PWM_MAX = 2500
+
+ARM_DEFAULT_PWM = [1400, 1500, 1500, 1500, 1600, 1500, CLAW_STOP_US_DEFAULT]
+JOINT_NEUTRAL_PWM = {1: 1400, 2: 1600, 3: 1500, 4: CLAW_STOP_US_DEFAULT}
 
 ARM_PRESET_JOINT_ORDER = (5, 4, 0, 6)  # J3→J2→J1→Claw (CSV indices)
 ARM_PRESET_DELAY_MIN_SEC = 0.45
 ARM_PRESET_DELAY_MAX_SEC = 4.0
 
-MANUAL_AUX_LABELS = ["J2", "—", "J3", "J1", "—", "—", "Claw"]
-MANUAL_AUX_DEFAULTS = [1500, 1500, 1500, 1500, 1500, 1500, CLAW_STOP_US_DEFAULT]
-JOINT_TO_AUX = {1: 4, 2: 1, 3: 3, 4: 7}
+MANUAL_AUX_LABELS = ["J2", "—", "J3", "—", "J1", "—", "Claw"]
+MANUAL_AUX_DEFAULTS = [1600, 1500, 1500, 1500, 1400, 1500, CLAW_STOP_US_DEFAULT]
+JOINT_TO_AUX = {1: 5, 2: 1, 3: 3, 4: 7}
 AUX_TO_JOINT = {v: k for k, v in JOINT_TO_AUX.items()}
+AUX_TO_CSV = {5: 0, 1: 4, 3: 5, 7: 6}
 ARM_MANUAL_JOINTS = [
-    {"joint": 1, "name": "J1", "aux": 4},
+    {"joint": 1, "name": "J1", "aux": 5},
     {"joint": 2, "name": "J2", "aux": 1},
     {"joint": 3, "name": "J3", "aux": 3},
     {"joint": 4, "name": "Claw", "aux": 7},
 ]
+
+ARM_SERVO_HINT = "SERVO9=59 SERVO11=61 SERVO13=63 SERVO15=65 (RCPassThru), BRD_SAFETYENABLE=0"
 
 # ── Thrusters (Pix6 RC1–8) ───────────────────────────────────────────────────
 MANUAL_THR_LABELS = ["FR_H", "BR_V", "BR_H", "BL_V", "FR_V", "FL_H", "FL_V", "BL_H"]
@@ -60,9 +77,9 @@ THR_PWM_MAX = 1900
 NEUTRAL_THR_PWM = 1500
 
 DEFAULT_ARM_PRESETS = {
-    "stow": {"label": "Stow", "pwm": [1500, 1500, 1500, 1500, 1500, 1500, CLAW_STOP_US_DEFAULT]},
-    "sample": {"label": "Sample", "pwm": [1600, 1500, 1500, 1500, 1450, 1500, CLAW_PWM_MAX]},
-    "deploy_claw": {"label": "Claw", "pwm": [1500, 1500, 1500, 1500, 1500, 1500, CLAW_PWM_MAX]},
+    "stow": {"label": "Stow", "pwm": list(ARM_DEFAULT_PWM)},
+    "sample": {"label": "Sample", "pwm": [1600, 1500, 1500, 1500, 1650, 1500, CLAW_PWM_MAX]},
+    "deploy_claw": {"label": "Claw", "pwm": [1400, 1500, 1500, 1500, 1600, 1500, CLAW_PWM_MAX]},
 }
 
 MAVPROXY_TCP_PORT = MAVPROXY_TCP_STAB

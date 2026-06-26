@@ -7,11 +7,11 @@ them to the Pixhawk 6 AUX outputs via MAVLink RC_CHANNELS_OVERRIDE
 through MAVProxy.
 
 Physical arm (4 DOF): J1, J2, J3, Claw
-    AUX4 (RC ch 12) → J1
-    AUX1 (RC ch  9) → J2
-    AUX3 (RC ch 11) → J3
-    AUX7 (RC ch 15) → Claw (continuous rotation; stop PWM configurable)
-    AUX2, AUX5, AUX6 — removed joints, held at neutral
+    AUX5 (RC ch 13, M13) → J1
+    AUX1 (RC ch  9, M9)  → J2
+    AUX3 (RC ch 11, M11) → J3 (continuous rotation; stop 1500 µs)
+    AUX7 (RC ch 15, M15) → Claw (continuous rotation; stop PWM configurable)
+    AUX2, AUX4, AUX6 — removed joints, held at neutral
     AUX8 (RC ch 16) → spare (always 1500)
 
 arm_sender still transmits 7 joint PWM values (+ optional angle field).
@@ -52,27 +52,39 @@ PRINT_HZ    = 2
 ARM_TELEM_HZ = 5
 ARM_TELEM_PORT = 5008
 TIMEOUT_SEC = 0.75
+STICK_CENTER_US = 1500
+ROTATION_IN_DEADBAND = 10
 
 # arm_sender CSV index → RC channel (AUX1=ch9 …)
 CSV_TO_RC_CH = {
-    0: 12,   # J1  → AUX4
-    4:  9,   # J2  → AUX1 (was J5)
-    5: 11,   # J3  → AUX3 (was J6)
-    6: 15,   # Claw → AUX7
+    0: 13,   # J1  → AUX5 / M13
+    4:  9,   # J2  → AUX1 / M9
+    5: 11,   # J3  → AUX3 / M11 (continuous)
+    6: 15,   # Claw → AUX7 / M15
 }
+J1_CSV_IDX = 0
+J2_CSV_IDX = 4
+J3_CSV_IDX = 5
 CLAW_CSV_IDX = 6
-CLAW_RC_CH   = 15
-SPARE_RC_CH  = 16
-REMOVED_RC_CHS = (10, 13, 14)  # AUX2, AUX5, AUX6 — no hardware
+J1_RC_CH = 13
+J2_RC_CH = 9
+J3_RC_CH = 11
+CLAW_RC_CH = 15
+SPARE_RC_CH = 16
+REMOVED_RC_CHS = (10, 12, 14)  # AUX2, AUX4, AUX6 — no hardware
+
+J1_MIN_US, J1_MAX_US, J1_NEUTRAL_US = 500, 2350, 1400
+J2_MIN_US, J2_MAX_US, J2_NEUTRAL_US = 950, 2200, 1600
+J3_MIN_US, J3_MAX_US, J3_STOP_US = 1300, 1700, 1500
 
 CLAW_MIN_US = 1325
 CLAW_MAX_US = 1525
 CLAW_STOP_US_DEFAULT = 1425
-CLAW_IN_DEADBAND = 10
 _claw_stop_pwm = CLAW_STOP_US_DEFAULT
 
-AUX_LABELS = ("J2", "—", "J3", "J1", "—", "—", "Claw")
-JOINT_TO_AUX = {1: 4, 2: 1, 3: 3, 4: 7}  # physical J1–J3, Claw → AUX port
+AUX_LABELS = ("J2", "—", "J3", "—", "J1", "—", "Claw")
+JOINT_TO_AUX = {1: 5, 2: 1, 3: 3, 4: 7}  # physical J1–J3, Claw → AUX port
+AUX_TO_CSV = {1: J2_CSV_IDX, 3: J3_CSV_IDX, 5: J1_CSV_IDX, 7: CLAW_CSV_IDX}
 
 
 def _clamp(x, lo, hi):
@@ -81,6 +93,27 @@ def _clamp(x, lo, hi):
 
 def _clamp_us(x):
     return int(_clamp(float(x), MIN_US, MAX_US))
+
+
+def _clamp_joint_csv(csv_idx: int, x) -> int:
+    if csv_idx == J1_CSV_IDX:
+        lo, hi = J1_MIN_US, J1_MAX_US
+    elif csv_idx == J2_CSV_IDX:
+        lo, hi = J2_MIN_US, J2_MAX_US
+    elif csv_idx == J3_CSV_IDX:
+        lo, hi = J3_MIN_US, J3_MAX_US
+    elif csv_idx == CLAW_CSV_IDX:
+        lo, hi = CLAW_MIN_US, CLAW_MAX_US
+    else:
+        lo, hi = MIN_US, MAX_US
+    return int(_clamp(float(x), lo, hi))
+
+
+def _clamp_aux_pwm(aux_i: int, pwm) -> int:
+    csv_idx = AUX_TO_CSV.get(aux_i)
+    if csv_idx is not None:
+        return _clamp_joint_csv(csv_idx, pwm)
+    return _clamp_us(pwm)
 
 
 def _clamp_claw_us(x):
@@ -95,25 +128,45 @@ def _claw_stop_us() -> int:
 def _claw_output_pwm(claw_input_us):
     """Claw continuous rotation — centered stick/input → configured stop PWM."""
     us = _clamp_claw_us(claw_input_us)
-    if abs(us - CENTER_US) <= CLAW_IN_DEADBAND:
+    if abs(us - STICK_CENTER_US) <= ROTATION_IN_DEADBAND:
         return _claw_stop_us()
+    return us
+
+
+def _j3_output_pwm(j3_input_us):
+    """J3 continuous rotation — centered stick/input → stop PWM (1500 µs)."""
+    us = _clamp_joint_csv(J3_CSV_IDX, j3_input_us)
+    if abs(us - STICK_CENTER_US) <= ROTATION_IN_DEADBAND:
+        return J3_STOP_US
     return us
 
 
 def _default_joint_us():
     vals = [CENTER_US] * 7
+    vals[J1_CSV_IDX] = J1_NEUTRAL_US
+    vals[J2_CSV_IDX] = J2_NEUTRAL_US
+    vals[J3_CSV_IDX] = J3_STOP_US
     vals[CLAW_CSV_IDX] = _claw_stop_us()
     return vals
 
 
 def _default_manual_aux_pwm():
     """Neutral PWM for AUX1–7 in manual mode."""
-    return [CENTER_US, CENTER_US, CENTER_US, CENTER_US, CENTER_US, CENTER_US, _claw_stop_us()]
+    return [
+        J2_NEUTRAL_US, CENTER_US, J3_STOP_US, CENTER_US,
+        J1_NEUTRAL_US, CENTER_US, _claw_stop_us(),
+    ]
 
 
 def _neutral_pwm_for_rc_ch(rc_ch: int) -> int:
     if rc_ch == CLAW_RC_CH:
         return _claw_stop_us()
+    if rc_ch == J3_RC_CH:
+        return J3_STOP_US
+    if rc_ch == J1_RC_CH:
+        return J1_NEUTRAL_US
+    if rc_ch == J2_RC_CH:
+        return J2_NEUTRAL_US
     return CENTER_US
 
 
@@ -134,7 +187,9 @@ def _should_hold_neutral(last_pkt_time: float) -> bool:
 def _pwm_for_csv_index(joint_us: list, csv_idx: int) -> int:
     if csv_idx == CLAW_CSV_IDX:
         return _claw_output_pwm(joint_us[csv_idx])
-    return _clamp_us(joint_us[csv_idx])
+    if csv_idx == J3_CSV_IDX:
+        return _j3_output_pwm(joint_us[csv_idx])
+    return _clamp_joint_csv(csv_idx, joint_us[csv_idx])
 
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -265,7 +320,7 @@ def _apply_preset_step_cmd(cmd: dict) -> None:
     with _lock:
         if not _arm_enabled:
             return
-        _joint_us = [_clamp_us(pwms[i]) for i in range(7)]
+        _joint_us = [_clamp_joint_csv(i, pwms[i]) for i in range(7)]
         _last_pkt_time = time.time()
         _preset_motion_since = time.time()
 
@@ -324,7 +379,7 @@ def _apply_manual_pwm_cmd(cmd: dict) -> None:
         return
     try:
         aux_i = int(aux)
-        pwm_i = _clamp_claw_us(pwm) if aux_i == 7 else _clamp_us(pwm)
+        pwm_i = _clamp_aux_pwm(aux_i, pwm)
     except (TypeError, ValueError):
         return
     if not (1 <= aux_i <= 7):
@@ -397,7 +452,7 @@ def _build_rc_manual(aux_vals=None):
             aux_vals = list(_manual_aux_pwm)
     for aux_i in range(1, 8):
         val = aux_vals[aux_i - 1]
-        rc[8 + aux_i - 1] = _clamp_claw_us(val) if aux_i == 7 else _clamp_us(val)
+        rc[8 + aux_i - 1] = _clamp_aux_pwm(aux_i, val)
     rc[SPARE_RC_CH - 1] = CENTER_US
     return rc
 
@@ -558,7 +613,7 @@ def _maybe_warn_servo_mismatch(rc: list, fc_rc: dict, fc_srv: dict, hold_neutral
     targets = []
     for rc_ch in CSV_TO_RC_CH.values():
         val = rc[rc_ch - 1]
-        if val == IGNORE or abs(val - _neutral_pwm_for_rc_ch(rc_ch)) <= CLAW_IN_DEADBAND:
+        if val == IGNORE or abs(val - _neutral_pwm_for_rc_ch(rc_ch)) <= ROTATION_IN_DEADBAND:
             continue
         targets.append((rc_ch, int(val)))
     if not targets or not fc_rc:
@@ -573,7 +628,7 @@ def _maybe_warn_servo_mismatch(rc: list, fc_rc: dict, fc_srv: dict, hold_neutral
     if not srv_ok:
         print(
             "[arm] *** FC RC changed but AUX servo output did not — "
-            "set SERVO9=59 SERVO11=61 SERVO12=62 SERVO15=65 (RCPassThru), BRD_SAFETYENABLE=0 ***",
+            "set SERVO9=59 SERVO11=61 SERVO13=63 SERVO15=65 (RCPassThru), BRD_SAFETYENABLE=0 ***",
             flush=True,
         )
 
@@ -596,7 +651,7 @@ def main():
     threading.Thread(target=_mavlink_connect_loop, daemon=True, name="arm-mavlink").start()
 
     print(f"[arm] Listening on UDP {UDP_PORT} (CSV arm + JSON control)", flush=True)
-    print("[arm] AUX4=J1  AUX1=J2  AUX3=J3  AUX7=Claw  (AUX2/5/6 removed)", flush=True)
+    print("[arm] AUX5=J1(M13)  AUX1=J2(M9)  AUX3=J3(M11)  AUX7=Claw(M15)  (AUX2/4/6 removed)", flush=True)
     print("[arm] MAVLink=connecting", flush=True)
 
     last_send = 0.0
@@ -646,7 +701,7 @@ def main():
                             pass
                         else:
                             vals = [float(x) for x in parts]
-                            _joint_us = [_clamp_us(vals[i]) for i in range(7)]
+                            _joint_us = [_clamp_joint_csv(i, vals[i]) for i in range(7)]
                             _last_pkt_time = now
                             _rx_count += 1
                     _note_telemetry_subscriber(addr[0], ARM_TELEM_PORT)
@@ -698,9 +753,9 @@ def main():
                     print(f"[arm] MANUAL | {aux_str}", flush=True)
                 else:
                     hold_neutral = _should_hold_neutral(lpt)
-                    j1 = _pwm_for_csv_index(jus, 0) if not hold_neutral else _neutral_pwm_for_rc_ch(12)
-                    j2 = _pwm_for_csv_index(jus, 4) if not hold_neutral else _neutral_pwm_for_rc_ch(9)
-                    j3 = _pwm_for_csv_index(jus, 5) if not hold_neutral else _neutral_pwm_for_rc_ch(11)
+                    j1 = _pwm_for_csv_index(jus, 0) if not hold_neutral else _neutral_pwm_for_rc_ch(J1_RC_CH)
+                    j2 = _pwm_for_csv_index(jus, 4) if not hold_neutral else _neutral_pwm_for_rc_ch(J2_RC_CH)
+                    j3 = _pwm_for_csv_index(jus, 5) if not hold_neutral else _neutral_pwm_for_rc_ch(J3_RC_CH)
                     claw = _pwm_for_csv_index(jus, 6) if not hold_neutral else _claw_stop_us()
                     print(
                         f"[arm] rx={rx} armed={armed} mav={'OK' if _mavlink_up else 'DOWN'} "

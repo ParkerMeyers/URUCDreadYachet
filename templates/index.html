@@ -142,6 +142,7 @@
     <h3>Pre-Dive Checklist</h3>
     <ul class="checklist" id="checklist-items">
       <li id="chk-ssh"><span class="chk-icon">○</span> SSH connected to Pi</li>
+      <li id="chk-pixhawk"><span class="chk-icon">○</span> Pixhawk USB on Pi (/dev/ttyACM0)</li>
       <li id="chk-mavproxy"><span class="chk-icon">○</span> MAVProxy / Pixhawk link</li>
       <li id="chk-stab"><span class="chk-icon">○</span> stabilization.py running</li>
       <li id="chk-arm-onboard"><span class="chk-icon">○</span> new_ar.py running</li>
@@ -568,7 +569,9 @@
     <div class="modal-body">
       <p class="manual-pwm-desc">
         Direct PWM to Pix6 arm outputs (J1, J2, J3, Claw) and thrusters M1–8.
-        Joints: 500–2500 µs. Claw: 1325–1525 µs (stop 1425). Thrusters: 1100–1900 µs.
+        J1 (M13): 500–2350 µs, neutral 1400. J2 (M9): 950–2200 µs, neutral 1600.
+        J3 (M11, continuous): 1300–1700 µs, stop 1500. Claw (M15): 1325–1525 µs, stop 1425.
+        Thrusters: 1100–1900 µs.
         When enabled, overrides gamepad mixer and <code>arm_sender.py</code>.
       </p>
       <div class="manual-pwm-toggle-row">
@@ -578,7 +581,7 @@
       </div>
       <div class="manual-pwm-cmd-row">
         <label for="manual-pwm-input">Command</label>
-        <input id="manual-pwm-input" type="text" placeholder="claw 1425  |  J1 1500  |  M3 1600  |  flh 1600"
+        <input id="manual-pwm-input" type="text" placeholder="claw 1425  |  J1 1400  |  M3 1600  |  flh 1600"
                onkeydown="if(event.key==='Enter')sendManualPwmLine()"/>
         <button class="btn btn-primary" onclick="sendManualPwmLine()">Send</button>
         <button class="btn btn-secondary" onclick="centerManualPwm()">Center all</button>
@@ -586,8 +589,8 @@
       </div>
       <div class="manual-pwm-grid" id="manual-pwm-grid"></div>
       <p class="manual-pwm-hint">
-        Arm: <strong>J1 1500</strong>, <strong>J2 1500</strong>, <strong>J3 1500</strong>,
-        <strong>claw 1425</strong> (stop; 1325–1525). Joint numbers 1–4 also work
+        Arm: <strong>J1 1400</strong> (M13), <strong>J2 1600</strong> (M9), <strong>J3 1500</strong> (M11 stop),
+        <strong>claw 1425</strong> (M15 stop; 1325–1525). Joint numbers 1–4 also work
         (<strong>1 1600</strong> = J1). Thrusters: <strong>M3 1600</strong> or <strong>flh 1600</strong>.
         Tune claw until no drift, then <strong>Save claw stop</strong>.
       </p>

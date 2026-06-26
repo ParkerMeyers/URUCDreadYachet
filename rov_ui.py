@@ -116,7 +116,7 @@ from topside.state import (
     manual_aux_defaults,
     manual_thr_defaults,
 )
-from topside.util import clamp_arm_pwm, clamp_arm_pwm_list, clamp_claw_pwm, clamp_thr_pwm
+from topside.util import clamp_arm_pwm, clamp_arm_pwm_list, clamp_claw_pwm, clamp_joint_pwm_aux, clamp_thr_pwm
 from topside.ssh_manager import ssh
 
 _manual_aux_defaults = manual_aux_defaults
@@ -416,7 +416,9 @@ def _parse_manual_pwm_line(line: str) -> tuple[str, int, int, str] | None:
     # Arm AUX / joint
     def _parse_aux_pwm(aux: int, pwm_raw: str) -> int | None:
         try:
-            return _clamp_claw_pwm(pwm_raw) if aux == 7 else _clamp_arm_pwm(pwm_raw)
+            if aux == 7:
+                return _clamp_claw_pwm(pwm_raw)
+            return clamp_joint_pwm_aux(aux, pwm_raw)
         except (TypeError, ValueError):
             return None
 
@@ -1008,12 +1010,19 @@ def _monitor_loop():
                 STATE["onboard_stab"]     = status["stab"]
                 STATE["onboard_arm"]      = status["arm"]
                 STATE["onboard_cam"]      = status["cam"]
+                STATE["pixhawk_serial_ok"] = ssh.any_serial_port_exists()
+                if STATE["onboard_mavproxy"]:
+                    STATE["mavproxy_detail"] = ""
+                else:
+                    STATE["mavproxy_detail"] = ssh.mavproxy_diagnosis()
             else:
                 STATE["ssh_connected"]    = False
                 STATE["onboard_mavproxy"] = False
                 STATE["onboard_stab"]     = False
                 STATE["onboard_arm"]      = False
                 STATE["onboard_cam"]      = False
+                STATE["pixhawk_serial_ok"] = False
+                STATE["mavproxy_detail"]  = ""
                 # Auto-reconnect only if the user had a working session before.
                 if _ssh_was_connected:
                     _trigger_ssh_reconnect()
@@ -1040,6 +1049,8 @@ def emit_status():
         "onboard_arm":           STATE["onboard_arm"],
         "onboard_cam":           STATE["onboard_cam"],
         "onboard_mavproxy":      STATE["onboard_mavproxy"],
+        "pixhawk_serial_ok":     STATE.get("pixhawk_serial_ok", False),
+        "mavproxy_detail":       STATE.get("mavproxy_detail", ""),
         "ssh_connected":         STATE["ssh_connected"],
         "ssh_error":             STATE["ssh_error"],
         "mode":                  STATE["mode"],
@@ -1769,7 +1780,7 @@ def api_arm_diagnostic():
         "ok": True,
         "checks": checks,
         "all_ok": all(c["ok"] for c in checks),
-        "hint": "Mission Planner: SERVO9=59 SERVO11=61 SERVO12=62 SERVO15=65 (RCPassThru), BRD_SAFETYENABLE=0",
+        "hint": f"Mission Planner: {ARM_SERVO_HINT}",
         "arm_joint_us": tel.get("arm_joint_us"),
         "mode": STATE.get("mode"),
     })
@@ -1789,8 +1800,9 @@ def api_arm_jog():
     if joint_i not in JOINT_TO_AUX:
         return jsonify({"ok": False, "msg": "Joint must be 1–4 (J1, J2, J3, Claw)"}), 400
     aux = JOINT_TO_AUX[joint_i]
-    pwm = _clamp_arm_pwm(data.get("pwm", 1600))
-    center = _clamp_arm_pwm(data.get("center_pwm", 1500))
+    neutral = JOINT_NEUTRAL_PWM[joint_i]
+    pwm = clamp_joint_pwm_aux(aux, data.get("pwm", neutral))
+    center = clamp_joint_pwm_aux(aux, data.get("center_pwm", neutral))
     label = ARM_JOINT_NAMES[joint_i - 1]
     hold_sec = float(data.get("hold_sec", 1.0))
 
@@ -1929,7 +1941,7 @@ def api_manual_pwm():
         if aux is not None and pwm is not None:
             try:
                 aux_i = int(aux)
-                pwm_i = _clamp_claw_pwm(pwm) if aux_i == 7 else _clamp_arm_pwm(pwm)
+                pwm_i = _clamp_claw_pwm(pwm) if aux_i == 7 else clamp_joint_pwm_aux(aux_i, pwm)
                 if 1 <= aux_i <= 7:
                     parsed = ("aux", aux_i, pwm_i,
                               f"AUX{aux_i} ({MANUAL_AUX_LABELS[aux_i - 1]})")
@@ -1952,7 +1964,7 @@ def api_manual_pwm():
                 "ok": False,
                 "msg": (
                     "Use J1–J3 / claw / joint 1–4, or M1–M8 / flh etc. plus PWM "
-                    "(e.g. 'J1 1500', 'claw 1425', 'M3 1600', 'flh 1600')"
+                    "(e.g. 'J1 1400', 'claw 1425', 'M3 1600', 'flh 1600')"
                 ),
             })
 
@@ -2023,11 +2035,25 @@ def api_mode():
         STATE["manual_pwm_enabled"] = False
         STATE["manual_thr_pwm"] = list(_manual_thr_defaults())
     _apply_disarmed_arm_lockout()
+    warnings: list[str] = []
     if mode in ("armed", "stabilize"):
+        _sync_arm_unlock()
         _sync_arm_claw_stop()
         _subscribe_arm_telemetry()
+        if not STATE.get("pixhawk_serial_ok"):
+            warnings.append("Pixhawk USB not detected on Pi — plug in /dev/ttyACM0 and Start Onboard")
+        elif not STATE.get("onboard_mavproxy"):
+            detail = (STATE.get("mavproxy_detail") or "").strip()
+            warnings.append(
+                "MAVProxy has no FC link — thrusters and arm will not move"
+                + (f" ({detail})" if detail else "")
+            )
+        if not STATE.get("onboard_stab"):
+            warnings.append("stabilization.py not running — Start Onboard")
+        if not STATE.get("onboard_arm"):
+            warnings.append("new_ar.py not running — Start Onboard")
     emit_status()
-    return jsonify({"ok": True, "mode": mode})
+    return jsonify({"ok": True, "mode": mode, "warnings": warnings})
 
 
 @app.route("/api/colmap", methods=["POST"])
@@ -2252,6 +2278,8 @@ def api_status():
         "onboard_arm":           STATE["onboard_arm"],
         "onboard_cam":           STATE["onboard_cam"],
         "onboard_mavproxy":      STATE["onboard_mavproxy"],
+        "pixhawk_serial_ok":     STATE.get("pixhawk_serial_ok", False),
+        "mavproxy_detail":       STATE.get("mavproxy_detail", ""),
         "ssh_connected":         STATE["ssh_connected"],
         "mode":                  STATE["mode"],
         "telemetry_listener_ok": STATE["telemetry_listener_ok"],
